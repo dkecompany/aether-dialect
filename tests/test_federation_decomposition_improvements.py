@@ -1,15 +1,10 @@
-"""Tests for federation decomposition, ordering, and combine projection improvements."""
+"""Tests for federation decomposition, ordering, and combine projection."""
 
 from __future__ import annotations
 
 from unittest.mock import patch
 
-from aetherdialect._contracts_base import (
-    FederationMappings,
-    MulGroup,
-    NormalizedExpr,
-    WhereParam,
-)
+from aetherdialect._contracts_base import MulGroup, NormalizedExpr, WhereParam
 from aetherdialect._contracts_core import (
     FederatedPlan,
     FederatedStage,
@@ -23,18 +18,19 @@ from aetherdialect._contracts_schema import (
     CaseWhenBranch,
     CaseWhenExpr,
     ColumnMetadata,
+    FederationMappings,
     SchemaGraph,
     TableMetadata,
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._federation import (
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import order_federation_execution_steps
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import (
     _build_source_sub_intent,
-    compose_composite_graph,
     derive_execution_order_from_stages,
     federation_table_set,
-    order_federation_execution_steps,
-    parse_federation_manifest,
     plan_federated_intent,
     plan_federated_stages,
     render_federation_glue,
@@ -57,7 +53,7 @@ def _graph(table: str, source_id: str) -> SchemaGraph:
 
 
 _MANIFEST = {
-    "federation_id": "fed_improve",
+    "federation_id": "fed_decomp",
     "sources": [
         {"source_id": "a", "engine": "duckdb", "role": "owner"},
         {"source_id": "b", "engine": "duckdb", "role": "owner"},
@@ -188,7 +184,7 @@ def test_sub_intent_keeps_referenced_case_registry_only() -> None:
         ],
     )
     table_set = federation_table_set(intent, composite, manifest)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = {"a": _graph("t_a", "a"), "b": _graph("t_b", "b")}
     step_a = _build_source_sub_intent(
         intent,
@@ -291,8 +287,8 @@ def test_plan_federated_stages_emits_member_and_coordinator() -> None:
 
 
 def test_plan_federated_stages_scalar_coordinator_stage_id() -> None:
+    from aetherdialect._contracts_base import NormalizedExpr
     from aetherdialect._contracts_core import ResidualSpec, SelectCol
-    from aetherdialect._intent_process import NormalizedExpr
 
     residual = ResidualSpec(
         select_cols=(SelectCol(expr=NormalizedExpr.from_agg("count", "t_a.id")),),
@@ -316,8 +312,8 @@ def test_plan_federated_stages_scalar_coordinator_stage_id() -> None:
 
 
 def test_member_prepare_skips_expand_shared_pk_tables_for_refs() -> None:
-    from aetherdialect._pipeline import generate_and_validate_sql
-    from aetherdialect._templates import TemplateOps
+    from aetherdialect._pipeline_generate import generate_and_validate_sql
+    from aetherdialect._templates_ops import TemplateOps
 
     schema = _graph("t_a", "a")
     intent = RuntimeIntent(
@@ -329,11 +325,11 @@ def test_member_prepare_skips_expand_shared_pk_tables_for_refs() -> None:
         where=None,
     )
     store = TemplateOps.empty_template_store(schema.schema_graph_id)
-    with patch("aetherdialect._pipeline.expand_shared_pk_tables_for_refs") as expand_mock:
+    with patch("aetherdialect._intent_normalize.expand_shared_pk_tables_for_refs") as expand_mock:
         expand_mock.side_effect = lambda value, _schema: value
-        with patch("aetherdialect._pipeline.build_deterministic_sql", return_value="SELECT id FROM t_a"):
+        with patch("aetherdialect._sql_gen.build_deterministic_sql", return_value="SELECT id FROM t_a"):
             with patch(
-                "aetherdialect._pipeline._run_sql_validation_cascade",
+                "aetherdialect._pipeline_generate.run_sql_validation_cascade",
                 return_value=(True, "", None, []),
             ):
                 generate_and_validate_sql(

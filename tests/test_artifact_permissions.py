@@ -9,8 +9,12 @@ import sys
 import pytest
 
 from aetherdialect._constants import ARTIFACT_FILE_MODE
-from aetherdialect._core_utils import write_gzip_json_atomic, write_json_atomic, write_text_atomic
-from aetherdialect._federation import _write_federation_json_atomic
+from aetherdialect._federation_execute import _write_federation_json_atomic
+from aetherdialect._utils_artifacts import (
+    write_gzip_json_atomic,
+    write_json_atomic,
+    write_text_atomic,
+)
 
 
 @pytest.mark.fast

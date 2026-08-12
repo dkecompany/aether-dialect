@@ -7,8 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._main_execution import PipelineSession
-from aetherdialect._templates import TemplateOps
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _session_owner() -> MagicMock:
@@ -53,12 +53,12 @@ def test_two_reader_turns_overlap() -> None:
     session_b = PipelineSession(owner, mode="reader")
 
     def run_first() -> None:
-        with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=block_first):
+        with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=block_first):
             session_a.ask("first reader question")
 
     def run_second() -> None:
         assert first_inside.wait(timeout=5.0)
-        with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=block_second):
+        with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=block_second):
             session_b.ask("second reader question")
 
     first = threading.Thread(target=run_first)
@@ -85,7 +85,7 @@ def test_writer_lock_released_across_model_call() -> None:
         lock_states.append(lock.locked())
 
     session = PipelineSession(owner, mode="writer")
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=capture_lock_state):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=capture_lock_state):
         session.ask("writer question")
 
     assert lock_states == [False], f"writer lock must be released during interactive_run_once, got {lock_states}"

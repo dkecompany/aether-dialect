@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import FeedbackKind, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import render_feedback_sql
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _simple_intent() -> RuntimeIntent:
@@ -45,7 +45,7 @@ class TestSummarizeFailureForMemorySqlBoundary:
             return '{"summary":"wrong table","bucket":"WRONG_TABLES_OR_JOINS"}'
 
         with patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True):
-            with patch("aetherdialect._templates.LLMProvider.chat", side_effect=_fake_llm):
+            with patch("aetherdialect._llm_provider.LLMProvider.chat", side_effect=_fake_llm):
                 entry = TemplateOps.summarize_failure_for_memory(
                     question="q",
                     intent=_simple_intent(),
@@ -81,7 +81,7 @@ class TestSummarizeFailureForMemorySqlBoundary:
             return '{"summary":"bad","bucket":"OTHER"}'
 
         with patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True):
-            with patch("aetherdialect._templates.LLMProvider.chat", side_effect=_fake_llm):
+            with patch("aetherdialect._llm_provider.LLMProvider.chat", side_effect=_fake_llm):
                 entry = TemplateOps.summarize_failure_for_memory(
                     question="q",
                     intent=intent,

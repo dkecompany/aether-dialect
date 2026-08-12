@@ -8,20 +8,20 @@ import tempfile
 import pytest
 
 from aetherdialect._constants import FEDERATION_ARTIFACT_FORMAT_VERSION, MIN_COMPATIBLE_PACKAGE_VERSION
-from aetherdialect._contracts_base import FederationMappings
-from aetherdialect._core_utils import artifact_package_version_string
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import FederationMappings
+from aetherdialect._federation_execute import persist_federation_tree
+from aetherdialect._federation_manifest import (
     federation_artifact_manifest_view,
     federation_artifact_paths,
-    persist_federation_tree,
 )
+from aetherdialect._utils_artifacts import artifact_package_version_string
 from tests.federation_helpers import build_two_member_federation
 
 
 @pytest.mark.fast
 def test_persist_writes_min_compatible_package_version() -> None:
     bundle = build_two_member_federation()
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     with tempfile.TemporaryDirectory() as tmp:
         persist_federation_tree(
             tmp,

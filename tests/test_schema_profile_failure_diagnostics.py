@@ -9,13 +9,12 @@ from aetherdialect._constants import (
     DIAGNOSTIC_CODE_PROFILE_TABLE_CLONE_FAILED,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._schema_profile import _profile_composite_descriptive, profile_table_clone
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._schema_catalog import _profile_composite_descriptive
-from aetherdialect._schema_graph import _profile_table_clone
 
 
 def _name_pair_table() -> TableMetadata:
@@ -97,7 +96,7 @@ def test_profile_table_clone_failure_emits_diagnostic_and_returns_none() -> None
 
     token = set_diagnostic_collector([])
     try:
-        clone = _profile_table_clone(dialect, table, notes_content=None)
+        clone = profile_table_clone(dialect, table, notes_content=None)
         diags = drain_diagnostic_collector()
     finally:
         reset_diagnostic_collector(token)

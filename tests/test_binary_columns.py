@@ -8,11 +8,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._constants import GROUND_FIELDS, SCHEMA_FIELD_SAMPLES
+from aetherdialect._constants_runtime import GROUND_FIELDS, SCHEMA_FIELD_SAMPLES
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import data_type_to_value_type
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
-from aetherdialect._schema_catalog import _build_column_profile_for_llm, _profile_column
+from aetherdialect._schema_profile import _build_column_profile_for_llm, _profile_column
+from aetherdialect._utils import data_type_to_value_type
 
 
 def _recording_engine() -> tuple[MagicMock, list[str]]:

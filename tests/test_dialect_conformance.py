@@ -204,6 +204,8 @@ def _verify_scalar(func: str, sql: str, engine: str) -> bool:
     if func == "date_trunc":
         if "DATE_TRUNC" in upper:
             return True
+        if "TRUNC(" in upper and engine == "oracle":
+            return True
         if engine in {"mysql", "mariadb"} and "DATE_FORMAT" in upper:
             return True
         if engine == "sqlite" and "DATE(" in upper and "START OF" in upper:
@@ -236,11 +238,11 @@ def _verify_filter_op(op: str, sql: str, engine: str) -> bool:
     if op == "not like":
         return "NOT" in upper and " LIKE " in upper
     if op == "ilike":
-        if engine in {"mysql", "mariadb", "sqlite", "bigquery", "sqlserver"}:
+        if engine in {"mysql", "mariadb", "sqlite", "bigquery", "sqlserver", "oracle"}:
             return " LIKE " in upper and "LOWER" in upper
         return "ILIKE" in upper
     if op == "not ilike":
-        if engine in {"mysql", "mariadb", "sqlite", "bigquery", "sqlserver"}:
+        if engine in {"mysql", "mariadb", "sqlite", "bigquery", "sqlserver", "oracle"}:
             return "NOT" in upper and " LIKE " in upper and "LOWER" in upper
         if engine == "databricks":
             return "NOT" in upper and "ILIKE" in upper
@@ -284,6 +286,7 @@ def _verify_string_agg_sql(sql: str, engine: str) -> bool:
         "redshift": ("STRING_AGG", "LISTAGG"),
         "bigquery": ("STRING_AGG",),
         "sqlserver": ("STRING_AGG",),
+        "oracle": ("LISTAGG",),
         "csv": ("STRING_AGG", "LISTAGG"),
         "mysql": ("GROUP_CONCAT",),
         "mariadb": ("GROUP_CONCAT",),
@@ -581,6 +584,8 @@ def _verify_date_window(sql: str, engine: str) -> bool:
         "current_date",
         "current_timestamp",
         "getdate()",
+        "sysdate",
+        "systimestamp",
         "datetime('now')",
         "date('now')",
         "current_timestamp()",
@@ -606,6 +611,7 @@ def _date_window_markers(engine: str) -> tuple[str, ...]:
         "mariadb": ("DATE_SUB",),
         "snowflake": ("DATEADD",),
         "sqlserver": ("DATEADD",),
+        "oracle": ("ADD_MONTHS", "SYSDATE", "SYSTIMESTAMP", "TRUNC"),
         "bigquery": ("DATE_SUB", "TIMESTAMP_SUB"),
         "databricks": ("DATE_ADD", "ADD_MONTHS", "DATE_COLUMNDD", "CURRENT_DATE", "INTERVAL"),
         "sqlite": ("date(", "datetime("),
@@ -623,6 +629,7 @@ def _date_diff_markers(engine: str) -> tuple[str, ...]:
         "mariadb": ("TIMESTAMPDIFF",),
         "snowflake": ("DATEDIFF",),
         "sqlserver": ("DATEDIFF",),
+        "oracle": ("MONTHS_BETWEEN", "SYSDATE", " - ", " / 7", "* 24", "* 1440", "* 86400"),
         "bigquery": ("DATE_DIFF",),
         "databricks": ("DATEDIFF", "datediff", "MONTHS_BETWEEN", "WEEKS_BETWEEN", "INTERVAL"),
         "sqlite": ("julianday",),
@@ -884,7 +891,8 @@ def _build_structural_cases() -> list[ConformanceCase]:
             verify=lambda sql, eng: (
                 "UNNEST" in sql.upper()
                 or "EXPLODE" in sql.upper()
-                or eng in {"mysql", "mariadb", "sqlserver", "snowflake", "bigquery", "redshift", "sqlite"}
+                or "JSON_TABLE" in sql.upper()
+                or eng in {"mysql", "mariadb", "sqlserver", "oracle", "snowflake", "bigquery", "redshift", "sqlite"}
             ),
         ),
         ConformanceCase(

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import SeedWarmupIntent, SeedWarmupResult, SelectCol
 from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._seed_warmup import SeedWarmupCacheSession
 
 

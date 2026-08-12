@@ -5,13 +5,12 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._constants import SELF_JOIN_CTE_NAME_PREFIX
-from aetherdialect._contracts_base import JoinInjectionFailedError, SchemaInvariantError
-from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import NormalizedExpr, SchemaInvariantError
+from aetherdialect._contracts_core import JoinInjectionFailedError, RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import Dialect, _apply_coordinator_probe_joins
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._intent_resolve import encode_inline_self_join_as_cte, normalize_cte_names
+from aetherdialect._dialect import Dialect, DialectRegistry
+from aetherdialect._federation_plan import _apply_coordinator_probe_joins
+from aetherdialect._intent_bind import encode_inline_self_join_as_cte, normalize_cte_names
 from aetherdialect._sql_gen import (
     _join_edges_from_signature,
     anti_join_presence_column,
@@ -133,11 +132,12 @@ def test_self_join_cte_name_collision_raises() -> None:
         encode_inline_self_join_as_cte(intent, schema)
 
 
-def test_normalized_cte_name_collision_with_physical_table_raises() -> None:
+def test_normalized_cte_name_rewrites_premature_cte_token() -> None:
+    """Premature ``cte1`` table tokens are forward refs; the step claims ``cte1``."""
     cte = RuntimeCteStep(
         cte_name="rollup",
-        tables=["cte1"],
-        select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.id"))],
+        tables=["orders"],
+        select_cols=[SelectCol(expr=NormalizedExpr.from_column("orders.id"))],
         output_columns=["id"],
     )
     intent = RuntimeIntent(
@@ -149,5 +149,7 @@ def test_normalized_cte_name_collision_with_physical_table_raises() -> None:
         where=None,
         cte_steps=[cte],
     )
-    with pytest.raises(SchemaInvariantError, match="normalized CTE name 'cte1'"):
-        normalize_cte_names(intent)
+    result = normalize_cte_names(intent)
+    assert result.cte_steps[0].cte_name == "cte1"
+    assert result.tables == ["cte1", "cte1"]
+    assert result.select_cols[0].expr.primary_term == "cte1.id"

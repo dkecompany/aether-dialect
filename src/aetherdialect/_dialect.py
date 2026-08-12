@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import importlib
-from collections.abc import Callable
+import inspect
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
 from typing import Any, ClassVar, Literal, Protocol, cast
 
@@ -11,12 +12,13 @@ import sqlglot
 
 import aetherdialect._constants
 
-from ._config import EngineConfig, EngineRuntimeConfig, PolicyConfig
+from ._config import EngineConfig, EngineLimits, EngineRuntimeConfig, PolicyConfig
 from ._constants import (
     AGGREGATE_FUNCTION_NAMES,
     CASE_INSENSITIVE_COLLATION_ENGINES,
     COLLATION_ENGINES,
     DIAGNOSTIC_CODE_CANCEL_NOT_SUPPORTED,
+    DOLLAR_NAMED_PLACEHOLDER_RE,
     EMBEDDED_ENGINE_NAMES,
     ENGINE_MODULE_PATHS,
     EXPLAIN_PERMISSION_DENIED_PATTERNS,
@@ -36,18 +38,16 @@ from ._contracts_base import (
     EngineContext,
     EngineIdentity,
     JoinEdge,
-    QueryLogSource,
-    ResultReaderKind,
     SchemaInclude,
     SqlDiagnostic,
     SqlDiagnosticCode,
     TableKind,
 )
-from ._contracts_core import RuntimeIntent
+from ._contracts_core import QueryLogSource, ResultReaderKind, RuntimeIntent
 from ._contracts_schema import CatalogStructuralConstraintsIndex, SchemaGraph
-from ._core_utils import (
+from ._schema_reflect import reflect_schema_graph_for_context
+from ._utils import (
     active_engine_identity,
-    assert_dialect_usable_after_fork,
     canonicalize_sql,
     collation_name_is_case_insensitive,
     cost_cap_active,
@@ -61,6 +61,7 @@ from ._core_utils import (
     substitute_params,
     substitute_params_for_execution,
 )
+from ._utils_artifacts import assert_dialect_usable_after_fork
 
 
 class Dialect:
@@ -81,7 +82,7 @@ class Dialect:
 
     @staticmethod
     def trace_finalize_render_stage(stage: str, sql_in: str, sql_out: str) -> None:
-        """Log one ``finalize_render`` sub-step for debugging and. ``PIPELINE_TRACE`` capture."""
+        """Log one ``finalize_render`` sub-step for debugging and ``PIPELINE_TRACE`` capture."""
         debug(f"[dialect.finalize_render.{stage}] in_sql_len={len(sql_in)} out_sql_len={len(sql_out)}")
         pipeline_trace(f"dialect.finalize_render.{stage}", lambda: stable_json({"in": sql_in, "out": sql_out}))
 
@@ -126,7 +127,7 @@ class Dialect:
         engine: str | None = None,
         dialect: Dialect | None = None,
     ) -> str:
-        """Reduce structural placeholders, substitute parameters, then AST- simplify the literal SQL."""
+        """Reduce structural placeholders, substitute parameters, then AST-simplify the literal SQL."""
         bind_engine = engine
         if bind_engine is None and dialect is not None:
             bind_engine = getattr(dialect, "name", None)
@@ -167,8 +168,9 @@ class Dialect:
 
     @staticmethod
     def normalize_named_placeholders(sql: str) -> str:
-        """Convert dialect-specific named placeholders back to ``:name`` form. sqlglot's Postgres generator emits ``%(name)s`` when serialising :class:`sqlglot.expressions.Placeholder` nodes, but the rest of the pipeline (``substitute_params``, SQLAlchemy ``text(...)`` binds) expects the canonical ``:name`` form. This helper rewrites ``%(name)s`` → ``:name`` so the placeholder template stays dialect- agnostic regardless of the round-trip dialect used during AST simplification or parameter abstraction."""
-        return PG_NAMED_PLACEHOLDER_RE.sub(lambda m: f":{m.group(1)}", sql)
+        """Convert dialect-specific named placeholders back to ``:name`` form. Sqlglot's Postgres generator emits ``%(name)s`` and DuckDB emits ``$name`` when serialising :class:`sqlglot.expressions.Placeholder` nodes, but the rest of the pipeline (``substitute_params``, SQLAlchemy ``text(...)`` binds, DuckDB positional conversion) expects the canonical ``:name`` form. This helper rewrites ``%(name)s`` → ``:name`` and ``$name`` → ``:name`` so the placeholder template stays dialect-agnostic regardless of the round-trip dialect used during AST simplification or parameter abstraction."""
+        out = PG_NAMED_PLACEHOLDER_RE.sub(lambda m: f":{m.group(1)}", sql)
+        return DOLLAR_NAMED_PLACEHOLDER_RE.sub(lambda m: f":{m.group(1)}", out)
 
     @staticmethod
     def relative_window_uses_timestamp(unit: str) -> bool:
@@ -177,7 +179,7 @@ class Dialect:
 
     @staticmethod
     def format_interval_unit(unit: str, amount: int) -> tuple[int, str]:
-        """Return ``(amount, unit)`` rewritten to a SQL-compatible ANSI. interval unit. SQL ``INTERVAL`` literals do not understand ``quarter`` or ``half_year``; both PostgreSQL and Spark expect base units such as ``month``. This helper converts those composite units to ``month`` (``quarter`` -> 3, ``half_year`` -> 6) and pluralises the unit when *amount* is not 1 so the rendered fragment reads naturally (``2 days``, ``1 month``, etc.)."""
+        """Return ``(amount, unit)`` rewritten to a SQL-compatible ANSI interval unit. SQL ``INTERVAL`` literals do not understand ``quarter`` or ``half_year``; both PostgreSQL and Spark expect base units such as ``month``. This helper converts those composite units to ``month`` (``quarter`` -> 3, ``half_year`` -> 6) and pluralises the unit when *amount* is not 1 so the rendered fragment reads naturally (``2 days``, ``1 month``, etc.)."""
         canonical = (unit or "").strip().lower()
         if canonical == "quarter":
             scaled = amount * 3
@@ -193,7 +195,7 @@ class Dialect:
 
     @staticmethod
     def emit_via_ast(sql: str, dialect_name: str) -> str:
-        """Round-trip a SQL fragment through the sqlglot AST and re- emit. via. the dialect generator. Used by dialect render helpers so the final fragment passes through a parser/generator pair (rather than being built only by f-string concatenation). The post-processor restores ``:name`` placeholders that the Postgres generator otherwise rewrites to ``%(name)s``."""
+        """Round-trip a SQL fragment through the sqlglot AST and re-emit via the dialect generator. Used by dialect render helpers so the final fragment passes through a parser/generator pair (rather than being built only by f-string concatenation). The post-processor restores ``:name`` placeholders that the Postgres generator otherwise rewrites to ``%(name)s``."""
         try:
             tree = sqlglot.parse_one(sql, dialect=dialect_name)
         except Exception:
@@ -406,7 +408,7 @@ class Dialect:
 
     @staticmethod
     def parameter_abstract(sql: str, *, sqlglot_dialect: str) -> tuple[str, dict[str, Any]]:
-        """Replace literal nodes with ``:p1``, ``:p2``, … via sqlglot AST. traversal. Numeric literals are recorded as their parsed value (``int`` or ``float``); string literals are recorded with surrounding single quotes preserved. Returns ``(sql, {})`` unchanged when the SQL is unparseable."""
+        """Replace literal nodes with ``:p1``, ``:p2``, … via sqlglot AST traversal. Numeric literals are recorded as their parsed value (``int`` or ``float``); string literals are recorded with surrounding single quotes preserved. Returns ``(sql, {})`` unchanged when the SQL is unparseable."""
         if not isinstance(sql, str) or not sql:
             return sql, {}
         parsed = Dialect._inspect_parse(sql, sqlglot_dialect=sqlglot_dialect)
@@ -509,7 +511,7 @@ class Dialect:
 
     @staticmethod
     def _reflect_include_for_schema_build(ctx: EngineContext) -> SchemaInclude:
-        """Mirror :func:`aetherdialect._schema_graph.effective_reflect_include` so partial and full rebuilds agree."""
+        """Return the single-kind include selector for schema-build reflection scopes."""
         return ctx.include
 
     @staticmethod
@@ -605,7 +607,7 @@ class Dialect:
         self._explain_disabled: bool = False
 
     def ast_validate(self, sql: str) -> tuple[bool, str]:
-        """Backwards-shaped wrapper over :meth:`ast_validate_full`. Returns ``(True, "")`` when no diagnostics are emitted, otherwise ``(False, first_code)`` where ``first_code`` is the string value of the first diagnostic's code."""
+        """Thin boolean wrapper over :meth:`ast_validate_full`. Returns ``(True, "")`` when no diagnostics are emitted, otherwise ``(False, first_code)`` where ``first_code`` is the string value of the first diagnostic's code."""
         diags = self.ast_validate_full(sql)
         if not diags:
             return True, ""
@@ -623,7 +625,7 @@ class Dialect:
         raise NotImplementedError
 
     def parse_select(self, sql: str) -> Any | None:
-        """Parse *sql* with the dialect's native AST library and return. an opaque handle. The handle is consumed only by :meth:`ordered_join_carrier_froms`, :meth:`attach_joins`, and :meth:`emit_sql` on the same dialect instance. Returns ``None`` when the SQL cannot be parsed or is not a single SELECT."""
+        """Parse *sql* with the dialect's native AST library and return an opaque handle. The handle is consumed only by :meth:`ordered_join_carrier_froms`, :meth:`attach_joins`, and :meth:`emit_sql` on the same dialect instance. Returns ``None`` when the SQL cannot be parsed or is not a single SELECT."""
         raise NotImplementedError
 
     def ordered_join_carrier_froms(self, parsed: Any) -> list[Any] | None:
@@ -631,13 +633,13 @@ class Dialect:
         raise NotImplementedError
 
     def attach_joins(self, parsed: Any, from_handle: Any, edges: list[JoinEdge]) -> bool:
-        """Attach the given structured *edges* as JOIN nodes onto. *from_handle*. Implementations construct dialect-native JOIN AST nodes directly from *edges* and graft them into *from_handle* without re-parsing any SQL fragment."""
+        """Attach the given structured *edges* as JOIN nodes onto *from_handle*. Implementations construct dialect-native JOIN AST nodes directly from *edges* and graft them into *from_handle* without re- parsing any SQL fragment."""
         raise NotImplementedError
 
     def attach_extra_from_and_where(
         self, parsed: Any, from_handle: Any, extra_from_tables: list[str], where_edges: list[JoinEdge]
     ) -> bool:
-        """AND-inject *where_edges*' equality predicates into. *from_handle*'s ``WHERE`` and append any *extra_from_tables* to its ``FROM`` clause. Used to render semantic-profile edges (``edge_kind`` ``semantic_profile`` / ``semantic_profile_virtual``) as comma-FROM + ``WHERE`` equality predicates rather than ``JOIN ... ON``. ``where_edges[i].on_terms`` is a tuple of ``(left_token, left_col, right_token, right_col)`` equality conjuncts that get AND-ed into the existing ``WHERE``. Returns ``True`` on success (including the no-op case when both lists are empty), ``False`` when grafting fails."""
+        """AND-inject *where_edges*' equality predicates into *from_handle*'s ``WHERE`` and append any *extra_from_tables* to its ``FROM`` clause. Used to render semantic-profile edges (``edge_kind`` ``semantic_profile`` / ``semantic_profile_virtual``) as comma- FROM + ``WHERE`` equality predicates rather than ``JOIN ... ON``. ``where_edges[i].on_terms`` is a tuple of ``(left_token, left_col, right_token, right_col)`` equality conjuncts that get AND-ed into the existing ``WHERE``. Returns ``True`` on success (including the no-op case when both lists are empty), ``False`` when grafting fails."""
         raise NotImplementedError
 
     def attach_where_sql_fragments(self, from_handle: Any, fragments: list[str]) -> bool:
@@ -666,7 +668,7 @@ class Dialect:
         schema: SchemaGraph | None = None,
         intent: RuntimeIntent | None = None,
     ) -> tuple[bool, str]:
-        """Backwards-shaped wrapper over :meth:`explain_diagnose`. Returns ``(ok, raw_message)`` discarding structured diagnostics."""
+        """Thin boolean/message wrapper over :meth:`explain_diagnose`. Returns ``(ok, raw_message)`` discarding structured diagnostics."""
         ok, _diags, raw = self.explain_diagnose(sql, params, schema=schema, intent=intent)
         return ok, raw
 
@@ -678,7 +680,7 @@ class Dialect:
         schema: SchemaGraph | None = None,
         intent: RuntimeIntent | None = None,
     ) -> tuple[bool, list[SqlDiagnostic], str]:
-        """Run ``EXPLAIN`` against the live engine and return. structured. findings."""
+        """Run ``EXPLAIN`` against the live engine and return structured findings."""
         raise NotImplementedError
 
     def can_explain(self) -> bool:
@@ -759,7 +761,7 @@ class Dialect:
         return frozenset(extra)
 
     def date_window_upper_bound_sql(self, unit: str, *, anchor: datetime | None = None) -> str:
-        """Return the SQL expression for an inclusive date-window upper. bound."""
+        """Return the SQL expression for an inclusive date-window upper bound."""
         return self.date_window_clock_sql(unit, anchor=anchor)
 
     def date_window_clock_sql(self, unit: str, *, anchor: datetime | None = None) -> str:
@@ -791,7 +793,7 @@ class Dialect:
         return frag
 
     def profile_statement_timeout_sql(self, timeout_ms: int) -> str | None:
-        """Return a session statement-timeout SQL statement for. profiling, or ``None`` when unsupported."""
+        """Return a session statement-timeout SQL statement for profiling, or ``None`` when unsupported."""
         _ = timeout_ms
         return None
 
@@ -802,7 +804,7 @@ class Dialect:
     def inject_pruning_predicates(
         self, sql: str, *, schema: SchemaGraph | None = None, intent: RuntimeIntent | None = None
     ) -> str:
-        """Append engine-specific pruning predicates when the WHERE. clause omits required keys."""
+        """Append engine-specific pruning predicates when the WHERE clause omits required keys."""
         _ = schema, intent
         return sql
 
@@ -814,11 +816,11 @@ class Dialect:
         return None
 
     def query_log_source(self) -> QueryLogSource | None:
-        """Return a dialect-specific query-log source, or ``None`` when. unsupported."""
+        """Return a dialect-specific query-log source, or ``None`` when unsupported."""
         return None
 
     def quote_table_column(self, table: str, column: str) -> str:
-        """Return a dialect-safe ``table.column`` reference for SQL. emission."""
+        """Return a dialect-safe ``table.column`` reference for SQL emission."""
         dialect = getattr(type(self), "sqlglot_dialect", "") or ""
         if not dialect:
             raise NotImplementedError
@@ -938,29 +940,25 @@ class Dialect:
         non_empty_in = (execution_sql_override or sql_param or "").strip()
         if non_empty_in and not rewritten.strip():
             raise RuntimeError(
-                "dialect.finalize_render produced empty SQL from non-empty input; "
-                "last_non_empty_stage=pre_execute_rewrite"
+                "dialect.finalize_render produced empty SQL from non-empty input; last_non_empty_stage=pre_execute_rewrite"
             )
         normalized = self.post_render_normalize(rewritten, stage="post_substitute")
         Dialect.trace_finalize_render_stage("post_render_normalize", rewritten, normalized)
         if non_empty_in and not normalized.strip():
             raise RuntimeError(
-                "dialect.finalize_render produced empty SQL from non-empty input; "
-                "last_non_empty_stage=post_render_normalize"
+                "dialect.finalize_render produced empty SQL from non-empty input; last_non_empty_stage=post_render_normalize"
             )
         qualified = self._qualify_tables_for_execution(normalized)
         Dialect.trace_finalize_render_stage("qualify_tables_for_execution", normalized, qualified)
         if non_empty_in and not qualified.strip():
             raise RuntimeError(
-                "dialect.finalize_render produced empty SQL from non-empty input; "
-                "last_non_empty_stage=qualify_tables_for_execution"
+                "dialect.finalize_render produced empty SQL from non-empty input; last_non_empty_stage=qualify_tables_for_execution"
             )
         pruned = self.inject_pruning_predicates(qualified, schema=schema, intent=intent)
         Dialect.trace_finalize_render_stage("inject_pruning_predicates", qualified, pruned)
         if non_empty_in and not pruned.strip():
             raise RuntimeError(
-                "dialect.finalize_render produced empty SQL from non-empty input; "
-                "last_non_empty_stage=inject_pruning_predicates"
+                "dialect.finalize_render produced empty SQL from non-empty input; last_non_empty_stage=inject_pruning_predicates"
             )
         return pruned
 
@@ -996,7 +994,7 @@ class Dialect:
         return Dialect.sqlglot_quote_identifier(ident, "postgres")
 
     def quote_schema_qualified(self, name: str) -> str:
-        """Quote a dotted identifier path as one quoted fragment per. segment."""
+        """Quote a dotted identifier path as one quoted fragment per segment."""
         parts = [p for p in str(name).strip().split(".") if p]
         if not parts:
             return self.quote_identifier(name)
@@ -1230,7 +1228,7 @@ class Dialect:
         raise NotImplementedError
 
     def compute_ddl_probe(self, schema_context: EngineContext) -> str:
-        """Return a cheap deterministic fingerprint of the live DDL the. cache should be valid against. Concrete dialects should run a single ``information_schema.columns`` query (or equivalent) scoped to the active schema/catalog and return a SHA-256 hex digest over the sorted ``(table, column, ordinal_position, data_type, is_nullable)`` rows. This probe is consulted by :func:`aetherdialect._schema.build_schema_graph` to short- circuit cache loads without re-reflecting or re-profiling the schema. The base implementation returns an empty string, which disables the fast path and forces the existing fingerprint-based cache validation. Returning ``""`` is also the contract for "probe not available at collection time" (e.g., transient DB error): callers must never propagate exceptions from this method."""
+        """Return a cheap deterministic fingerprint of the live DDL the cache should be valid against. Concrete dialects should run a single ``information_schema.columns`` query (or equivalent) scoped to the active schema/catalog and return a SHA-256 hex digest over the sorted ``(table, column, ordinal_position, data_type, is_nullable)`` rows. This probe is consulted by :func:`aetherdialect._schema.build_schema_graph` to short- circuit cache loads without re-reflecting or re-profiling the schema. The base implementation returns an empty string, which disables the fast path and forces the existing fingerprint-based cache validation. Returning ``""`` is also the contract for "probe not available at collection time" (e.g., transient DB error): callers must never propagate exceptions from this method."""
         _ = schema_context
         return ""
 
@@ -1240,13 +1238,13 @@ class Dialect:
         return ""
 
     def reflect_only(self, schema_context: EngineContext) -> SchemaGraph:
-        """Reflect a structural-only ``SchemaGraph`` honouring ``schema_context.include``. Used by the partial-rebuild diff path: only structural shape (tables, columns, FKs) is needed in order to compute a :class:`SchemaDiff`; profiling is run later, on the affected subset only. The default implementation delegates to :meth:`reflect_schema_graph` with the effective include kind. Dialects may override to skip work that is unnecessary for the diff (e.g., enum value enrichment)."""
-        include = Dialect._reflect_include_for_schema_build(schema_context)
-        allow_obj = schema_context.allow_objects if schema_context.allow_objects else None
-        deny_obj = schema_context.deny_objects if schema_context.deny_objects else None
-        return self.reflect_schema_graph(
-            include=include, allow_objects=allow_obj, deny_objects=deny_obj, sql_file=schema_context.sql_file
-        )
+        """Reflect a structural-only ``SchemaGraph`` using include / allow / deny scope."""
+        return reflect_schema_graph_for_context(self, schema_context)
+
+    def filter_selectable_relation_names(self, schema_name: str, names: Sequence[str]) -> list[str]:
+        """Return relation names the current login may safely reflect and profile. Default keeps the inspector list unchanged. Dialects whose catalogs list relations the login cannot ``SELECT`` (for example PostgreSQL ``USAGE`` without table grants) must override this and drop non-selectable names before reflection."""
+        _ = schema_name
+        return [str(n) for n in names if str(n).strip()]
 
     def profile_schema_dispatch(self, sg: SchemaGraph) -> None:
         """Profile tables using the active native backend chain with SQLAlchemy fallback."""
@@ -1271,7 +1269,7 @@ class Dialect:
         return None
 
     def profiling_text_cast_sql(self, expr: str) -> str:
-        """Return a dialect-correct text cast expression for profiling. overlap queries."""
+        """Return a dialect-correct text cast expression for profiling overlap queries."""
         return f"CAST({expr} AS TEXT)"
 
     def profiling_ordered_limit_sample_suffix(self, sample_size: int) -> str:
@@ -1294,7 +1292,7 @@ class Dialect:
         return self.profiling_ordered_limit_sample_suffix(sample_size)
 
     def profiling_stats_use_subquery_when_sampling(self, table_kind: TableKind = TableKind.TABLE) -> bool:
-        """Return True when distinct/null stats must scan a sampled. subquery."""
+        """Return True when distinct/null stats must scan a sampled subquery."""
         return True
 
 
@@ -1388,6 +1386,9 @@ class DialectRegistry:
         const.STATISTICAL_AGG_EXCLUDED_ENGINES = derived["statistical_agg_excluded_engines"]
         const.WINDOW_FRAMES_EXCLUDED_ENGINES = derived["window_frames_excluded_engines"]
         const.ARRAY_CONTAINS_EXCLUDED_ENGINES = derived["array_contains_excluded_engines"]
+        const.SQLGLOT_DIALECT_HOOK_ENGINES = frozenset(
+            name for name in derived["canonical_engine_order"] if name != "postgresql"
+        )
 
     @classmethod
     def set_supported_engines(cls, engines: frozenset[str]) -> None:
@@ -1407,7 +1408,13 @@ class DialectRegistry:
 
     @classmethod
     def get_dialect_class(cls, engine_type: str) -> type[Dialect]:
-        """Return the registered dialect class for *engine_type* without. constructing an instance. Raises: ValueError: When *engine_type* is not registered."""
+        """
+        Return the registered dialect class for *engine_type* without
+
+        constructing an instance.
+
+        Raises: ValueError: When *engine_type* is not registered.
+        """
         cls._ensure_engine_registered(engine_type)
         if engine_type not in cls._DIALECT_REGISTRY:
             raise ValueError(f"Unsupported dialect: {engine_type}")
@@ -1482,7 +1489,7 @@ class DialectRegistry:
 
     @classmethod
     def engine_supports_ordered_string_agg(cls, engine_type: str) -> bool:
-        """Return True when the engine can render ``string_agg`` with an in- aggregate ``ORDER BY``."""
+        """Return True when the engine can render ``string_agg`` with an in-aggregate ``ORDER BY``."""
         return cls._engine_supports_attr(engine_type, "supports_ordered_string_agg")
 
     @classmethod
@@ -1580,6 +1587,12 @@ class DialectRegistry:
             return cls.get_dialect(name_or_api)
         raise TypeError(f"Expected str or Dialect, got {type(name_or_api).__name__}")
 
+    @staticmethod
+    def _dialect_limits_kwargs(ctor: Any, limits: EngineLimits) -> dict[str, EngineLimits]:
+        if "limits" not in inspect.signature(ctor).parameters:
+            return {}
+        return {"limits": limits}
+
     @classmethod
     def get_dialect(
         cls,
@@ -1588,6 +1601,7 @@ class DialectRegistry:
         sqlalchemy_engine: Any | None = None,
         *,
         native_connection: Any | None = None,
+        limits: EngineLimits | None = None,
     ) -> Dialect:
         """Construct the dialect implementation for an engine type."""
         if engine_type is None:
@@ -1612,13 +1626,18 @@ class DialectRegistry:
         if engine_type not in cls._DIALECT_REGISTRY:
             raise ValueError(f"Unsupported dialect: {engine_type}")
         ctor = cls._DIALECT_REGISTRY[engine_type]
+        resolved_limits = limits if limits is not None else EngineLimits()
+        limits_kwargs = cls._dialect_limits_kwargs(ctor, resolved_limits)
         if engine_type in EMBEDDED_ENGINE_NAMES:
             return cast(_EmbeddedDialectCtor, ctor)(
-                config, sqlalchemy_engine=sqlalchemy_engine, native_connection=native_connection
+                config,
+                sqlalchemy_engine=sqlalchemy_engine,
+                native_connection=native_connection,
+                **limits_kwargs,
             )
         if sqlalchemy_engine is not None:
-            return cast(_SqlalchemyDialectCtor, ctor)(config, sqlalchemy_engine=sqlalchemy_engine)
-        return cast(_BaseDialectCtor, ctor)(config)
+            return cast(_SqlalchemyDialectCtor, ctor)(config, sqlalchemy_engine=sqlalchemy_engine, **limits_kwargs)
+        return cast(_BaseDialectCtor, ctor)(config, **limits_kwargs)
 
     get = get_dialect
     get_class = get_dialect_class

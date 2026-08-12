@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._constants import REFUSAL_CATALOGUE, REPHRASE_HINT_MESSAGES, REPHRASE_HINT_REFUSAL_CODES
+from aetherdialect._constants import REPHRASE_HINT_REFUSAL_CODES
+from aetherdialect._constants_runtime import REFUSAL_CATALOGUE, REPHRASE_HINT_MESSAGES
 
 _FORBIDDEN_TERMS: tuple[str, ...] = (
     "foreign_keys_add",

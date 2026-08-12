@@ -11,13 +11,12 @@ import pytest
 
 from aetherdialect._contracts_base import FederationCapExceededError
 from aetherdialect._contracts_core import RuntimeIntent
-from aetherdialect._federation import (
-    compose_composite_graph,
-    execute_federation_coordinator,
-    parse_federation_manifest,
-    plan_federated_intent,
-)
-from aetherdialect._schema_graph import ColumnMetadata, SchemaGraph, TableMetadata, recompute_join_paths_multi
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import execute_federation_coordinator
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
+from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
 def _graph(table: str, *, source_id: str) -> SchemaGraph:

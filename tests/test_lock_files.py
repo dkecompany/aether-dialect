@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from aetherdialect._constants import ARTIFACT_LOCK_FILENAME
-from aetherdialect._core_utils import artifact_lock
+from aetherdialect._utils_artifacts import artifact_lock
 
 
 @pytest.mark.fast

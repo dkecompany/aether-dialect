@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._contracts_base import OwnerOnlyOperationError
-from aetherdialect._main_execution import PipelineSession
+from aetherdialect._main_session import PipelineSession
 
 
 @pytest.mark.fast
@@ -45,7 +45,7 @@ def test_reader_restore_stays_reader() -> None:
     }
 
     with patch(
-        "aetherdialect._main_execution.MainExecutionOps.deserialize_suspended_state",
+        "aetherdialect._main_session.MainSessionSerdeOps.deserialize_suspended_state",
         return_value={
             "state_id": "execute",
             "message": "confirm",

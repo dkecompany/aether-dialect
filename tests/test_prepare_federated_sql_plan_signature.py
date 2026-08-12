@@ -6,7 +6,7 @@ import inspect
 
 import pytest
 
-from aetherdialect._pipeline import prepare_federated_sql_plan
+from aetherdialect._pipeline_execute import prepare_federated_sql_plan
 
 
 @pytest.mark.fast

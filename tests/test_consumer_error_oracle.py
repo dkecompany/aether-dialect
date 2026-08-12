@@ -6,10 +6,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE, REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE
+from aetherdialect._constants_runtime import (
+    PERMISSION_DENIED_USER_MESSAGE,
+    REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE,
+)
 from aetherdialect._contracts_base import FailureCategory
 from aetherdialect._contracts_core import GenerationPath, SqlGenerationOutcome
-from aetherdialect._main_execution import MainExecutionOps, PipelineSession
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_session import PipelineSession
 
 
 def _consumer_owner() -> MagicMock:
@@ -57,10 +61,10 @@ def test_sensitive_group_by_error_scrubbed_for_consumer() -> None:
     intent.sql_param = "SELECT 1"
 
     with patch(
-        "aetherdialect._main_execution.generate_and_validate_sql",
+        "aetherdialect._main_interactive.generate_and_validate_sql",
         return_value=gen_out,
     ):
-        with patch("aetherdialect._main_execution.note_interactive_turn") as note:
+        with patch("aetherdialect._main_interactive.note_interactive_turn") as note:
             MainExecutionOps._run_sql_phase_after_intent_confirm(
                 q_norm="count users by email",
                 intent=intent,
@@ -89,7 +93,7 @@ def test_sensitive_group_by_error_scrubbed_for_consumer() -> None:
     assert recorded["sql"] is None
     assert recorded["intent"] is None
 
-    session = PipelineSession(owner)
+    session = PipelineSession(owner, mode="reader")
     session._turn_question = "count users by email"
     session._last_turn_outcome = {
         "outcome": "permission_denied",
@@ -114,11 +118,12 @@ def test_sensitive_group_by_error_scrubbed_for_consumer() -> None:
     with patch.object(session, "_emit_turn_llm_usage", return_value=()):
         step = session._completed_step()
 
-    assert step.error is None
-    assert step.message == PERMISSION_DENIED_USER_MESSAGE
-    assert step.status == "permission_denied"
+    assert step.error is not None and step.error.code.value == "forbidden"
+    assert step.answer is None
     assert step.sql is None
-    assert "users" not in (step.message or "")
-    assert "email" not in (step.message or "")
-    assert leaking not in (step.message or "")
-    assert REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE not in (step.message or "")
+    serialized = str(step)
+    assert "users" not in serialized
+    assert "email" not in serialized
+    assert leaking not in serialized
+    assert REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE not in serialized
+    _ = PERMISSION_DENIED_USER_MESSAGE

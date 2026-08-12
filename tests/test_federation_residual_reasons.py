@@ -1,4 +1,4 @@
-"""Tests for coordinator residual rendering and retired ineligible reason strings."""
+"""Tests for coordinator residual rendering and absent cross-source ineligible reason strings."""
 
 from __future__ import annotations
 
@@ -6,13 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from aetherdialect._contracts_core import OrderByCol, ResidualSpec, SelectCol
-from aetherdialect._federation import render_federation_residual_sql
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._contracts_base import NormalizedExpr, OrderByCol
+from aetherdialect._contracts_core import ResidualSpec, SelectCol
+from aetherdialect._federation_plan import render_federation_residual_sql
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _REPO_ROOT / "src" / "aetherdialect"
-_RETIRED_REASONS = (
+_ABSENT_REASON_STRINGS = (
     "cross-source ORDER BY is not supported",
     "cross-source DISTINCT is not supported",
 )
@@ -29,11 +29,11 @@ def test_residual_order_by_renders_null_placement() -> None:
 
 
 @pytest.mark.fast
-def test_retired_cross_source_clause_reasons_have_no_emission_site() -> None:
+def test_cross_source_clause_reasons_have_no_emission_site() -> None:
     hits: list[str] = []
     for path in _SRC_ROOT.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        for reason in _RETIRED_REASONS:
+        for reason in _ABSENT_REASON_STRINGS:
             if reason in text:
                 hits.append(f"{path.relative_to(_REPO_ROOT)}: {reason}")
     assert not hits

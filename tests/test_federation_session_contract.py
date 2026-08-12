@@ -12,7 +12,7 @@ from aetherdialect._constants import (
     DIAGNOSTIC_CODE_FEDERATION_MEMBER_FAILED,
     DIAGNOSTIC_CODE_FEDERATION_PLAN_REPLAY,
 )
-from aetherdialect._contracts_base import InferenceTag
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
     FederatedPlan,
     FederatedPrepareOutcome,
@@ -22,17 +22,23 @@ from aetherdialect._contracts_core import (
     SourceStep,
     SqlGenerationOutcome,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._federation import parse_federation_manifest
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._intent_repair import expand_shared_pk_tables_for_refs
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FKEdge,
+    InferenceTag,
+    SchemaGraph,
+    SQLShape,
+    TableMetadata,
+    TemplateStats,
+)
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._intent_normalize import expand_shared_pk_tables_for_refs
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import handle_direct_sql_reuse
+from aetherdialect._pipeline_execute import handle_direct_sql_reuse
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _member_table(name: str, source_id: str) -> TableMetadata:
@@ -141,8 +147,8 @@ def test_handle_direct_sql_reuse_blocked_when_federation_manifest_active() -> No
     )
     store = TemplateOps.empty_template_store(schema.schema_graph_id)
     templates = {tmpl.id: tmpl}
-    with patch("aetherdialect._pipeline._try_federation_plan_question_reuse", return_value=None):
-        with patch("aetherdialect._pipeline.execute_reuse_with_params") as exec_mock:
+    with patch("aetherdialect._pipeline_execute._try_federation_plan_question_reuse", return_value=None):
+        with patch("aetherdialect._pipeline_execute.execute_reuse_with_params") as exec_mock:
             result = handle_direct_sql_reuse(
                 "how many t",
                 tmpl,
@@ -192,7 +198,7 @@ def test_sql_execute_suspend_context_carries_federated_prepare() -> None:
 
 
 def test_prepare_member_failure_emits_federation_diagnostic() -> None:
-    from aetherdialect._pipeline import prepare_federated_sql_plan
+    from aetherdialect._pipeline_execute import prepare_federated_sql_plan
 
     sub_intent = RuntimeIntent(
         tables=["t"],
@@ -207,7 +213,7 @@ def test_prepare_member_failure_emits_federation_diagnostic() -> None:
     schema = SchemaGraph(tables=tables, join_paths_multi=recompute_join_paths_multi(tables))
     store = TemplateOps.empty_template_store(schema.schema_graph_id)
     member_graphs = {"west": schema}
-    with patch("aetherdialect._pipeline.generate_and_validate_sql") as gen_mock:
+    with patch("aetherdialect._pipeline_execute.generate_and_validate_sql") as gen_mock:
         gen_mock.return_value = SqlGenerationOutcome(
             "",
             False,
@@ -216,7 +222,7 @@ def test_prepare_member_failure_emits_federation_diagnostic() -> None:
             sql_validation_error="bad sql",
             error_kind="validation_failed",
         )
-        with patch("aetherdialect._pipeline.notify") as notify_mock:
+        with patch("aetherdialect._pipeline_execute.notify") as notify_mock:
             outcome = prepare_federated_sql_plan(
                 "q",
                 plan,
@@ -240,11 +246,15 @@ def test_prepare_member_failure_emits_federation_diagnostic() -> None:
 def test_prepared_federated_outcome_reads_suspend_not_engine_slot() -> None:
     from aetherdialect.aetherdialect import AetherFederation
 
-    with patch("aetherdialect.aetherdialect.initialize_aether_federation"):
+    bundle = MagicMock(members=None)
+    with patch("aetherdialect.aetherdialect.initialize_aether_federation", return_value=bundle):
         fed = AetherFederation(
             "fed_surface",
-            members={"conn_a": MagicMock(), "conn_b": MagicMock()},
-            declaration_file="/tmp/aether_fed_surface_declaration.json",
+            members=(
+                MagicMock(_named_connection="conn_a", _connection="conn_a"),
+                MagicMock(_named_connection="conn_b", _connection="conn_b"),
+            ),
+            declaration="/tmp/aether_fed_surface_declaration.json",
         )
     assert fed.prepared_federated_outcome() is None
 
@@ -306,10 +316,10 @@ def test_concurrent_federation_sessions_keep_distinct_prepared_plans() -> None:
 
     def _resume(session: MagicMock, ctx: object, label: str) -> None:
         with patch(
-            "aetherdialect._main_execution.MainExecutionOps._run_sql_execution_for_gen_out",
+            "aetherdialect._main_interactive.MainInteractiveOps._run_sql_execution_for_gen_out",
             side_effect=lambda **kwargs: captured.__setitem__(label, kwargs["federated_prepare"]) or ([(1,)], None),
         ):
-            with patch("aetherdialect._main_execution.MainExecutionOps._offer_sql_feedback_after_execute"):
+            with patch("aetherdialect._main_interactive.MainInteractiveOps._offer_sql_feedback_after_execute"):
                 MainExecutionOps._complete_interactive_execute(ctx, "y", choice_port=session)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -331,7 +341,7 @@ def test_federation_plan_replay_diagnostic_code_exists() -> None:
 
 @pytest.mark.fast
 def test_member_feedback_q_norm_scopes_member_store_keys() -> None:
-    from aetherdialect._federation import member_feedback_q_norm
+    from aetherdialect._federation_manifest import member_feedback_q_norm
 
     assert member_feedback_q_norm("west", "how many orders") == "west::how many orders"
     assert member_feedback_q_norm("west", "west::how many orders") == "west::how many orders"
@@ -339,9 +349,9 @@ def test_member_feedback_q_norm_scopes_member_store_keys() -> None:
 
 @pytest.mark.fast
 def test_credit_federation_accept_raises_when_member_store_missing() -> None:
+    from aetherdialect._contracts_base import FederationConfigError
     from aetherdialect._contracts_core import FederatedPreparedStep
-    from aetherdialect._federation import FederationConfigError
-    from aetherdialect._pipeline import credit_federation_accept
+    from aetherdialect._pipeline_generate import credit_federation_accept
 
     sub_intent = RuntimeIntent(
         tables=["t"],
@@ -385,11 +395,10 @@ def test_drain_write_queue_applies_member_tree_events(monkeypatch: pytest.Monkey
     from datetime import datetime
 
     from aetherdialect._config import EngineConfig
-    from aetherdialect._contracts_base import WriteQueueEvent
-    from aetherdialect._contracts_core import FeedbackKind, QuestionFeedbackEntry, RejectionBucket
-    from aetherdialect._core_utils import emit_write_queue_event
+    from aetherdialect._contracts_core import FeedbackKind, QuestionFeedbackEntry, RejectionBucket, WriteQueueEvent
     from aetherdialect._main_execution import MainExecutionOps
-    from aetherdialect._templates import TemplateOps
+    from aetherdialect._templates_ops import TemplateOps
+    from aetherdialect._utils_artifacts import emit_write_queue_event
 
     composite_dir = tmp_path / "fed"
     member_dir = tmp_path / "member_west"
@@ -405,12 +414,12 @@ def test_drain_write_queue_applies_member_tree_events(monkeypatch: pytest.Monkey
     )
     member_store = TemplateOps.empty_template_store("member_west")
     monkeypatch.setattr(
-        "aetherdialect._templates.TemplateOps.load_template_store",
+        "aetherdialect._templates_ops.TemplateOps.load_template_store",
         lambda *_a, **_k: member_store,
     )
     saves: list[int] = []
     monkeypatch.setattr(
-        "aetherdialect._templates.TemplateOps.save_template_store",
+        "aetherdialect._templates_ops.TemplateOps.save_template_store",
         lambda _s: saves.append(1),
     )
 
@@ -444,7 +453,7 @@ def test_drain_write_queue_applies_member_tree_events(monkeypatch: pytest.Monkey
         produced_at=ts,
         payload=(("q_norm", "west::how many t"), ("entry_json", json.dumps(entry.to_dict()))),
     )
-    emit_write_queue_event(str(member_dir), ev)
+    emit_write_queue_event(str(member_dir), ev, space_name="master")
 
     applied = MainExecutionOps.drain_write_queue(owner, str(composite_dir))
     assert applied == 1
@@ -456,7 +465,8 @@ def test_drain_write_queue_applies_member_tree_events(monkeypatch: pytest.Monkey
 def test_residual_group_by_excludes_keys_not_needed_post_join() -> None:
     """Grouped cross-source residual must not copy unattributable group_by keys."""
     from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-    from aetherdialect._federation import compose_composite_graph, plan_federated_intent
+    from aetherdialect._federation_compose import compose_composite_graph
+    from aetherdialect._federation_plan import plan_federated_intent
     from aetherdialect._schema_graph import recompute_join_paths_multi
 
     manifest = parse_federation_manifest(

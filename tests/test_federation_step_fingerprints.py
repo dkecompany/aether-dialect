@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent, SelectCol, SourceStep
-from aetherdialect._federation import federation_plan_step_fingerprints
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_execute import federation_plan_step_fingerprints
 from aetherdialect._templates import TemplateRefs
-from aetherdialect._utils import intent_key
+from aetherdialect._utils_intent import intent_key
 
 
 def _member_join_intent(*, signature: list[str], candidate_id: str = "J01") -> RuntimeIntent:

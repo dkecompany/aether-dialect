@@ -1,13 +1,13 @@
 """Tests for config module constants and normalization functions."""
 
 import os
-import re
 
 import pytest
 
 from aetherdialect._config import (
     DatabricksRuntimeConfig,
     EngineConfig,
+    EngineLimits,
     PolicyConfig,
     PostgresRuntimeConfig,
     QSimConfig,
@@ -15,14 +15,11 @@ from aetherdialect._config import (
 )
 from aetherdialect._constants import (
     AGG_PATTERN,
-    AGG_QUANTITY_RE,
     AGGREGATION_ALLOWED_COLUMN_TYPES,
     COLUMN_TYPE_TO_VALUE_TYPE,
     ENGINE_STORAGE_PLACEHOLDER_DIR,
     INSTRUCTIONAL_OTHER_QUALIFIED_COLUMN_PLACEHOLDER,
     INSTRUCTIONAL_QUALIFIED_COLUMN_PLACEHOLDER,
-    INTENT_CRITICAL_RULES,
-    INTENT_SCHEMA,
     NUMERIC_ONLY_AGGREGATIONS,
     QSIM_QUESTIONS_PATTERN,
     REGISTRY_CASE_ID_RE,
@@ -53,11 +50,12 @@ from aetherdialect._constants import (
     WINDOW_RANKING_FUNCTIONS,
     WINDOW_VALUE_FUNCTIONS,
 )
+from aetherdialect._constants_runtime import INTENT_CRITICAL_RULES, INTENT_SCHEMA
 from aetherdialect._contracts_base import (
     HavingParam,
     WhereParam,
 )
-from aetherdialect._core_utils import (
+from aetherdialect._utils import (
     diagnostic_debug_enabled,
     diagnostic_force_enter,
     diagnostic_force_exit,
@@ -65,6 +63,8 @@ from aetherdialect._core_utils import (
     effective_llm_timeout_ms,
     normalize_column_type,
     normalize_value_type,
+    pop_engine_limits,
+    push_engine_limits,
     seed_warmup_failure_code_from_validate_sql_error,
 )
 
@@ -200,57 +200,6 @@ class TestNormalizeValueType:
         assert normalize_value_type("null") == "null"
 
 
-class TestAggQuantityRe:
-    """Tests for AGG_QUANTITY_RE regex."""
-
-    def test_more_than_matches(self):
-        """AGG_QUANTITY_RE matches 'more than N'."""
-        assert AGG_QUANTITY_RE.search("Orders with more than 5 items") is not None
-        assert AGG_QUANTITY_RE.search("more than 10") is not None
-
-    def test_at_least_matches(self):
-        """AGG_QUANTITY_RE matches 'at least N'."""
-        assert AGG_QUANTITY_RE.search("at least 3") is not None
-
-    def test_over_matches(self):
-        """AGG_QUANTITY_RE matches 'over N'."""
-        assert AGG_QUANTITY_RE.search("over 100") is not None
-
-    def test_less_than_matches(self):
-        """AGG_QUANTITY_RE matches 'less than N'."""
-        assert AGG_QUANTITY_RE.search("less than 2") is not None
-
-    def test_no_more_than_matches(self):
-        """AGG_QUANTITY_RE matches 'no more than N'."""
-        assert AGG_QUANTITY_RE.search("no more than 1") is not None
-
-    def test_a_minimum_of_matches(self):
-        """AGG_QUANTITY_RE matches 'a minimum of N'."""
-        assert AGG_QUANTITY_RE.search("a minimum of 5") is not None
-
-    def test_a_maximum_of_matches(self):
-        """AGG_QUANTITY_RE matches 'a maximum of N'."""
-        assert AGG_QUANTITY_RE.search("a maximum of 10") is not None
-
-    def test_no_match_without_number(self):
-        """AGG_QUANTITY_RE does not match when no number follows phrase."""
-        assert AGG_QUANTITY_RE.search("more than many") is None
-
-    def test_case_insensitive(self):
-        """AGG_QUANTITY_RE is case-insensitive."""
-        assert AGG_QUANTITY_RE.search("MORE THAN 5") is not None
-
-    def test_above_matches(self):
-        """AGG_QUANTITY_RE matches 'above N'."""
-        assert AGG_QUANTITY_RE.search("above 3") is not None
-        assert AGG_QUANTITY_RE.search("customers with above 5 rentals") is not None
-
-    def test_below_matches(self):
-        """AGG_QUANTITY_RE matches 'below N'."""
-        assert AGG_QUANTITY_RE.search("below 10") is not None
-        assert AGG_QUANTITY_RE.search("stores with below 2 employees") is not None
-
-
 class TestAggPattern:
     """Tests for AGG_PATTERN regex."""
 
@@ -327,7 +276,7 @@ class TestRoleAllowedAggregations:
 
     def test_audit_empty(self):
         """AUDIT role allows no aggregations."""
-        assert ROLE_ALLOWED_AGGREGATIONS["AUDIT"] == set()
+        assert ROLE_ALLOWED_AGGREGATIONS["AUDIT"] == {"count"}
 
     def test_boolean_count_and_sum(self):
         """BOOLEAN role allows only count (sum is rejected by AGGREGATION_ALLOWED_COLUMN_TYPES['sum'])."""
@@ -489,18 +438,27 @@ class TestEffectiveTimeouts:
 
     def test_effective_explain_prefers_explicit(self, monkeypatch):
         monkeypatch.setattr(PolicyConfig, "EXPLAIN_TIMEOUT_MS", 5000)
-        monkeypatch.setattr(PolicyConfig, "STATEMENT_TIMEOUT_MS", 30_000)
-        assert effective_explain_timeout_ms() == 5000
+        token = push_engine_limits(EngineLimits(statement_timeout_ms=30_000))
+        try:
+            assert effective_explain_timeout_ms() == 5000
+        finally:
+            pop_engine_limits(token)
 
     def test_effective_explain_falls_back_to_statement(self, monkeypatch):
         monkeypatch.setattr(PolicyConfig, "EXPLAIN_TIMEOUT_MS", None)
-        monkeypatch.setattr(PolicyConfig, "STATEMENT_TIMEOUT_MS", 42_000)
-        assert effective_explain_timeout_ms() == 42_000
+        token = push_engine_limits(EngineLimits(statement_timeout_ms=42_000))
+        try:
+            assert effective_explain_timeout_ms() == 42_000
+        finally:
+            pop_engine_limits(token)
 
     def test_effective_explain_disabled_when_both_off(self, monkeypatch):
         monkeypatch.setattr(PolicyConfig, "EXPLAIN_TIMEOUT_MS", None)
-        monkeypatch.setattr(PolicyConfig, "STATEMENT_TIMEOUT_MS", None)
-        assert effective_explain_timeout_ms() is None
+        token = push_engine_limits(EngineLimits(statement_timeout_ms=None))
+        try:
+            assert effective_explain_timeout_ms() is None
+        finally:
+            pop_engine_limits(token)
 
 
 class TestValidRelativeDateUnits:
@@ -741,11 +699,6 @@ class TestQSimConfig:
         """QSIM_QUESTIONS_PATTERN contains {version}."""
         assert "{version}" in QSIM_QUESTIONS_PATTERN
 
-    def test_excluded_filter_patterns_are_valid_regex(self):
-        """EXCLUDED_WHERE_PATTERNS are valid regex strings."""
-        for pat in QSimConfig.EXCLUDED_WHERE_PATTERNS:
-            re.compile(pat)
-
 
 class TestSeedWarmupConfig:
     """Tests for SeedWarmupConfig."""
@@ -860,15 +813,10 @@ class TestIntentSchema:
                 }
             ],
         }
-        for emission in ("semi_join", "anti_join"):
+        for emission in ("semi_join", "anti_join", "join_table", "scalar_subquery"):
             step = dict(payload["cte_steps"][0])
             step["emission"] = emission
             jsonschema.validate(instance={**payload, "cte_steps": [step]}, schema=INTENT_SCHEMA)
-        for emission in ("join_table", "scalar_subquery"):
-            step = dict(payload["cte_steps"][0])
-            step["emission"] = emission
-            with pytest.raises(jsonschema.ValidationError):
-                jsonschema.validate(instance={**payload, "cte_steps": [step]}, schema=INTENT_SCHEMA)
 
     def test_rejects_invalid_emission_value(self) -> None:
         import jsonschema
@@ -1040,11 +988,11 @@ class TestMiscConstants:
 
 
 class TestPromptNeutrality:
-    """Regression checks for neutral vocabulary constants."""
+    """Neutral vocabulary constants."""
 
     def test_vocab_guidance_has_no_polarity_example_tokens(self):
         """QUESTION_NORMALIZE_VOCABULARY_GUIDANCE avoids enumerated polarity pairs."""
-        from aetherdialect._constants import QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
+        from aetherdialect._constants_runtime import QUESTION_NORMALIZE_VOCABULARY_GUIDANCE
 
         low = QUESTION_NORMALIZE_VOCABULARY_GUIDANCE.lower()
         assert "positive:" not in low
@@ -1052,7 +1000,7 @@ class TestPromptNeutrality:
 
     def test_irregular_plurals_exclude_demographic_tokens(self):
         """IRREGULAR_PLURALS_MAP lists morphological irregulars only."""
-        from aetherdialect._constants import IRREGULAR_PLURALS_MAP
+        from aetherdialect._constants_runtime import IRREGULAR_PLURALS_MAP
 
         assert "women" not in IRREGULAR_PLURALS_MAP
         assert "men" not in IRREGULAR_PLURALS_MAP
@@ -1060,7 +1008,7 @@ class TestPromptNeutrality:
     def test_negation_tokens_not_in_stopwords(self):
         """Negators must remain available to the question normaliser."""
         from aetherdialect._config import PolicyConfig
-        from aetherdialect._constants import STOPWORDS_GRAMMATICAL_PARTICLES
+        from aetherdialect._constants_runtime import STOPWORDS_GRAMMATICAL_PARTICLES
 
         negators = ("not", "without", "except", "no", "never", "neither", "nor")
         for t in negators:
@@ -1082,9 +1030,9 @@ class TestPlannerMandatoryConventions:
     """Planner NL conventions include anti-spurious clause guidance."""
 
     def test_groupby_orderby_limit_rule_present(self) -> None:
-        from aetherdialect._intent_process import PLANNER_NL_CONVENTIONS
+        from aetherdialect._constants_runtime import INTERPRET_NL_CONVENTIONS
 
-        mandatory = list(PLANNER_NL_CONVENTIONS["mandatory"])
+        mandatory = list(INTERPRET_NL_CONVENTIONS["mandatory"])
         assert any("group_by" in m and "order_by" in m and "limit" in m and "empty" in m.lower() for m in mandatory)
 
 

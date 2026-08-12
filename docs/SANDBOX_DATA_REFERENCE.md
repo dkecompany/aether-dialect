@@ -1,8 +1,8 @@
 # Sandbox data reference
 
-Closed-world inventory of every table, column, view, federation member, and practice question shipped in the **rental_shop** sandbox bundle. Use this document when authoring `EngineContext(allow_objects=...)`, federation declarations, or AetherSpace scopes. For session recipes and API patterns, see [Sandbox guide](SANDBOX.md).
+Closed-world inventory of every table, column, view, federation member, and bundled question shipped in the **rental_shop** sandbox bundle. Use this document when authoring `EngineContext(allow_objects=...)`, federation declarations, or AetherSpace scopes. For session walkthroughs and API patterns, see [Sandbox guide](SANDBOX.md).
 
-**Reading order:** [Sandbox guide](SANDBOX.md) -> this document.
+**Reading order:** [README](../README.md) → [Getting started](GETTING_STARTED.md) → [User guide](USER_GUIDE.md) → [Integrator guide](INTEGRATOR_GUIDE.md) → [Sandbox guide](SANDBOX.md) → [API reference](API_REFERENCE.md) → [Troubleshooting](TROUBLESHOOTING.md) → [How it works](HOW_IT_WORKS.md) → [Security](SECURITY.md) → [Support matrix](SUPPORT_MATRIX.md) → this document.
 
 ## Sections
 
@@ -12,10 +12,11 @@ Closed-world inventory of every table, column, view, federation member, and prac
 | [Single-engine schema](#single-engine-schema) | All 34 tables with columns, keys, and foreign keys |
 | [Views](#views) | Bundled analytical views and `include="views"` |
 | [Bundled notes and named spaces](#bundled-notes-and-named-spaces) | Optional notes fixtures and `SpaceContext` subsets |
-| [Overrides and sensitivity fixtures](#overrides-and-sensitivity-fixtures) | Hidden vs denied columns |
+| [Structure and sensitivity fixtures](#structure-and-sensitivity-fixtures) | Hidden vs denied columns, bundled structure demos |
 | [Consumer scopes](#consumer-scopes) | Owner role and narrowed consumer `allow_objects` |
 | [Federation topology](#federation-topology) | Members, replicas, joins, and logical tables |
-| [Question corpus](#question-corpus) | Practice question tiers |
+| [Question corpus](#question-corpus) | Bundled question tiers |
+| [Authoring checklist](#authoring-checklist) | Closed-world naming rules |
 
 ---
 
@@ -27,7 +28,7 @@ Closed-world inventory of every table, column, view, federation member, and prac
 | Analytical views | **3** (`rental_shop_views.sql`; loaded when `include="views"`) |
 | DuckDB schema | `main` (default in-memory connection) |
 | Synthetic activity dates | Predominantly **2022–2025** (some seed rows span earlier years) |
-| Closed-world rule | Every table, column, member name, and practice question in this document is namable in the sandbox |
+| Closed-world rule | Every table, column, member name, and bundled question in this document is namable in the sandbox |
 
 The single-engine owner seed loads all 34 tables from `rental_shop.sql` into one in-memory DuckDB database. Views are defined separately and are not part of the base seed DDL.
 
@@ -35,7 +36,7 @@ The single-engine owner seed loads all 34 tables from `rental_shop.sql` into one
 
 ## Single-engine schema
 
-Tables are grouped by business area. Column types match `rental_shop.sql`. Primary keys (PK) and foreign keys (FK) list the referenced table.
+Tables are grouped by domain area. Column types match `rental_shop.sql`. Primary keys (PK) and foreign keys (FK) list the referenced table.
 
 ### Geography and language
 
@@ -420,7 +421,7 @@ Unique on (`promotion_id`, `rental_id`).
 
 ## Views
 
-Three analytical views ship in `rental_shop_views.sql`. They are **not** in `rental_shop.sql`. Load them with `AetherEngine.offline_sandbox(include="views")` or `EngineContext(include="views")`. The `include` selector is per kind: `"tables"` reflects base tables only (default); `"views"` reflects views only.
+Three analytical views ship in `rental_shop_views.sql`. They are separate from `rental_shop.sql`. Load them with `Sandbox().engine(include="views")` or `EngineContext(include="views")`. The `include` selector is per kind: `"tables"` reflects base tables only (default); `"views"` reflects views only.
 
 | View | Columns | Base tables |
 | --- | --- | --- |
@@ -432,53 +433,75 @@ Three analytical views ship in `rental_shop_views.sql`. They are **not** in `ren
 
 ## Bundled notes and named spaces
 
-Hosts may define named AetherSpaces with any `SpaceContext` table subset validated against the schema graph. **Notes are optional** — `SpaceContext(tables={...})` without `notes_file` is valid. Attach bundled notes when you want knowledge-narrowing demos.
+Hosts may define named AetherSpaces with any `SpaceContext` table subset validated against the schema graph. **Notes are optional** — `SpaceContext(tables={...})` without `notes_file` is valid. The corpus also ships four member-aligned spaces (`storefront`, `catalog`, `logistics`, `crm`) whose table scopes match `federation_partition.json`. The same spaces are used for single-engine and federation demos.
 
 ```python
-from aetherdialect import AetherEngine, SpaceContext
+from aetherdialect import Sandbox, SpaceContext
 
-with AetherEngine.offline_sandbox() as sb:
-    sb.engine.aetherspace(
+with Sandbox() as sandbox:
+    engine = sandbox.engine()
+    space = engine.aetherspace(
         "catalog",
         space_context=SpaceContext(
             tables=frozenset({"item", "film", "category", "item_category"}),
         ),
     )
-    with sb.session(space="catalog") as session:
+    with engine.session(space=space.uid) as session:
         session.accept_until_done("How many films are in the Horror category?")
 ```
 
-Two owner note files ship with the corpus. Full bundled text:
+Owner note files ship with the corpus. Full bundled text:
 
-### `rental_shop_notes.txt` (default master space)
-
-```text
-The Rental Shop inventory system tracks films, books, and games through a unified catalog. Every media entry is represented by a central item record that contains common attributes like title, description, release year, and language. Specific details for each media type are stored in dedicated tables for films, books, and games. For films, we track physical length and ratings, while additional features like trailers or deleted scenes are managed as separate line items rather than being embedded in the main record.
-
-Rental tracking is based on strict date semantics. The rental date marks when an item was checked out, while the return date indicates when it was received back. If no return date is recorded, the item is still with the customer. Items have a defined rental duration in days; a rental is considered overdue if it hasn't been returned and the allowed duration has passed since the checkout date.
-
-Inventory is managed at the store level, where each record represents a specific physical copy of an item at a particular location. Status history allows us to track whether a copy is available, currently rented, undergoing repair, or lost. Payments are directly associated with these rental transactions.
-
-Our customer database includes contact information and employment status for staff members. We maintain strict privacy controls: sensitive staff credentials like passwords and social security numbers are completely hidden from the system and must never be included in any analysis or output.
-
-The system also handles advance reservations, damage reporting for returned items, and optional delivery services through various courier partners. Procurement and stock transfers between stores and warehouses ensure that inventory levels remain balanced. Promotions and loyalty rewards are applied to rentals using specific redemption codes and types like clearance or member specials.
-```
-
-### `sandbox_space_catalog_notes.txt` (second-space demo)
+### `rental_shop_notes.txt` (default space)
 
 ```text
-The catalog inventory focuses on our core sellable media assets and their organization. We track individual items and their specific attributes across different formats, primarily films.
+Film, book, and game share one catalog spine on item. Title, rental_duration, and rental_rate live there. item_type is film, book, or game and the type tables hang off item_id. People say title and they mean item.title. Film has rating and length. Games have esrb, platform, and developer. Books have author, publisher, and isbn. language_id on the item is the usual language join. Film can also carry original_language_id. Categories are names people care about more than ids, and a title can sit in more than one. Trailers, commentaries, and deleted_scenes are item_feature rows with audio or video, not columns on film. game_supported_language is the dubbing bridge. I forget it until someone asks.
 
-Classification is handled through a category system that allows us to group items for better discovery. Each item can belong to one or more categories. When analyzing this part of the business, we prioritize descriptive category names and media titles over internal numeric identifiers. This domain is concerned with the attributes and grouping of the media itself, rather than transaction history, revenue, or store-specific logistics.
+Inventory is a physical copy at a store, not the abstract title. inventory_status_history.status is the copy state with available, rented, damaged, in_repair, lost, and retired. Use the latest change when someone asks if it is available. rental_date is checkout. return_date null means still out. Overdue is still out and past rental_date plus item.rental_duration. payment.amount is money on a rental. There is no FX table. A rental can have more than one payment row. There is no separate late-fee table. Staff credentials like ssn and passwords are hidden and off limits. customer.email is PII-ish. Phone lives on address. Store location is store to address to city to country.
+
+Reservations are holds with pending, fulfilled, expired, or cancelled status, not an active rental. Promotions use promo_type values like clearance, new_member, loyalty_reward, weekday_special, and bundle. promotion_redemption ties a promo to a rental with discount_amount. There is no staff_id on the redemption. damage_report severity is minor, moderate, or severe. Delivery is optional home drop-off through courier. Most rentals never touch it. Procurement is purchase_order and purchase_line to a supplier. stock_transfer moves quantity from warehouse to store. Supplier and courier are vendors, not customers.
+
+ARR in finance chat means annualized rental revenue from payment amounts, even though the rows are daily. NRR means revenue from returning customers, not first-time walk-ins. FY for ops chatter is April through March. That is whiteboard folklore, not a column. SLA in the warehouse corner means pick-to-ship hours. People loosely say under 24h is on-time though nothing encodes that. Deep catalog is merchandising slang for titles with release_year older than about ten years. VIP is informal for heavy promo redeemers, not a column. Churny is also slang. There is no churn table. It usually means no recent rental and no recent redemption. When people say busy Saturday they mean rental_date volume by store, not a staff schedule.
 ```
 
-Use with `SpaceContext(tables={...}, notes_file="sandbox_space_catalog_notes.txt")` as shown in [Sandbox guide - Named AetherSpaces](SANDBOX.md#named-aetherspaces).
+### `federation_storefront_notes.txt` (storefront member space)
+
+```text
+Customers, staff, stores, rentals, payments, and reservations sit with the address to city to country chain for where people and stores live. ARR for finance chat is annualized rental revenue rolled from payment.amount even though the ledger is daily rows. NRR is the same idea but only returning customers, not first-time walk-ins. A rental with return_date null means the copy is still out. Overdue is still out and past rental_date plus the agreed rental_duration when that duration is known. payment.amount is money. Never invent FX rates. A rental can show more than one payment row. There is no separate late-fee table. customer.email is sensitive. Phone is on address. FY for ops chatter is April through March, not calendar year. That is whiteboard folklore, not a column. Reservations are holds with pending, fulfilled, expired, or cancelled status, not an active rental. Staff credentials like ssn and passwords are off limits. If someone asks where store 2 is they mean store to address to city to country. Busy Saturday means rental_date volume by store, not a staff roster fiction.
+```
+
+### `federation_catalog_notes.txt` (catalog member space)
+
+```text
+Titles and media metadata live on item as the shared spine for film, book, and game. The type tables hang off item_id. People say title meaning item.title. Film has rating and length. Games use esrb, platform, and developer. Books lean on author, publisher, and isbn. item.language_id is the main language join. film.original_language_id is the original-language hook. ARR means licensed title count growth year over year, not cash revenue. Category names matter more than ids. An item can sit in multiple categories. Inventory rows are physical copies at a store, not the abstract title. Actor hooks through film_actor. Trailers and commentaries are item_feature lines, not film columns. Deep catalogue is merchandising slang for release_year older than about ten years. If someone asks how many films they usually mean film joined to item, not inventory copy counts. City and country may be present but titles do not hang geography off them. Use language for language questions.
+```
+
+### `federation_logistics_notes.txt` (logistics member space)
+
+```text
+Warehouses and the messy middle. stock_transfer moves item quantity from warehouse to store at transferred_at. purchase_order plus purchase_line is buying from a supplier for a store. received_date plus status received is when goods landed. inventory_status_history is the copy-state truth with available, rented, damaged, in_repair, lost, and retired. That is not a vibe and not a shortened repair label. damage_report is after a bad return with severity minor, moderate, or severe. Delivery and courier are optional home drop-off tied to a rental. Most rentals never touch them. unit_cost and delivery_fee are money. receipts is a payment-shaped ledger with rcpt_id, rent_id, amt, and dt. It is money against a rental, not a goods-received document. SLA means warehouse pick-to-ship hours. People loosely say under 24h is on-time even though nothing codes that rule. Dead stock is slang for copies that sat available forever with no rental buzz. There is no dead_stock table. FY is April through March when ops argues about transfer volume. Suppliers are vendors, not customers.
+```
+
+### `federation_crm_notes.txt` (crm member space)
+
+```text
+Customers sit with the promo machine. promo_type values in use are clearance, new_member, loyalty_reward, weekday_special, and bundle, with start and end dates and optional discount_pct. promotion_redemption is a promo used on a rental_id with discount_amount. There is no staff column on the redemption. Customer comes through the rental. Different promos can land on the same rental, but the same promotion_id cannot redeem twice on one rental_id. ARR often means active rewarded renters, customers with at least one redemption in the period, not cash revenue from payments. Churny customers are ones with no recent redemption and no rental buzz. There is no churn table. VIP is informal for heavy redeemers, not a column. Promo windows matter more than the promotion_id number when explaining a campaign. customer.email is sensitive. Staff may show up as people who work the floor, not as who keyed the code. If the exact promo_type list is needed, read the data. Do not invent member_special.
+```
+
+Use with `SpaceContext(tables=SANDBOX_MEMBER_SPACE_TABLES[<member>], notes_file="federation_<member>_notes.txt")` as shown in [Sandbox guide - Named AetherSpaces](SANDBOX.md#named-aetherspaces).
 
 ---
 
-## Overrides and sensitivity fixtures
+## Structure and sensitivity fixtures
 
-Two override files ship with distinct roles.
+### Hidden versus denied
+
+| Mechanism | Where set | Effect |
+| --- | --- | --- |
+| `sensitivity: hidden` in structure document | `rental_shop_overrides.json` (corpus build input), `schema_structure_demo.json` (bundled runtime demo) | Column **remains in the schema graph** but is blocked from prompts and validation |
+| `deny_columns` on `EngineContext` / `Sandbox().engine(...)` | constructor parameter | Column is **removed from the schema graph** before profiling — the engine does not know it exists |
+
+Two structure fixture files ship with distinct roles.
 
 ### `rental_shop_overrides.json` (corpus baseline)
 
@@ -489,36 +512,29 @@ Applied during bundle build. Effects:
 | `staff.ssn`, `staff.password` | `sensitivity: hidden` |
 | `foreign_keys_add` | Adds join edges not present in raw DDL: `film`/`book`/`game` → `item_category`; `game` → `game_supported_language`; `customer` → `address` → `city` → `country`; `rental` → `inventory` → `item` |
 
-### `sandbox_overrides_demo.json` (runtime demo)
+### `schema_structure_demo.json` (runtime demo)
 
-Applied via `apply_bundled_schema_overrides()`:
+Copy the JSON below and call `apply_structure(document)` on an owner engine — the same production workflow:
 
 | Target | Effect |
 | --- | --- |
 | `staff.ssn`, `staff.password` | `sensitivity: hidden` |
-| `film` | analyst description override |
 
 Full bundled JSON:
 
 ```json
 {
-  "version": "0.2.1",
-  "tables": {
-    "staff": {
-      "columns": {
-        "ssn": {
-          "sensitivity": "hidden"
-        },
-        "password": {
-          "sensitivity": "hidden"
-        }
-      }
-    },
-    "film": {
-      "description": "Sandbox demo override: Rental Shop film catalog.",
-      "role": null
+  "table_count": 1,
+  "tables": [
+    {
+      "name": "staff",
+      "columns": [
+        {"name": "ssn", "data_type": "VARCHAR", "sensitivity": "hidden"},
+        {"name": "password", "data_type": "VARCHAR", "sensitivity": "hidden"}
+      ]
     }
-  },
+  ],
+  "relationships": [],
   "foreign_keys_add": [],
   "foreign_keys_remove": [],
   "primary_keys_add": [],
@@ -526,18 +542,11 @@ Full bundled JSON:
 }
 ```
 
-### Hidden versus denied
-
-| Mechanism | Where set | Effect |
-| --- | --- | --- |
-| `sensitivity: hidden` in overrides | `rental_shop_overrides.json`, `sandbox_overrides_demo.json` | Column **remains in the schema graph** but is blocked from prompts and validation |
-| `deny_columns` on `EngineContext` / `offline_sandbox(...)` | constructor parameter | Column is **removed from the schema graph** before profiling — the engine does not know it exists |
-
 ---
 
 ## Consumer scopes
 
-`role="consumer"` uses the **same practice question surface** as the owner role (`AetherEngine.sandbox_questions()` and the other catalog helpers). Narrow visibility with `EngineContext(allow_objects=...)` — any subset of the owner seed tables is valid. Questions that reference tables outside the allow list fail at ask or execution with permission or schema refusal.
+`role="consumer"` uses the **same question corpus** as the owner role — see [Question corpus](#question-corpus). Narrow visibility with a plain `EngineContext(allow_objects=...)`; any subset of the owner seed tables is valid, and there is no `create_consumer_*` helper. Questions that reference tables outside the allow list fail at ask or execution with permission or schema refusal. Consumer `allow_objects` is not an AetherSpace permission axis; the full security model is in [Security - Execution boundary](SECURITY.md#2-execution-boundary-and-credentials) and [Integrator guide - Multi-user deployment](INTEGRATOR_GUIDE.md#multi-user-deployment).
 
 ### Owner (default)
 
@@ -545,27 +554,77 @@ No `allow_objects` restriction — all **34** base tables from [Single-engine sc
 
 ### Consumer (`role="consumer"`)
 
-When you call `sandbox.engine(role="consumer")` or pass a consumer `EngineContext` to `AetherEngine.offline_sandbox()`, the engine runs in reader session mode and enqueues learning events instead of applying them locally. Table visibility follows your `allow_objects` set. If you omit `allow_objects`, the consumer sees the full **34**-table owner seed (same table list as owner).
+When you call `sandbox.engine(role="consumer")` or pass a consumer `EngineContext` to `Sandbox().engine(...)`, open a **reader** session (`mode="reader"`). Reader sessions keep learning session-local and do **not** enqueue durable write-queue events. Table visibility follows your `allow_objects` set. If you omit `allow_objects`, the consumer sees the full **34**-table owner seed.
 
-Pass an explicit `EngineContext(allow_objects=...)` to exercise narrowed scopes.
+### Four documented member scopes
 
-### Example: permission-denied exercise
-
-One common narrow allow list for practising permission errors:
-
-`customer`, `payment`, `rental`, `address`, `city`, `country`
+The four bundled federation member table sets ([Federation topology - Members](#members)) double as ready-made consumer `allow_objects` scopes on the **single engine** — no separate helper, just pass the same table set:
 
 ```python
 from aetherdialect import EngineContext, Sandbox
 
-narrow = EngineContext(
-    allow_objects=frozenset({"customer", "payment", "rental", "address", "city", "country"}),
+storefront_scope = EngineContext(
+    allow_objects=frozenset(
+        {"address", "city", "country", "customer", "payment", "rental", "reservation", "staff", "store"}
+    )
 )
+catalog_scope = EngineContext(
+    allow_objects=frozenset(
+        {
+            "actor",
+            "author",
+            "book",
+            "category",
+            "city",
+            "country",
+            "film",
+            "film_actor",
+            "game",
+            "game_supported_language",
+            "inventory",
+            "item",
+            "item_category",
+            "item_feature",
+            "language",
+            "payment",
+            "publisher",
+        }
+    )
+)
+logistics_scope = EngineContext(
+    allow_objects=frozenset(
+        {
+            "courier",
+            "damage_report",
+            "delivery",
+            "inventory_status_history",
+            "purchase_line",
+            "purchase_order",
+            "receipts",
+            "stock_transfer",
+            "supplier",
+            "warehouse",
+        }
+    )
+)
+crm_scope = EngineContext(
+    allow_objects=frozenset({"customer", "promotion", "promotion_redemption", "staff"})
+)
+
 with Sandbox() as sandbox:
-    engine = sandbox.engine(narrow, role="consumer")
+    engine = sandbox.engine(storefront_scope, role="consumer")
 ```
 
-Questions referencing tables outside this set (for example `staff`) should fail with permission or schema errors. See [Sandbox guide - Owner vs consumer roles](SANDBOX.md#owner-vs-consumer-roles).
+Explicit allow frozensets (same values as `SANDBOX_MEMBER_SPACE_TABLES`):
+
+| Member | `allow_objects` |
+| --- | --- |
+| `storefront` | `frozenset({"address", "city", "country", "customer", "payment", "rental", "reservation", "staff", "store"})` |
+| `catalog` | `frozenset({"actor", "author", "book", "category", "city", "country", "film", "film_actor", "game", "game_supported_language", "inventory", "item", "item_category", "item_feature", "language", "payment", "publisher"})` |
+| `logistics` | `frozenset({"courier", "damage_report", "delivery", "inventory_status_history", "purchase_line", "purchase_order", "receipts", "stock_transfer", "supplier", "warehouse"})` |
+| `crm` | `frozenset({"customer", "promotion", "promotion_redemption", "staff"})` |
+
+Questions referencing tables outside the chosen set (for example asking a `catalog`-scoped consumer about `staff`) fail with permission or schema errors — see [Sandbox guide - Owner vs consumer roles](SANDBOX.md#owner-vs-consumer-roles).
 
 ---
 
@@ -582,16 +641,18 @@ Federation ID: **`sandbox_rental_shop`** (offline). Declaration: `federation_dec
 | `logistics` | DuckDB in-memory | `courier`, `damage_report`, `delivery`, `inventory_status_history`, `purchase_line`, `purchase_order`, `receipts`, `stock_transfer`, `supplier`, `warehouse` |
 | `crm` | DuckDB in-memory | `customer`, `promotion`, `promotion_redemption`, `staff` |
 
-Offline construction: `Sandbox().federation("sandbox_rental_shop")` loads four separate in-memory DuckDB connections with per-member artifact trees.
+Offline construction: `Sandbox().federation("sandbox_rental_shop")` loads **all four** members on separate in-memory DuckDB connections with per-member artifact trees. Passing a partial `members=` map (for example only `storefront` and `catalog`) raises `ConfigError` — the sandbox federation is fixed to the full quartet.
 
 ### Payment union split
 
-`payment` is the only table present on **two** members (`storefront` and `catalog`). The declaration models it as a `union` logical table — queries aggregate across both partitions without double-counting rows that exist on only one member.
+`payment` is present on `storefront` and `catalog`, and logistics contributes historical `receipts` into the same logical table. The declaration models it as a `union` — queries aggregate across those partitions without treating them as a single replica.
 
 ### Replica tables
 
 | Logical table | Semantics | Authoritative member | Replica member |
 | --- | --- | --- | --- |
+| `city` | `replica` | `storefront` | `catalog` (local geography copy for publisher FKs; may drift) |
+| `country` | `replica` | `storefront` | `catalog` (local geography copy for publisher FKs; may drift) |
 | `customer` | `replica` | `storefront` | `crm` |
 | `staff` | `replica` | `storefront` | `crm` (column subset only) |
 
@@ -624,7 +685,9 @@ Credentials (`password`, `ssn`, `email`, `username`, `address_id`, `active`) nev
 
 | Logical | Semantics | Members |
 | --- | --- | --- |
-| `payment` | `union` | `storefront.payment`, `catalog.payment` |
+| `payment` | `union` | `storefront.payment`, `catalog.payment`, `logistics.receipts` |
+| `city` | `replica` (authoritative: `storefront`) | `storefront.city`, `catalog.city` |
+| `country` | `replica` (authoritative: `storefront`) | `storefront.country`, `catalog.country` |
 | `customer` | `replica` (authoritative: `storefront`) | `storefront.customer`, `crm.customer` |
 | `staff` | `replica` (authoritative: `storefront`) | `storefront.staff`, `crm.staff` (column subset) |
 
@@ -634,14 +697,14 @@ Member roster fields (`sources`, `table_namespace`) are derived at compose time 
 
 ## Question corpus
 
-Practice strings live in `sandbox_questions.txt` inside the bundled `data.zip`. Tiers and counts:
+Bundled question strings ship inside the installed package and are listed in the sections below. Copy questions from the lists below into `session.ask(...)` / `session.accept_until_done(...)` — there is no public method that returns them. Tiers and counts:
 
-| Tier | Count | Returned by |
+| Tier | Count | Use |
 | --- | --- | --- |
-| `questions` | 50 | `AetherEngine.sandbox_questions()` |
-| `validation_failures` | 4 | `AetherEngine.sandbox_validation_failure_demo()` |
-| `feedback_samples` | 1 | `AetherEngine.sandbox_feedback_demo()` |
-| `views_questions` | 3 | **Not** returned by `sandbox_questions()` — use when practising with `include="views"` |
+| `questions` | 50 | General questions on the owner/consumer engine |
+| `validation_failures` | 4 | Expected to end in terminal validation errors |
+| `feedback_samples` | 1 | Anchor question for the rejection/feedback exercise ([Sandbox guide - Rejections and feedback](SANDBOX.md#rejections-and-feedback)) |
+| `views_questions` | 3 | Questions for `include="views"` (not part of the `questions` tier) |
 
 ### `questions` tier (50)
 
@@ -696,6 +759,64 @@ Practice strings live in `sandbox_questions.txt` inside the bundled `data.zip`. 
 - What is the average payment amount grouped by film category?
 - List all films in the catalog.
 
+### Member-space question subsets
+
+These are subsets of the `questions` tier that stay in-scope for the matching member-aligned AetherSpace (`session(space=...)`). Every question below remains valid on single-engine default space and on the full four-member federation.
+
+#### Storefront member
+
+- How many open reservations are there?
+- Show active staff at each store.
+- How many rentals happened in 2025?
+- Who are our top 5 customers by total payment?
+- What is the count of pending reservations by store?
+- List all store locations by city.
+- Which staff members work at store 1?
+- List customers who have never rented an item.
+- What is the total revenue by store?
+- Which city has the most customers?
+- How many customers are in each country?
+- What is the average payment amount?
+- How many rentals are currently overdue?
+
+#### Catalog member
+
+- How many items are in the catalog by item type?
+- How many books do we have?
+- How many games are in the catalog?
+- Which films include trailers?
+- Which games support English?
+- What is the average rental duration?
+- Which films have the highest replacement cost?
+- How many actors are in the database?
+- What are the film ratings available?
+- How many films are in the Horror category?
+- Which languages are available?
+- Which actors appear in the most films?
+- Which actors have the most film credits?
+- Which films are in the Horror category?
+- List films released in 2006.
+- Which author has the most books?
+- How many inventory items does each store have?
+- List publishers with more than five books.
+- What is the average page count by publisher?
+- List all films in the catalog.
+
+#### Logistics member
+
+- What is the total delivery fee by courier?
+- Show purchase orders still open by supplier.
+- How many damage reports are open?
+- List inventory status changes in the last 90 days.
+- Which warehouse holds the most stock?
+- Show delivery status counts by courier.
+- List stock transfers between warehouses this year.
+- Which suppliers have the most purchase lines?
+
+#### CRM member
+
+- List promotion redemptions by promotion name.
+
 ### `validation_failures` tier (4)
 
 - Show payroll deductions by employee SSN.
@@ -725,7 +846,5 @@ The sandbox is closed-world. When authoring scopes or declarations, names must c
 | Federation member names | [Federation topology - Members](#members) (`storefront`, `catalog`, `logistics`, `crm`) |
 | `cross_source_joins`, `logical_tables`, `logical_columns` | [Federation topology](#federation-topology) |
 | AetherSpace table subsets | Any subset of the 34 base tables |
-| Practice question wording | [Question corpus](#question-corpus) tiers |
+| Bundled question wording | [Question corpus](#question-corpus) tiers |
 | View names | [Views](#views) (`active_customer_v`, `store_revenue_v`, `film_catalog_v`) |
-
----

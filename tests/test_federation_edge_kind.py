@@ -20,15 +20,11 @@ from aetherdialect._contracts_core import (
     SelectCol,
     SourceStep,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    FederationMappings,
-    _collect_member_reducing_edges,
-    inject_semijoin_where,
-    parse_federation_manifest,
-    plan_federated_intent,
-)
-from aetherdialect._pipeline import _execute_federation_source_step
+from aetherdialect._contracts_schema import ColumnMetadata, FederationMappings, SchemaGraph, TableMetadata
+from aetherdialect._federation_execute import inject_semijoin_where
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import _collect_member_reducing_edges, plan_federated_intent
+from aetherdialect._pipeline_execute import _execute_federation_source_step
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -138,19 +134,19 @@ def _execution_harness(
         *,
         value_type: str = "string",
     ) -> RuntimeIntent:
-        from aetherdialect._federation import inject_filter_keys_where
+        from aetherdialect._federation_execute import inject_filter_keys_where
 
         filter_keys_called.append(True)
         return inject_filter_keys_where(sub_intent, key_column, keys, value_type=value_type)
 
-    monkeypatch.setattr("aetherdialect._pipeline.inject_semijoin_where", _track_semijoin)
+    monkeypatch.setattr("aetherdialect._pipeline_execute.inject_semijoin_where", _track_semijoin)
     monkeypatch.setattr(
-        "aetherdialect._pipeline.inject_filter_keys_where",
+        "aetherdialect._pipeline_execute.inject_filter_keys_where",
         _track_filter_keys,
         raising=False,
     )
     monkeypatch.setattr(
-        "aetherdialect._pipeline.generate_and_validate_sql",
+        "aetherdialect._pipeline_execute.generate_and_validate_sql",
         lambda *_a, **_k: type("Out", (), {"success": True, "sql": "SELECT a_id FROM tb"})(),
     )
 
@@ -164,10 +160,10 @@ def _execution_harness(
     ) -> list[tuple[int, ...]]:
         return [(1,), (2,)]
 
-    monkeypatch.setattr("aetherdialect._pipeline.execute_guarded_sql", _fake_execute_guarded_sql)
-    monkeypatch.setattr("aetherdialect._pipeline.validate_federated_sub_intent", lambda *_a, **_k: None)
+    monkeypatch.setattr("aetherdialect._pipeline_execute.execute_guarded_sql", _fake_execute_guarded_sql)
+    monkeypatch.setattr("aetherdialect._pipeline_execute.validate_federated_sub_intent", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        "aetherdialect._validation_execute.validate_sql",
+        "aetherdialect._federation_execute.validate_sql",
         lambda *a, **k: (True, None, None, None),
     )
     mock_dialect = MagicMock()
@@ -245,7 +241,7 @@ def test_collect_member_reducing_edges_assigns_distinct_kinds() -> None:
     )
     join_reducing = _collect_member_reducing_edges(
         manifest,
-        FederationMappings(version="0.2.1"),
+        FederationMappings(version="0.2.3"),
         sources,
         join_only,
         source_by_table,
@@ -265,7 +261,7 @@ def test_collect_member_reducing_edges_assigns_distinct_kinds() -> None:
     )
     filter_reducing = _collect_member_reducing_edges(
         manifest,
-        FederationMappings(version="0.2.1"),
+        FederationMappings(version="0.2.3"),
         sources,
         filter_intent,
         source_by_table,

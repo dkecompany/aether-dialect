@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from aetherdialect._config import FederationLimits
-from aetherdialect._federation import resolve_member_row_cap
+from aetherdialect._federation_execute import resolve_member_row_cap
 
 
 @pytest.mark.fast

@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._constants import (
-    DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT,
-    REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE,
-)
+from aetherdialect._constants import DIAGNOSTIC_CODE_REFUSAL_NOT_AVAILABLE_IN_CONTEXT
+from aetherdialect._constants_runtime import REFUSAL_NOT_AVAILABLE_IN_CONTEXT_MESSAGE
 from aetherdialect._contracts_base import FailureCategory, NormalizedExpr, PredicateGroup, WhereParam
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._utils import (
     failure_kind_is_permission_denied,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._validation_semantic import validate_denied_references, validate_deny_bare_select
+from aetherdialect._validation_rules import (
+    validate_denied_references,
+    validate_deny_bare_select,
+)
 
 
 def _schema_with_denied_amount() -> SchemaGraph:

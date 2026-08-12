@@ -4,15 +4,19 @@ from typing import cast
 
 from sqlglot import exp, parse_one
 
-from aetherdialect._constants import COMPOSE_SUPPORTED_CAPABILITIES, INTENT_SCHEMA
+from aetherdialect._constants_runtime import COMPOSE_SUPPORTED_CAPABILITIES, INTENT_SCHEMA
 from aetherdialect._contracts_base import MulGroup, NormalizedExpr, OrderByCol
 from aetherdialect._contracts_core import SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata, WindowRegistryStep, WindowSpec
-from aetherdialect._federation import compose_composite_graph, parse_federation_manifest, stamp_federation_member_graph
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
+    parse_federation_manifest,
+    stamp_federation_member_graph,
+)
 from aetherdialect._intent_expr import _order_by_col_from_obc
 from aetherdialect._schema_graph import compute_database_feature_capability, recompute_join_paths_multi
 from aetherdialect._sql_to_intent_sqlglot import _aggregate_to_expr, _sort_clause, _window_def_to_spec
-from aetherdialect._validation_schema import (
+from aetherdialect._validation_shape import (
     validate_order_by_cols_schema,
     validate_select_cols_schema,
     validate_window_spec_schema,

@@ -10,19 +10,19 @@ import pytest
 from aetherdialect._constants import (
     DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_FAILED,
     DIAGNOSTIC_CODE_DESCRIPTION_ENRICHMENT_NOOP,
-    SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS,
     SCHEMA_ENRICHED_LINES_MAX_CHARS,
 )
 from aetherdialect._contracts_base import SpaceContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaDiff, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._schema_finalize import _refresh_existing_descriptions_after_addition
+from aetherdialect._schema_profile import NotesExtractionLedger, NotesExtractionResult
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._schema_overrides import _refresh_existing_descriptions_after_addition
-from aetherdialect._utils import schema_context_enriched_lines_for_tables
+from aetherdialect._utils_intent import schema_context_enriched_lines_for_tables
 
 
 def _table(name: str, *, description: str = "", column_description: str = "") -> TableMetadata:
@@ -65,14 +65,19 @@ def test_enrich_space_notes_failure_propagates(tmp_path: Path) -> None:
     snapshot = _space_snapshot("orders")
     space = SpaceContext(tables=frozenset({"orders"}), notes_file=str(notes))
 
+    sk_fact = __import__("aetherdialect._contracts_base", fromlist=["StructuralKnowledgeFact"]).StructuralKnowledgeFact(
+        kind="relation",
+        text="order rows",
+        referenced_entities=frozenset({"orders"}),
+    )
     with (
         patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
         patch(
-            "aetherdialect._main_execution.extract_business_knowledge_from_notes",
-            return_value=(),
+            "aetherdialect._main_spaces.extract_knowledge_from_notes",
+            return_value=NotesExtractionResult((), (sk_fact,), NotesExtractionLedger(())),
         ),
         patch(
-            "aetherdialect._main_execution.llm_classify_schema",
+            "aetherdialect._main_spaces.llm_enrich_schema_from_structural_knowledge",
             side_effect=RuntimeError("model unavailable"),
         ),
         pytest.raises(RuntimeError, match="model unavailable"),
@@ -87,19 +92,19 @@ def test_enrich_space_notes_noop_emits_diagnostic(tmp_path: Path) -> None:
     graph = _graph("orders")
     snapshot = _space_snapshot("orders")
     space = SpaceContext(tables=frozenset({"orders"}), notes_file=str(notes))
-    empty_classify = {"orders": ("fact", "", {"id": ("identifier", "", None)})}
 
     token = set_diagnostic_collector([])
     try:
         with (
             patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
+            patch("aetherdialect._main_spaces.EngineConfig.llm_credentials_configured", return_value=True),
             patch(
-                "aetherdialect._main_execution.extract_business_knowledge_from_notes",
-                return_value=(),
+                "aetherdialect._main_spaces.extract_knowledge_from_notes",
+                return_value=NotesExtractionResult((), (), NotesExtractionLedger(())),
             ),
             patch(
-                "aetherdialect._main_execution.llm_classify_schema",
-                return_value=empty_classify,
+                "aetherdialect._main_spaces.llm_enrich_schema_from_structural_knowledge",
+                return_value={},
             ),
         ):
             out = MainExecutionOps.enrich_space_snapshot_with_notes(snapshot, graph, space, str(notes))
@@ -122,7 +127,7 @@ def test_refresh_existing_descriptions_failure_emits_diagnostic() -> None:
     token = set_diagnostic_collector([])
     try:
         with patch(
-            "aetherdialect._schema_overrides.llm_classify_schema",
+            "aetherdialect._schema_finalize.llm_classify_schema",
             side_effect=RuntimeError("classify failed"),
         ):
             _refresh_existing_descriptions_after_addition(cached, diff, "notes")
@@ -147,7 +152,7 @@ def test_refresh_existing_descriptions_noop_emits_diagnostic() -> None:
     token = set_diagnostic_collector([])
     try:
         with patch(
-            "aetherdialect._schema_overrides.llm_classify_schema",
+            "aetherdialect._schema_finalize.llm_classify_schema",
             return_value=noop_classify,
         ):
             _refresh_existing_descriptions_after_addition(cached, diff, "notes")
@@ -162,7 +167,7 @@ def test_refresh_existing_descriptions_noop_emits_diagnostic() -> None:
 
 @pytest.mark.fast
 def test_enriched_schema_lines_total_char_cap() -> None:
-    long_desc = "x" * (SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS + 100)
+    long_desc = "x" * 400
     columns = {
         f"col_{i}": ColumnMetadata(name=f"col_{i}", data_type="varchar", description=long_desc) for i in range(200)
     }
@@ -179,13 +184,12 @@ def test_enriched_schema_lines_total_char_cap() -> None:
 
 
 @pytest.mark.fast
-def test_enriched_schema_lines_per_description_char_cap() -> None:
-    long_desc = "w" * (SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS + 50)
+def test_enriched_schema_lines_preserve_full_description_under_block_budget() -> None:
+    long_desc = "w" * 300
     graph = SchemaGraph(
         tables={"tbl": _table("tbl", description=long_desc, column_description=long_desc)},
         join_paths_multi={},
     )
     rendered = schema_context_enriched_lines_for_tables(graph, ["tbl"])
+    assert long_desc in rendered
     assert len(rendered) <= SCHEMA_ENRICHED_LINES_MAX_CHARS
-    assert f"{'w' * (SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS + 10)}" not in rendered
-    assert "..." in rendered

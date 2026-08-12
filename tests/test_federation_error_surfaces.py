@@ -12,11 +12,12 @@ from aetherdialect._contracts_base import (
     FederationMemberProbeError,
     FederationPartialFailureError,
 )
-from aetherdialect._federation import federation_user_facing_error_message, probe_federation_member_connections
-from aetherdialect._main_execution import (
-    MainExecutionOps,
-    PipelineSession,
+from aetherdialect._federation_execute import (
+    federation_user_facing_error_message,
+    probe_federation_member_connections,
 )
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_session import PipelineSession
 
 
 @pytest.mark.fast
@@ -45,7 +46,7 @@ def test_member_execution_user_message_omits_physical_source_label() -> None:
 
 @pytest.mark.fast
 def test_timeout_cap_user_message_omits_physical_source_label() -> None:
-    from aetherdialect._federation import federation_member_timeout_error
+    from aetherdialect._federation_execute import federation_member_timeout_error
 
     exc = federation_member_timeout_error("secret_member", RuntimeError("statement timeout"))
     message = federation_user_facing_error_message(exc)
@@ -73,7 +74,7 @@ def test_federation_error_diagnostics_use_sanitized_message() -> None:
         limit_key="semijoin_key_cap",
         source_id="b",
     )
-    diags = MainExecutionOps._federation_error_diagnostics(exc)
+    diags = MainExecutionOps.federation_error_diagnostics(exc)
     assert len(diags) == 1
     user_message = federation_user_facing_error_message(exc)
     assert diags[0].message == user_message
@@ -105,7 +106,7 @@ def test_pipeline_session_terminal_error_omits_physical_source_label() -> None:
     owner = MagicMock()
     owner._audit_emit = None
     owner._schema_graph = None
-    owner._llm_config = MagicMock(provider="mock")
+    owner._llm_config = MagicMock(provider="sandbox")
     session = PipelineSession(owner)
     exc = FederationCapExceededError(
         "federation coordinator total input row cap exceeded for source 'b': 10 rows > cap 5",
@@ -114,6 +115,6 @@ def test_pipeline_session_terminal_error_omits_physical_source_label() -> None:
     )
     step = session._terminal_error_from_exception(exc)
     assert step.error is not None
-    assert "'b'" not in step.error
-    assert step.federation_source_id == "b"
-    assert step.federation_limit_key == "total_input_row_cap"
+    assert "'b'" not in str(step.error.code)
+    assert step.error.source_id == "b"
+    assert step.error.limit_key == "total_input_row_cap"

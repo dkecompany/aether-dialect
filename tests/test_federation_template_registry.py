@@ -1,4 +1,4 @@
-"""Federation exposes the same template registry bridge as AetherEngine."""
+"""Federation exposes the same template registry surface as AetherEngine."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherFederation
-from aetherdialect._contracts_base import TemplateExecutionResult
-from tests.test_reuse_saved_question import _minimal_template
+from aetherdialect._contracts_core import TemplateExecutionResult
+from tests.template_fixtures import _minimal_template
 
 
 def _federation_stub(*, templates: dict | None = None) -> AetherFederation:
@@ -19,7 +19,7 @@ def _federation_stub(*, templates: dict | None = None) -> AetherFederation:
     fed._store = {}
     fed._rejected = {}
     fed._schema_graph = MagicMock()
-    fed._schema_graph.tables = {}
+    fed._schema_graph.tables = {"t1": MagicMock()}
     fed._dialect = MagicMock()
     fed._dialect.sqlglot_dialect = "postgresql"
     fed._dialect.name = "postgresql"

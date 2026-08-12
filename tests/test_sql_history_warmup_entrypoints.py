@@ -68,27 +68,27 @@ def test_sql_warmup_entrypoints_thread_expand_and_max_kept_intents(
 
     with (
         patch(
-            "aetherdialect._main_execution.load_sql_history_statements",
+            "aetherdialect._main_interactive.load_sql_history_statements",
             return_value=["SELECT 1"],
         ),
         patch(
-            "aetherdialect._main_execution.compute_sql_history_content_hash",
+            "aetherdialect._main_interactive.compute_sql_history_content_hash",
             return_value="abc",
         ),
         patch(
-            "aetherdialect._main_execution.fetch_query_log",
+            "aetherdialect._main_interactive.fetch_query_log",
             return_value=["SELECT 1"],
         ),
         patch(
-            "aetherdialect._main_execution.MainExecutionOps._raw_db_connection_for_query_log",
+            "aetherdialect._main_interactive.MainInteractiveOps._raw_db_connection_for_query_log",
             return_value=MagicMock(),
         ),
         patch(
-            "aetherdialect._main_execution.MainExecutionOps._dialect_name_for_query_log",
+            "aetherdialect._main_interactive.MainInteractiveOps._dialect_name_for_query_log",
             return_value="postgresql",
         ),
         patch(
-            "aetherdialect._main_execution.MainExecutionOps._run_seed_warmup_sql_history_pipeline",
+            "aetherdialect._main_interactive.MainInteractiveOps._run_seed_warmup_sql_history_pipeline",
             side_effect=_capture,
         ),
     ):
@@ -110,19 +110,19 @@ def test_sql_history_pipeline_expand_builds_larger_queue(monkeypatch, tmp_path) 
     synthetic = _intent(intent_id="syn_1", source="synthetic")
 
     monkeypatch.setattr(
-        "aetherdialect._main_execution.convert_sql_to_intent",
+        "aetherdialect._main_interactive.convert_sql_to_intent",
         lambda *_a, **_k: MagicMock(intent=MagicMock(), failure_code=None, sql_hash="h1"),
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.dedup_runtime_intents",
+        "aetherdialect._main_interactive.dedup_runtime_intents",
         lambda runtimes: runtimes,
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.seed_warmup_intent_from_runtime_intent",
+        "aetherdialect._main_interactive.seed_warmup_intent_from_runtime_intent",
         lambda *_a, **_k: base_intent,
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.compute_schema_limits",
+        "aetherdialect._main_interactive.compute_schema_limits",
         lambda _s: MagicMock(max_where_predicates=3, max_groupby=2, max_tables=4),
     )
     expand_called: list[bool] = []
@@ -132,7 +132,7 @@ def test_sql_history_pipeline_expand_builds_larger_queue(monkeypatch, tmp_path) 
         return [synthetic]
 
     monkeypatch.setattr(
-        "aetherdialect._main_execution.expand_gold_intents",
+        "aetherdialect._main_interactive.expand_gold_intents",
         _fake_expand,
     )
     monkeypatch.setattr(
@@ -193,19 +193,19 @@ def test_sql_history_pipeline_passes_max_kept_intents_to_execution(monkeypatch, 
     base_intent = _intent()
 
     monkeypatch.setattr(
-        "aetherdialect._main_execution.convert_sql_to_intent",
+        "aetherdialect._main_interactive.convert_sql_to_intent",
         lambda *_a, **_k: MagicMock(intent=MagicMock(), failure_code=None, sql_hash="h1"),
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.dedup_runtime_intents",
+        "aetherdialect._main_interactive.dedup_runtime_intents",
         lambda runtimes: runtimes,
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.seed_warmup_intent_from_runtime_intent",
+        "aetherdialect._main_interactive.seed_warmup_intent_from_runtime_intent",
         lambda *_a, **_k: base_intent,
     )
     monkeypatch.setattr(
-        "aetherdialect._main_execution.compute_schema_limits",
+        "aetherdialect._main_interactive.compute_schema_limits",
         lambda _s: MagicMock(max_where_predicates=3, max_groupby=2, max_tables=4),
     )
     monkeypatch.setattr(

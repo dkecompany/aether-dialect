@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._core_utils import StepResult
+from aetherdialect._contracts_core import StepResult
 
 
 def test_recording_max_attempts_is_two() -> None:
@@ -17,25 +17,25 @@ def test_recording_max_attempts_is_two() -> None:
 
 
 def test_clear_results_file_is_empty(tmp_path: Path) -> None:
-    import live_tests.conftest as lt_conftest
+    import sandbox_recording as recording
 
     results_path = tmp_path / "recording_results.txt"
-    prev_results_file = lt_conftest._RESULTS_FILE
+    prev_results_file = recording.results_file()
     try:
-        lt_conftest._RESULTS_FILE = results_path
-        lt_conftest._clear_results_file()
+        recording.set_results_file(results_path)
+        recording.clear_results_file()
         assert results_path.read_text(encoding="utf-8") == ""
     finally:
-        lt_conftest._RESULTS_FILE = prev_results_file
+        recording.set_results_file(prev_results_file)
 
 
 def test_failure_trace_append_writes_trace_only(tmp_path: Path) -> None:
-    import live_tests.conftest as lt_conftest
+    import sandbox_recording as recording
 
     corpus_mod = importlib.import_module("sandbox_corpus")
 
     results_path = tmp_path / "recording_results.txt"
-    prev_results_file = lt_conftest._RESULTS_FILE
+    prev_results_file = recording.results_file()
     saved_debug = PolicyConfig.DEBUG
     try:
         corpus_mod._begin_eval_results(results_path)
@@ -47,9 +47,9 @@ def test_failure_trace_append_writes_trace_only(tmp_path: Path) -> None:
             captured_logs=["[DEBUG] intent_parse started", "[PIPELINE_TRACE] intent\n{}"],
             duration_seconds=1.25,
         )
-        lt_conftest._append_failure_trace(step)
+        recording.append_live_failure_trace(step)
     finally:
-        lt_conftest._RESULTS_FILE = prev_results_file
+        recording.set_results_file(prev_results_file)
 
     text = results_path.read_text(encoding="utf-8")
     assert "Live Test Results" not in text

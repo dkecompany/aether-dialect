@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._dialect_sqlglot_engines import DuckDBNativeBackend
-from aetherdialect._federation import _execute_coordinator_sql_with_timeout
+from aetherdialect._federation_execute import _execute_coordinator_sql_with_timeout
 
 
 @pytest.mark.fast

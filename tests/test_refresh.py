@@ -10,17 +10,17 @@ import pytest
 from aetherdialect import AetherEngine, AetherFederation
 from aetherdialect._contracts_base import (
     EngineContext,
-    LLMConfig,
     MigrationPendingError,
     MigrationTier,
     RefreshReport,
-    RuntimeConfig,
 )
+from aetherdialect._contracts_core import LLMConfig, RuntimeConfig
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import load_runtime_config, write_artifact_manifest
 from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_init import MainInitOps
 from aetherdialect._schema_graph import diff_schemas, recompute_join_paths_multi
-from aetherdialect._schema_overrides import save_schema_to_cache
+from aetherdialect._schema_reflect import save_schema_to_cache
+from aetherdialect._utils_artifacts import load_runtime_config, write_artifact_manifest
 from tests.federation_helpers import write_federation_declaration_file
 
 
@@ -129,13 +129,13 @@ def test_refresh_detects_drift_like_construction(tmp_path: Path) -> None:
 
     engine = _mock_engine(old, artifacts_dir)
     with (
-        patch("aetherdialect._main_execution.build_schema_graph_with_diff", side_effect=_build_graph),
-        patch("aetherdialect._templates.TemplateOps.load_template_store", return_value=MagicMock()),
-        patch("aetherdialect._templates.TemplateOps.store_to_templates", return_value={}),
-        patch("aetherdialect._templates.TemplateOps.reconcile_template_store") as reconcile_mock,
-        patch("aetherdialect._templates.TemplateOps.collect_orphaned_migration_checkpoints", return_value=[]),
-        patch("aetherdialect._templates.TemplateOps.collect_expired_template_orphans", return_value=(0, 0)),
-        patch.object(MainExecutionOps, "_emit_artifact_growth_diagnostics", return_value=[]),
+        patch("aetherdialect._main_init.build_schema_graph_with_diff", side_effect=_build_graph),
+        patch("aetherdialect._templates_ops.TemplateOps.load_template_store", return_value=MagicMock()),
+        patch("aetherdialect._templates_ops.TemplateOps.store_to_templates", return_value={}),
+        patch("aetherdialect._templates_ops.TemplateOps.reconcile_template_store") as reconcile_mock,
+        patch("aetherdialect._templates_ops.TemplateOps.collect_orphaned_migration_checkpoints", return_value=[]),
+        patch("aetherdialect._templates_ops.TemplateOps.collect_expired_template_orphans", return_value=(0, 0)),
+        patch.object(MainInitOps, "_emit_artifact_growth_diagnostics", return_value=[]),
     ):
         reconcile_mock.return_value = MagicMock(dropped_template_ids=())
         report = MainExecutionOps.refresh_aether_engine(engine, reflect=True)
@@ -143,7 +143,7 @@ def test_refresh_detects_drift_like_construction(tmp_path: Path) -> None:
     assert isinstance(report, RefreshReport)
     assert report.migration_tier == MigrationTier.ADDITIVE
     assert report.schema_changed is True
-    assert "extras" in report.objects_added
+    assert "extras" in report.tables_added
 
 
 @pytest.mark.fast
@@ -184,8 +184,8 @@ def test_refresh_raises_migration_pending_like_construction(tmp_path: Path) -> N
 
     engine = _mock_engine(old, artifacts_dir)
     with (
-        patch("aetherdialect._main_execution.build_schema_graph_with_diff", side_effect=_build_graph),
-        patch("aetherdialect._templates.TemplateOps.collect_orphaned_migration_checkpoints", return_value=[]),
+        patch("aetherdialect._main_init.build_schema_graph_with_diff", side_effect=_build_graph),
+        patch("aetherdialect._templates_ops.TemplateOps.collect_orphaned_migration_checkpoints", return_value=[]),
         pytest.raises(MigrationPendingError, match="Schema migration required"),
     ):
         MainExecutionOps.refresh_aether_engine(engine, reflect=True)
@@ -215,14 +215,15 @@ def test_refresh_reports_reclaimed_bytes(tmp_path: Path) -> None:
     )
     engine = _mock_engine(schema, artifacts_dir)
     with (
-        patch("aetherdialect._main_execution.assign_schema_graph_hashes"),
-        patch("aetherdialect._main_execution.build_schema_graph_with_diff", return_value=(schema, None)),
-        patch("aetherdialect._templates.TemplateOps.load_template_store", return_value=MagicMock()),
-        patch("aetherdialect._templates.TemplateOps.store_to_templates", return_value={}),
-        patch("aetherdialect._templates.TemplateOps.reconcile_template_store") as reconcile_mock,
-        patch("aetherdialect._templates.TemplateOps.collect_orphaned_migration_checkpoints", return_value=[]),
-        patch("aetherdialect._templates.TemplateOps.collect_expired_template_orphans", return_value=(2, 4096)),
-        patch.object(MainExecutionOps, "_emit_artifact_growth_diagnostics", return_value=[]),
+        patch("aetherdialect._main_init.assign_schema_graph_hashes"),
+        patch("aetherdialect._main_init.classify_migration_tier", return_value=MigrationTier.NO_CHANGE),
+        patch("aetherdialect._main_init.build_schema_graph_with_diff", return_value=(schema, None)),
+        patch("aetherdialect._templates_ops.TemplateOps.load_template_store", return_value=MagicMock()),
+        patch("aetherdialect._templates_ops.TemplateOps.store_to_templates", return_value={}),
+        patch("aetherdialect._templates_ops.TemplateOps.reconcile_template_store") as reconcile_mock,
+        patch("aetherdialect._templates_ops.TemplateOps.collect_orphaned_migration_checkpoints", return_value=[]),
+        patch("aetherdialect._templates_ops.TemplateOps.collect_expired_template_orphans", return_value=(2, 4096)),
+        patch.object(MainInitOps, "_emit_artifact_growth_diagnostics", return_value=[]),
     ):
         reconcile_mock.return_value = MagicMock(dropped_template_ids=())
         report = MainExecutionOps.refresh_aether_engine(engine, reflect=True)
@@ -256,18 +257,19 @@ def test_refresh_without_reflect_does_artifact_work_only(tmp_path: Path) -> None
     engine = _mock_engine(schema, artifacts_dir)
     build_calls: list[bool] = []
     with (
-        patch("aetherdialect._main_execution.assign_schema_graph_hashes"),
+        patch("aetherdialect._main_init.assign_schema_graph_hashes"),
+        patch("aetherdialect._main_init.classify_migration_tier", return_value=MigrationTier.NO_CHANGE),
         patch(
-            "aetherdialect._main_execution.build_schema_graph_with_diff",
+            "aetherdialect._main_init.build_schema_graph_with_diff",
             side_effect=lambda *_a, **_k: (build_calls.append(True), (schema, None))[1],
         ),
-        patch("aetherdialect._schema_overrides.finalize_with_overrides"),
-        patch("aetherdialect._templates.TemplateOps.load_template_store", return_value=MagicMock()),
-        patch("aetherdialect._templates.TemplateOps.store_to_templates", return_value={}),
-        patch("aetherdialect._templates.TemplateOps.reconcile_template_store") as reconcile_mock,
-        patch("aetherdialect._templates.TemplateOps.collect_orphaned_migration_checkpoints", return_value=[]),
-        patch("aetherdialect._templates.TemplateOps.collect_expired_template_orphans", return_value=(0, 0)),
-        patch.object(MainExecutionOps, "_emit_artifact_growth_diagnostics", return_value=[]) as growth_mock,
+        patch("aetherdialect._main_init.finalize_with_structure"),
+        patch("aetherdialect._templates_ops.TemplateOps.load_template_store", return_value=MagicMock()),
+        patch("aetherdialect._templates_ops.TemplateOps.store_to_templates", return_value={}),
+        patch("aetherdialect._templates_ops.TemplateOps.reconcile_template_store") as reconcile_mock,
+        patch("aetherdialect._templates_ops.TemplateOps.collect_orphaned_migration_checkpoints", return_value=[]),
+        patch("aetherdialect._templates_ops.TemplateOps.collect_expired_template_orphans", return_value=(0, 0)),
+        patch.object(MainInitOps, "_emit_artifact_growth_diagnostics", return_value=[]) as growth_mock,
     ):
         reconcile_mock.return_value = MagicMock(dropped_template_ids=())
         report = MainExecutionOps.refresh_aether_engine(engine, reflect=False)
@@ -283,8 +285,10 @@ def test_federation_refresh_covers_members_and_composite(tmp_path: Path, monkeyp
     member_report = RefreshReport(
         migration_tier=MigrationTier.NO_CHANGE,
         schema_changed=False,
-        objects_added=(),
-        objects_removed=(),
+        tables_added=(),
+        tables_removed=(),
+        columns_added=(),
+        columns_removed=(),
         templates_invalidated=0,
         orphans_removed=0,
         bytes_reclaimed=0,
@@ -361,7 +365,7 @@ def test_federation_refresh_covers_members_and_composite(tmp_path: Path, monkeyp
         fed = AetherFederation(
             "fed_refresh",
             members=members,
-            declaration_file=str(declaration_path),
+            declaration=str(declaration_path),
             artifacts_dir=str(tmp_path),
         )
 

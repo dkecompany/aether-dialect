@@ -24,12 +24,17 @@ from aetherdialect._contracts_schema import (
     WindowSpec,
 )
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import federation_plan_is_degenerate, parse_federation_manifest, plan_federated_intent
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import (
+    federation_plan_is_degenerate,
+    plan_federated_intent,
+)
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import generate_and_validate_sql, prepare_federated_sql_plan
+from aetherdialect._pipeline_execute import prepare_federated_sql_plan
+from aetherdialect._pipeline_generate import generate_and_validate_sql
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import build_deterministic_sql
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 from tests.conftest import duckdb_engine_identity
 from tests.test_federation_single_source import _composed_manifest, _member_graphs, _runtime_manifest
 
@@ -40,6 +45,7 @@ _MEMBER_ENGINES = (
     "mysql",
     "mariadb",
     "sqlserver",
+    "oracle",
     "snowflake",
     "bigquery",
     "redshift",
@@ -276,7 +282,7 @@ def test_degenerate_prepare_matches_direct_member_sql(engine: str) -> None:
     )
     store = TemplateOps.empty_template_store(composite.schema_graph_id)
     with patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     ):
 
@@ -285,7 +291,7 @@ def test_degenerate_prepare_matches_direct_member_sql(engine: str) -> None:
             _federation_dialects = {sid: runtime.dialect for sid, runtime in runtimes.items()}
 
         owner = _Owner()
-        single_source = MainExecutionOps._federation_single_source_sql_context(
+        single_source = MainExecutionOps.federation_single_source_sql_context(
             owner,
             intent,
             composite,
@@ -358,10 +364,10 @@ def test_degenerate_prepare_uses_unscoped_template_learning_kwargs() -> None:
         return generate_and_validate_sql(*args, **kwargs)
 
     with patch(
-        "aetherdialect._pipeline._run_sql_validation_cascade",
+        "aetherdialect._pipeline_generate.run_sql_validation_cascade",
         return_value=(True, "", None, []),
     ):
-        with patch("aetherdialect._pipeline.generate_and_validate_sql", side_effect=_capture_gen):
+        with patch("aetherdialect._pipeline_execute.generate_and_validate_sql", side_effect=_capture_gen):
             prepare_federated_sql_plan(
                 "list rentals",
                 plan,

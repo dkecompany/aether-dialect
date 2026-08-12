@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import FailureCategory
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import FailureCategory, NormalizedExpr
+from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import IntentIssue
-from aetherdialect._intent_process import resolve_repair_instruction
-from aetherdialect._intent_repair import refusal_for_join_unreachable_table_removal
+from aetherdialect._intent_loop import resolve_repair_instruction
+from aetherdialect._intent_normalize import refusal_for_join_unreachable_table_removal
 
 
 def _join_unreachable_issue(*, root: str = "orders", target: str = "products") -> IntentIssue:

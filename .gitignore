@@ -41,6 +41,10 @@ site/
 # scripts/ generated data (private dev pipeline)
 # Federation partition seeds and federation_partition.json are committed artifacts (see scripts/README.md).
 scripts/data/rental_shop_csvs/
+scripts/data/federation_storefront_data/
+scripts/data/federation_catalog_data/
+scripts/data/federation_logistics_data/
+scripts/data/federation_crm_data/
 scripts/data/rental_shop.zip
 scripts/data/_llm_cache/
 scripts/data/_downloads/
@@ -52,15 +56,21 @@ scripts/**/*.sqlite
 scripts/**/*.duckdb
 scripts/**/*.duckdb.*
 scripts/logs/
+scripts/logs/_sandbox_artifacts/
 
 # Secrets (repo-local credentials; never commit)
 secrets/
 
-# live test output (private only)
+# live test output (private only; numbered sidecars from rotated runs)
 live_tests/results.txt
+live_tests/results[0-9]*.txt
 live_tests/invoice.txt
+live_tests/invoice[0-9]*.txt
+live_tests/_run_artifacts/
 
 # Pipeline cwd artifacts (pytest / sandbox recipes use Path.cwd())
+.aetherdialect/
+fed_dir/
 results.csv
 schema_overrides.json
 schema_overrides.applied.json

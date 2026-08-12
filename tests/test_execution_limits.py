@@ -15,12 +15,14 @@ from aetherdialect._dialect_sqlglot_engines import (
     DuckDBNativeBackend,
     MySQLConnectorBackend,
     MySQLDialect,
+    OracleDialect,
     RedshiftConnectorBackend,
     SnowflakeArrowBackend,
     SQLiteNativeBackend,
     SQLServerDialect,
 )
 from aetherdialect._dialect_sqlglot_helper import (
+    OracleResultBackend,
     SqlAlchemyResultBackend,
     SqlServerResultBackend,
 )
@@ -127,6 +129,32 @@ def test_sqlserver_result_backend_sets_driver_timeout() -> None:
     rows = backend.fetch_rows("SELECT 2", timeout_ms=8000)
     assert rows == [(2,)]
     assert raw.timeout == 8
+
+
+def test_oracle_execute_routes_through_backend() -> None:
+    dialect = object.__new__(OracleDialect)
+    mock_backend = MagicMock()
+    mock_backend.fetch_rows.return_value = [(9,)]
+    dialect._backend = mock_backend
+    rows = OracleDialect.execute(dialect, "SELECT :x FROM DUAL", {"x": 1})
+    assert rows == [(9,)]
+    mock_backend.fetch_rows.assert_called_once_with("SELECT :x FROM DUAL", {"x": 1}, timeout_ms=30000)
+
+
+def test_oracle_profile_timeout_returns_none() -> None:
+    dialect = object.__new__(OracleDialect)
+    assert OracleDialect.profile_statement_timeout_sql(dialect, 30_000) is None
+
+
+def test_oracle_result_backend_sets_call_timeout() -> None:
+    engine, conn = _sqlalchemy_conn_with_rows([(2,)])
+    raw = MagicMock()
+    raw.call_timeout = None
+    conn.connection = raw
+    backend = OracleResultBackend(engine, dialect_name="OracleDialect")
+    rows = backend.fetch_rows("SELECT 2 FROM DUAL", timeout_ms=8000)
+    assert rows == [(2,)]
+    assert raw.call_timeout == 8000
 
 
 def test_policy_config_apply_environment_ignores_execution_caps() -> None:

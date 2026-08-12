@@ -1,4 +1,4 @@
-"""Deny-only aetherspace scope and space snapshot migration regressions."""
+"""Deny-only aetherspace scope and space snapshot migration."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._constants import AETHERSPACE_ARTIFACT_VERSION
-from aetherdialect._contracts_base import EngineContext, SpaceContext
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import EngineContext, NormalizedExpr, SpaceContext
+from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaDiff, SchemaGraph, TableDiff, TableMetadata
 from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import assert_consumer_sql_in_scope, assert_intent_in_scope
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _column(name: str, *, data_type: str = "integer") -> ColumnMetadata:

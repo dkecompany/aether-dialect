@@ -11,9 +11,9 @@ from aetherdialect._contracts_base import NormalizedExpr, OrderByCol, SchemaInva
 from aetherdialect._contracts_core import RuntimeCteStep, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import SchemaGraph
 from aetherdialect._dialect_postgres import PostgresDialect
-from aetherdialect._intent_resolve import encode_inline_self_join_as_cte
+from aetherdialect._intent_bind import encode_inline_self_join_as_cte
 from aetherdialect._sql_gen import build_deterministic_sql
-from aetherdialect._validation_schema import validate_distinct_on_schema
+from aetherdialect._validation_shape import validate_distinct_on_schema
 
 
 def _pg_render() -> PostgresDialect:
@@ -124,7 +124,7 @@ class TestDistinctOnRenderer:
             order_by_cols=intent.order_by_cols,
             where=intent.where,
             distinct_on=intent.distinct_on,
-            planner_cte_names=[f"{DISTINCT_ON_CTE_NAME_PREFIX}1"],
+            interpret_cte_names=[f"{DISTINCT_ON_CTE_NAME_PREFIX}1"],
         )
         sql = build_deterministic_sql(intent, schema=simple_schema, dialect=_pg_render())
         assert f"{DISTINCT_ON_CTE_NAME_PREFIX}2" in _norm(sql)

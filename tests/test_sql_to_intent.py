@@ -72,7 +72,7 @@ def test_postgres_and_sqlglot_spark_bucket_parity(schema_graph: SchemaGraph, sql
 
 
 def test_sqlglot_spark_cte_native_extractor(schema_graph: SchemaGraph) -> None:
-    """Databricks sqlglot reader uses the native sqlglot extractor (no pglast transpile bridge)."""
+    """Databricks sqlglot reader uses the native sqlglot extractor (no pglast transpile path)."""
     sql = "WITH c AS (SELECT customer_id FROM customers) SELECT customer_id FROM c"
     db_d = _databricks()
     rt = _convert_sqlglot(sql, schema_graph, db_d)

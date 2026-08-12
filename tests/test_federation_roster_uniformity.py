@@ -8,13 +8,12 @@ import pytest
 
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    _build_source_sub_intent,
-    compose_composite_graph,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
     parse_federation_manifest,
     parse_federation_mappings,
-    plan_federated_intent,
 )
+from aetherdialect._federation_plan import _build_source_sub_intent, plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from tests.federation_helpers import stamp_union_disjointness_profiling
 
@@ -68,7 +67,7 @@ _FOUR_MEMBER_MANIFEST = {
 }
 
 _FOUR_MEMBER_MAPPINGS = {
-    "version": "0.2.1",
+    "version": "0.2.3",
     "logical_tables": [
         {
             "logical": "events",
@@ -92,7 +91,7 @@ def test_one_member_and_four_member_plans_share_envelope_fields(monkeypatch: pyt
         build_calls.append(kwargs.get("multi_source", False))
         return _build_source_sub_intent(*args, **kwargs)
 
-    monkeypatch.setattr("aetherdialect._federation._build_source_sub_intent", _track_build)
+    monkeypatch.setattr("aetherdialect._federation_plan._build_source_sub_intent", _track_build)
 
     one_manifest = parse_federation_manifest(_ONE_MEMBER_MANIFEST, include_derived_roster=True)
     one_composite = compose_composite_graph({"solo": _member_graph("events", "solo")}, one_manifest)

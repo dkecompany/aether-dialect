@@ -1,4 +1,4 @@
-"""Aetherspace export/apply/delete round-trip and version-guard regressions."""
+"""Aetherspace export/apply/delete round-trip and version-guard behaviour."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pytest
 
 from aetherdialect import AetherEngine
 from aetherdialect._constants import AETHERSPACE_ARTIFACT_VERSION
-from aetherdialect._contracts_base import ConfigError, SpaceContext
+from aetherdialect._contracts_base import ConfigError, EngineContext, SpaceContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._main_execution import (
     MainExecutionOps,
@@ -41,8 +41,8 @@ def _sample_schema() -> SchemaGraph:
 
 
 @pytest.mark.fast
-def test_engine_exposes_apply_and_delete_aetherspace() -> None:
-    assert hasattr(AetherEngine, "apply_aetherspace")
+def test_engine_exposes_aetherspace_and_delete_aetherspace() -> None:
+    assert hasattr(AetherEngine, "aetherspace")
     assert hasattr(AetherEngine, "delete_aetherspace")
 
 
@@ -52,11 +52,11 @@ def test_export_apply_round_trip_persists_named_space(tmp_path: Path) -> None:
     schema = _sample_schema()
     snap = MainExecutionOps.subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
     MainExecutionOps.save_aetherspace_snapshot(engine_dir, "films_only", snap)
-    export_path = MainExecutionOps.export_aetherspace_json(engine_dir, "films_only", schema)
+    export_path = MainExecutionOps.write_space_snapshot(engine_dir, "films_only", schema)
     MainExecutionOps.delete_aetherspace_snapshot(engine_dir, "films_only")
     assert MainExecutionOps.load_aetherspace_snapshot(engine_dir, "films_only") is None
 
-    desc = MainExecutionOps.apply_aetherspace_json(engine_dir, "films_only", schema)
+    desc = MainExecutionOps.read_space_snapshot(engine_dir, "films_only", schema)
     assert desc.name == "films_only"
     assert export_path.is_file()
     loaded = MainExecutionOps.load_aetherspace_snapshot(engine_dir, "films_only")
@@ -70,10 +70,10 @@ def test_apply_from_explicit_source_path(tmp_path: Path) -> None:
     schema = _sample_schema()
     snap = MainExecutionOps.subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
     MainExecutionOps.save_aetherspace_snapshot(engine_dir, "films_only", snap)
-    export_path = MainExecutionOps.export_aetherspace_json(engine_dir, "films_only", schema)
+    export_path = MainExecutionOps.write_space_snapshot(engine_dir, "films_only", schema)
     MainExecutionOps.delete_aetherspace_snapshot(engine_dir, "films_only")
 
-    desc = MainExecutionOps.apply_aetherspace_json(engine_dir, "imported", schema, source=export_path)
+    desc = MainExecutionOps.read_space_snapshot(engine_dir, "imported", schema, source=export_path)
     assert desc.name == "imported"
     loaded = MainExecutionOps.load_aetherspace_snapshot(engine_dir, "imported")
     assert loaded is not None
@@ -93,7 +93,7 @@ def test_apply_rejects_export_version_mismatch(tmp_path: Path) -> None:
     export_path.write_text(json.dumps(stale), encoding="utf-8")
 
     with pytest.raises(ConfigError, match=r"version .*" + str(AETHERSPACE_ARTIFACT_VERSION)) as exc_info:
-        MainExecutionOps.apply_aetherspace_json(engine_dir, "stale", schema)
+        MainExecutionOps.read_space_snapshot(engine_dir, "stale", schema)
     msg = str(exc_info.value)
     assert "0.0.0" in msg
     assert "Delete" in msg
@@ -115,15 +115,15 @@ def test_delete_master_aetherspace_raises(tmp_path: Path) -> None:
 def test_apply_master_aetherspace_raises(tmp_path: Path) -> None:
     engine_dir = str(tmp_path)
     schema = _sample_schema()
-    export_path = MainExecutionOps.export_aetherspace_json(engine_dir, "master", schema)
+    export_path = MainExecutionOps.write_space_snapshot(engine_dir, "master", schema)
     with pytest.raises(ConfigError, match="cannot be created or overwritten"):
-        MainExecutionOps.apply_aetherspace_json(engine_dir, "master", schema, source=export_path)
+        MainExecutionOps.read_space_snapshot(engine_dir, "master", schema, source=export_path)
 
 
 @pytest.mark.fast
 def test_apply_missing_export_raises(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="export file not found"):
-        MainExecutionOps.apply_aetherspace_json(str(tmp_path), "films_only", _sample_schema())
+        MainExecutionOps.read_space_snapshot(str(tmp_path), "films_only", _sample_schema())
 
 
 @pytest.mark.fast
@@ -139,21 +139,18 @@ def test_delete_removes_snapshot_file(tmp_path: Path) -> None:
 
 
 @pytest.mark.fast
-def test_engine_apply_and_delete_delegate_to_helpers(tmp_path: Path) -> None:
-    with (
-        patch(
-            "aetherdialect.aetherdialect.apply_aetherspace_json",
-            return_value=SimpleNamespace(name="films_only"),
-        ) as apply_mock,
-        patch("aetherdialect.aetherdialect.delete_aetherspace_snapshot", return_value=True) as delete_mock,
-    ):
+def test_engine_delete_aetherspace_delegates_to_helper(tmp_path: Path) -> None:
+    schema = _sample_schema()
+    snap = MainExecutionOps.subset_graph_for_space(schema, SpaceContext(tables=frozenset({"film"})))
+    MainExecutionOps.save_aetherspace_snapshot(str(tmp_path), "films_only", snap)
+    with patch("aetherdialect.aetherdialect.delete_aetherspace", return_value=True) as delete_mock:
         engine = AetherEngine.__new__(AetherEngine)
         engine._artifacts_dir = tmp_path
-        engine._schema_graph = _sample_schema()
+        engine._schema_graph = schema
         engine._schema_role = "owner"
         engine._context_name = "master"
-        desc = engine.apply_aetherspace("films_only")
-        assert desc.name == "films_only"
-        apply_mock.assert_called_once()
+        engine._runtime_config = SimpleNamespace(execution_context=None, engine_context=EngineContext())
+        engine._consumer_visible_objects = None
+        engine._pipeline_writer_lock = __import__("threading").Lock()
         assert engine.delete_aetherspace("films_only") is True
         delete_mock.assert_called_once()

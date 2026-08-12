@@ -6,23 +6,23 @@ from decimal import Decimal
 
 import pytest
 
-from aetherdialect._core_utils import llm_usage_question_scope
+from aetherdialect._utils import llm_usage_question_scope
 
-from ._federation_live import (
+from .live_support import (
     build_federation_live_engine,
     ensure_federation_partitions_loaded,
     federation_partitions_available,
 )
-from .federation_oracles import (
+from .mydb_profile import (
     ACTOR_COUNT,
     CATEGORY_COUNT,
     CUSTOMER_COUNT,
     FILM_CATALOG_ROW_COUNT,
-    HORROR_DISTINCT_CUSTOMERS,
     INVENTORY_COUNT,
-    JOIN_RENTAL_LINKED_TITLES,
-    PAYMENT_TOTAL,
     RENTAL_COUNT,
+    SANDBOX_SUBSET_HORROR_DISTINCT_CUSTOMERS,
+    SANDBOX_SUBSET_JOIN_RENTAL_LINKED_TITLES,
+    SANDBOX_SUBSET_PAYMENT_TOTAL,
 )
 
 pytestmark = pytest.mark.live
@@ -60,15 +60,27 @@ def _scalar_value(step) -> float | int | Decimal | None:
 @pytest.mark.parametrize(
     ("slot_id", "question", "expected"),
     [
-        ("join_rental_linked_titles", "how many rentals are linked to film titles", JOIN_RENTAL_LINKED_TITLES),
-        ("payment_total", "what is the total payment amount", PAYMENT_TOTAL),
-        ("horror_distinct_customers", "how many distinct customers rented horror films", HORROR_DISTINCT_CUSTOMERS),
+        (
+            "join_rental_linked_titles",
+            "how many rentals are linked to film titles",
+            SANDBOX_SUBSET_JOIN_RENTAL_LINKED_TITLES,
+        ),
+        ("payment_total", "what is the total payment amount", SANDBOX_SUBSET_PAYMENT_TOTAL),
+        (
+            "horror_distinct_customers",
+            "how many distinct customers rented horror films",
+            SANDBOX_SUBSET_HORROR_DISTINCT_CUSTOMERS,
+        ),
         ("actor_count", "how many actors are in the database", ACTOR_COUNT),
         ("customer_count", "how many customers do we have", CUSTOMER_COUNT),
         ("rental_count", "how many rentals were made in total", RENTAL_COUNT),
         ("inventory_count", "how many inventory items are there", INVENTORY_COUNT),
         ("category_count", "how many film categories are there", CATEGORY_COUNT),
-        ("horror_distinct_uppercase", "how many distinct customers rented HORROR films", HORROR_DISTINCT_CUSTOMERS),
+        (
+            "horror_distinct_uppercase",
+            "how many distinct customers rented HORROR films",
+            SANDBOX_SUBSET_HORROR_DISTINCT_CUSTOMERS,
+        ),
     ],
 )
 @pytest.mark.skipif(_SKIP, reason="postgres/mysql federation partitions unavailable")

@@ -18,82 +18,85 @@ from dataclasses import dataclass, replace
 from importlib import resources
 from pathlib import Path
 from types import TracebackType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from aetherdialect._main_session import PipelineSession
 
 from aetherdialect._config import (
     DuckDBRuntimeConfig,
+    EngineLimits,
+    FederationLimits,
     SandboxBundlePolicy,
     SQLiteRuntimeConfig,
 )
 from aetherdialect._constants import (
     AETHERSPACES_SEGMENT,
-    CONSUMER_ALLOW_OBJECTS,
-    CONSUMER_EXAMPLE_NARROW_ALLOW_OBJECTS,
     FEDERATION_COMPOSITE_SCHEMA_FILENAME,
     FEDERATION_DECLARATION_FILENAME,
     FEDERATION_MANIFEST_FILENAME,
     FEDERATION_MAPPINGS_FILENAME,
+    MASTER_AETHERSPACE_NAME,
+    SESSION_KIND_AWAITING_SQL_CONFIRM,
+    SESSION_KIND_RESULT,
+    WRITE_QUEUE_FILENAME,
+)
+from aetherdialect._constants_runtime import (
     RENTAL_SHOP_VIEW_NAMES,
     SANDBOX_BASELINE_CACHE_FILES,
     SANDBOX_BUNDLED_DATASET_NAMES,
-    SANDBOX_BUNDLED_MEMBER_SEEDS,
-    SANDBOX_CATALOG_SPACE_TABLES,
+    SANDBOX_BUNDLED_MEMBER_DATA_DIRS,
+    SANDBOX_BUNDLED_MEMBER_NOTES,
+    SANDBOX_BUNDLED_MEMBER_SCHEMAS,
     SANDBOX_CONNECTION_HOST_ATTR,
+    SANDBOX_DEFAULT_DATA_DIR,
     SANDBOX_DEFAULT_DATASET_NAME,
+    SANDBOX_DEFAULT_SCHEMA_SQL,
     SANDBOX_DOCTOR_OPTIONAL_BASELINE_DIRS,
     SANDBOX_DOCTOR_OPTIONAL_BASELINE_MEMBERS,
     SANDBOX_DOCTOR_REQUIRED_MEMBERS,
     SANDBOX_FIXTURE_ALIASES,
     SANDBOX_INTERPRET_DOMAIN_FILENAME,
-    SANDBOX_LEGACY_FAITHFULNESS_SPECS,
+    SANDBOX_MEMBER_SPACE_NOTES_FILES,
+    SANDBOX_MEMBER_SPACE_QUESTIONS,
+    SANDBOX_MEMBER_SPACE_TABLES,
     SANDBOX_MIN_FIXTURE_COUNT,
     SANDBOX_MIN_INTENT_FIXTURE_COUNT,
-    SANDBOX_RECIPES,
     SANDBOX_SCHEMA_LITERALS_FILENAME,
+    SANDBOX_SHIPPED_FIXTURE_BASENAMES,
+    SANDBOX_STATIC_FAITHFULNESS_SPECS,
     SANDBOX_TOUR_EXPECT_NO_SQL,
     SANDBOX_VALIDATION_FAILURE_EXPECT_NO_SQL,
     SANDBOX_VALIDATION_FAILURE_QUESTIONS,
-    SCHEMA_OVERRIDES_DEFAULT_FILENAME,
-    SESSION_KIND_AWAITING_SQL_CONFIRM,
-    SESSION_KIND_RESULT,
-    WRITE_QUEUE_FILENAME,
 )
 from aetherdialect._contracts_base import (
     ConfigError,
     EngineContext,
     FederationContext,
     MigrationPendingError,
-    MigrationPreview,
+    NormalizedExpr,
     OwnerOnlyOperationError,
+    PredicateGroup,
     SandboxBuildSection,
     SandboxLlmMode,
-    SandboxPreset,
     SchemaInclude,
     SchemaRole,
     SessionActiveError,
-    SessionStep,
     SpaceContext,
     WhereParam,
 )
-from aetherdialect._contracts_core import (
-    NormalizedExpr,
-    PredicateGroup,
-    RuntimeIntent,
-)
-from aetherdialect._core_utils import (
-    append_failure_trace,
-    build_session_step_trace,
-    debug,
-    pipeline_capture,
-    require_driver,
-)
+from aetherdialect._contracts_core import MigrationPreview, RuntimeIntent, SessionStep
+from aetherdialect._contracts_schema import FederationSourceBinding
 from aetherdialect._dialect import Dialect
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
-from aetherdialect._federation import (
-    FederationSourceBinding,
+from aetherdialect._federation_compose import (
+    clear_bundled_composite_classifications,
+    schema_graph_classification_payload,
+    set_bundled_composite_classifications,
+)
+from aetherdialect._federation_execute import compute_federation_storage_dir, federation_source_artifacts_dir
+from aetherdialect._federation_manifest import (
     binding_from_member_engine,
-    compute_federation_storage_dir,
-    federation_source_artifacts_dir,
     federation_source_storage_slug,
     parse_federation_declaration,
 )
@@ -101,8 +104,16 @@ from aetherdialect._llm_provider import (
     MockProvider,
     SandboxRuntimeState,
 )
-from aetherdialect._main_execution import MainExecutionOps, PipelineSession
-from aetherdialect._templates import TemplateOps
+from aetherdialect._main_init import MainInitOps
+from aetherdialect._schema_graph import load_schema_graph_snapshot
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import (
+    build_session_step_trace,
+    notify,
+    pipeline_capture,
+    require_driver,
+)
+from aetherdialect._utils_artifacts import append_failure_trace
 
 _ARTIFACT_REFCOUNT: dict[str, int] = {}
 _CONNECTION_SANDBOX_HOSTS: dict[int, Sandbox] = {}
@@ -121,7 +132,7 @@ class _SandboxDataset:
 
 
 class _SandboxPendingMethods:
-    """Temporary holder; methods are reassigned onto Sandbox below."""
+    """Sandbox method mixin; members are bound onto Sandbox below."""
 
     @staticmethod
     def _write_sandbox_toml(*, fixtures_file: str) -> str:
@@ -133,9 +144,9 @@ class _SandboxPendingMethods:
             'path = ":memory:"',
             "",
             "[llm]",
-            'provider = "mock"',
+            'provider = "sandbox"',
             "",
-            "[mock]",
+            "[sandbox]",
             f"fixtures_file = {json.dumps(fixtures_file)}",
             "",
         ]
@@ -147,15 +158,15 @@ class _SandboxPendingMethods:
 
     @staticmethod
     def _schema_context_for_preset(
-        preset: SandboxPreset | str,
+        preset: str,
         *,
         notes_file: str | None,
         sql_file: str | None,
         deny_columns: frozenset[str] | None,
-        restricted_consumer: bool,
         include: SchemaInclude = SchemaInclude.TABLES,
         engine_context: EngineContext | None = None,
     ) -> EngineContext:
+        """Build an ``EngineContext`` for a sandbox construction preset. Consumers never define ``EngineContext`` at construction; a custom allow list is applied as a post-init overlay."""
         if engine_context is not None:
             ctx = replace(
                 engine_context,
@@ -184,21 +195,25 @@ class _SandboxPendingMethods:
         extract_path: Path,
         user_path: str | None,
     ) -> tuple[str | None, str | None]:
-        """Resolve a user path to a bundled fixture when the path is absent on disk."""
+        """Resolve a bare shipped fixture basename to a file under *extract_path*."""
         if not user_path:
             return None, None
-        expanded = Path(user_path).expanduser()
-        if expanded.is_file():
-            return str(expanded), None
-        alias_target = SANDBOX_FIXTURE_ALIASES.get(Path(user_path).name)
-        if alias_target:
-            bundled = extract_path / alias_target
-            if bundled.is_file():
-                return (
-                    str(bundled),
-                    f"{user_path!r} resolved to bundled fixture {alias_target!r}",
-                )
-        return None, None
+        candidate = Path(user_path)
+        if candidate.is_absolute() or ".." in candidate.parts or len(candidate.parts) != 1:
+            return None, None
+        basename = candidate.name
+        shipped_name = SANDBOX_FIXTURE_ALIASES.get(basename, basename)
+        if shipped_name not in SANDBOX_SHIPPED_FIXTURE_BASENAMES:
+            return None, None
+        bundled = extract_path / shipped_name
+        if not bundled.is_file():
+            return None, None
+        if shipped_name == basename:
+            return str(bundled), None
+        return (
+            str(bundled),
+            f"{user_path!r} resolved to bundled fixture {shipped_name!r}",
+        )
 
     @staticmethod
     def _resolve_sandbox_notes_and_sql(
@@ -248,12 +263,11 @@ class _SandboxPendingMethods:
     @staticmethod
     def _sandbox_trusts_bundled_baseline(
         *,
-        preset: SandboxPreset | str,
+        preset: str,
         schema_context: EngineContext,
         bundled_notes: str | None,
         bundled_sql: str | None,
         deny_columns: frozenset[str] | None,
-        restricted_consumer: bool,
         include: SchemaInclude,
         engine_context: EngineContext | None,
         notes_file: str | None,
@@ -266,19 +280,18 @@ class _SandboxPendingMethods:
             notes_file=bundled_notes,
             sql_file=bundled_sql,
             deny_columns=deny_columns,
-            restricted_consumer=restricted_consumer,
             include=include,
         )
         return Sandbox._sandbox_scope_signature(schema_context) == Sandbox._sandbox_scope_signature(baseline_context)
 
     @staticmethod
-    def _role_for_preset(preset: SandboxPreset | str) -> SchemaRole:
+    def _role_for_preset(preset: str) -> SchemaRole:
         return SchemaRole.CONSUMER if preset == "consumer_reader" else SchemaRole.OWNER
 
     @staticmethod
     def _baseline_dir_for_preset(
         extract_path: Path,
-        preset: SandboxPreset | str,
+        preset: str,
         *,
         include: SchemaInclude = SchemaInclude.TABLES,
     ) -> Path | None:
@@ -325,7 +338,7 @@ class _SandboxPendingMethods:
         saved_schema = DuckDBRuntimeConfig.SCHEMA
         try:
             Sandbox._reset_sandbox_duckdb_runtime()
-            return Path(MainExecutionOps.compute_engine_storage_dir(artifacts_dir, "duckdb"))
+            return Path(MainInitOps.compute_engine_storage_dir(artifacts_dir, "duckdb"))
         finally:
             DuckDBRuntimeConfig.DATABASE_PATH = saved_path
             DuckDBRuntimeConfig.SCHEMA = saved_schema
@@ -396,17 +409,57 @@ class _SandboxPendingMethods:
         return frozenset(name for name in tables if name)
 
     @staticmethod
+    def _sandbox_federation_member_artifacts_dir(
+        artifacts_dir: str,
+        federation_id: str,
+        binding: FederationSourceBinding,
+    ) -> str:
+        """Return the engine storage dir for a sandbox federation member (``fedsrc_<fed>_<source>``)."""
+        return federation_source_artifacts_dir(artifacts_dir, binding, federation_id=federation_id)
+
+    @staticmethod
+    def _federation_member_baseline_source(baseline: Path, member_name: str, binding: Any | None = None) -> Path | None:
+        """Return the packaged member baseline directory when it contains a schema graph."""
+        candidates: list[Path] = []
+        name = str(member_name or "").strip()
+        if name:
+            candidates.append(baseline / name)
+            candidates.append(baseline / name / "conn_duckdb_memory_main")
+        if binding is not None:
+            slug = federation_source_storage_slug(binding)
+            candidates.append(baseline / slug)
+            candidates.append(baseline / slug / "conn_duckdb_memory_main")
+        for candidate in candidates:
+            if candidate.is_dir() and (candidate / "schema_graph.json.gz").is_file():
+                return candidate
+        return None
+
+    @staticmethod
+    def _federation_member_baselines_complete(baseline: Path, member_names: tuple[str, ...]) -> bool:
+        """Return True when every federation member has a packaged schema-graph baseline."""
+        return all(Sandbox._federation_member_baseline_source(baseline, name) is not None for name in member_names)
+
+    @staticmethod
     def _seed_federation_member_baseline(
         *,
         baseline: Path,
         artifacts_dir: str,
-        binding: Any,
+        federation_id: str,
+        member_name: str,
+        binding: FederationSourceBinding | None = None,
     ) -> None:
-        slug = federation_source_storage_slug(binding)
-        member_src = baseline / slug
-        if not member_src.is_dir():
+        member_src = Sandbox._federation_member_baseline_source(baseline, member_name, binding)
+        if member_src is None:
             return
-        member_dest = Path(federation_source_artifacts_dir(artifacts_dir, binding))
+        if binding is None:
+            binding = FederationSourceBinding(
+                source_id=member_name,
+                engine="duckdb",
+                connection=member_name,
+                context="master",
+                role=SchemaRole.OWNER,
+            )
+        member_dest = Path(Sandbox._sandbox_federation_member_artifacts_dir(artifacts_dir, federation_id, binding))
         if (member_dest / "schema_graph.json.gz").is_file():
             return
         Sandbox._copy_baseline_cache_files(member_src, member_dest)
@@ -434,8 +487,9 @@ class _SandboxPendingMethods:
     def _create_federation_member_engine(
         engine_cls: type[Any],
         *,
+        federation_id: str,
         member_name: str,
-        seed_path: str,
+        schema_path: str,
         extract_path: Path,
         artifacts_dir: str,
         config_path: str,
@@ -443,44 +497,95 @@ class _SandboxPendingMethods:
         sql_file: str | None,
         allow_tables: frozenset[str],
         baseline: Path | None,
-        binding: Any | None,
+        binding: FederationSourceBinding | None,
+        limits: EngineLimits | None = None,
     ) -> tuple[Any, Any]:
-        del member_name, extract_path
-        connection = Sandbox._load_memory_connection(seed_path)
+        connection = Sandbox._load_memory_connection(schema_path)
+        data_dir = Sandbox._resolve_member_data_dir(extract_path, member_name)
+        if data_dir is None:
+            raise ConfigError(f"no CSV data dir found for federation member {member_name!r}")
+        Sandbox._load_table_rows_into_connection(connection, data_dir)
         execution_engine = DuckDBDialect.create_duckdb_sqlalchemy_engine(connection)
-        schema_context = Sandbox._owner_writer_schema_context(notes_file=notes_file, sql_file=sql_file)
+        member_notes = Sandbox._resolve_member_notes_file(extract_path, member_name) or notes_file
+        schema_context = Sandbox._owner_writer_schema_context(notes_file=member_notes, sql_file=sql_file)
         if allow_tables:
             schema_context = replace(schema_context, allow_objects=allow_tables)
-        if baseline is not None and binding is not None:
-            Sandbox._seed_federation_member_baseline(baseline=baseline, artifacts_dir=artifacts_dir, binding=binding)
+        if baseline is not None:
+            Sandbox._seed_federation_member_baseline(
+                baseline=baseline,
+                artifacts_dir=artifacts_dir,
+                federation_id=federation_id,
+                member_name=member_name,
+                binding=binding,
+            )
+        if binding is None:
+            binding = FederationSourceBinding(
+                source_id=member_name,
+                engine="duckdb",
+                connection=member_name,
+                context="master",
+                role=SchemaRole.OWNER,
+            )
+        member_dest = Path(Sandbox._sandbox_federation_member_artifacts_dir(artifacts_dir, federation_id, binding))
+        member_baseline_ready = (member_dest / "schema_graph.json.gz").is_file()
         engine = engine_cls(
             schema_context,
             artifacts_dir=artifacts_dir,
+            connection=member_name,
             config_file=config_path,
             execution_engine=execution_engine,
             native_connection=connection,
             role=SchemaRole.OWNER,
-            trust_bundled_baseline=True,
+            _trust_bundled_baseline=member_baseline_ready,
+            _storage_dir=str(member_dest),
+            limits=limits or EngineLimits(),
         )
         engine._sandbox_mode = True
         return engine, connection
 
     @staticmethod
-    def _default_federation_member_specs(extract_path: Path) -> tuple[tuple[str, str], ...]:
-        return tuple(
-            (member_name, str(extract_path / seed_name)) for member_name, seed_name in SANDBOX_BUNDLED_MEMBER_SEEDS
-        )
+    def _stamp_member_union_disjointness_samples(engines: Mapping[str, Any]) -> None:
+        """Stamp disjoint value_overlap_sample keys for the sandbox payment union members."""
+        for source_id, table_name, key_col, samples in (
+            ("storefront", "payment", "payment_id", ("sf_p1", "sf_p2")),
+            ("catalog", "payment", "payment_id", ("cat_p1", "cat_p2")),
+            ("logistics", "receipts", "rcpt_id", ("log_p1", "log_p2")),
+        ):
+            engine = engines.get(source_id)
+            if engine is None:
+                continue
+            graph = getattr(engine, "_schema_graph", None)
+            if graph is None:
+                continue
+            table = graph.tables.get(table_name)
+            if table is None:
+                continue
+            col = table.columns.get(key_col)
+            if col is None:
+                continue
+            col.value_overlap_sample = list(samples)
+            col.row_count = max(int(col.row_count or 0), len(samples), 1)
+            table.row_count = max(int(table.row_count or 0), len(samples), 1)
 
     @staticmethod
-    def _require_bundled_federation_seeds(extract_path: Path) -> None:
+    def _default_federation_member_specs(extract_path: Path) -> tuple[tuple[str, str], ...]:
+        specs: list[tuple[str, str]] = []
+        for member_name, _schema_name in SANDBOX_BUNDLED_MEMBER_SCHEMAS:
+            schema_path = Sandbox._resolve_member_schema_sql(extract_path, member_name)
+            if schema_path is not None:
+                specs.append((member_name, str(schema_path)))
+        return tuple(specs)
+
+    @staticmethod
+    def _require_bundled_federation_schemas(extract_path: Path) -> None:
         missing = [
-            seed_name
-            for _member_name, seed_name in SANDBOX_BUNDLED_MEMBER_SEEDS
-            if not (extract_path / seed_name).is_file()
+            member_name
+            for member_name, _schema_name in SANDBOX_BUNDLED_MEMBER_SCHEMAS
+            if Sandbox._resolve_member_schema_sql(extract_path, member_name) is None
         ]
         if missing:
             raise ConfigError(
-                "federation preset requires bundled partition seeds: " + ", ".join(missing),
+                "federation preset requires bundled partition schema SQL for members: " + ", ".join(missing),
             )
 
     @staticmethod
@@ -500,7 +605,7 @@ class _SandboxPendingMethods:
         else:
             declaration_path = extract_path / FEDERATION_DECLARATION_FILENAME
         if members is None:
-            Sandbox._require_bundled_federation_seeds(extract_path)
+            Sandbox._require_bundled_federation_schemas(extract_path)
         if not declaration_path.is_file():
             raise ConfigError(f"federation preset requires bundled {FEDERATION_DECLARATION_FILENAME}")
 
@@ -532,15 +637,26 @@ class _SandboxPendingMethods:
         )
 
     @staticmethod
-    def _ensure_federation_catalog_aetherspace(engine: Any, extract_path: Path) -> None:
-        notes_path = extract_path / "sandbox_space_catalog_notes.txt"
-        notes_arg = str(notes_path) if notes_path.is_file() else None
-        catalog = SpaceContext(
-            tables=SANDBOX_CATALOG_SPACE_TABLES,
-            columns=frozenset(),
-            notes_file=notes_arg,
-        )
-        engine.aetherspace("catalog", space_context=catalog)
+    def _ensure_federation_member_aetherspaces(engine: Any, extract_path: Path) -> None:
+        """Define the four member-aligned sandbox spaces (same scopes on engine or federation)."""
+        for space_name, tables in SANDBOX_MEMBER_SPACE_TABLES.items():
+            notes_name = SANDBOX_MEMBER_SPACE_NOTES_FILES[space_name]
+            notes_path = extract_path / notes_name
+            notes_arg = str(notes_path) if notes_path.is_file() else None
+            context = SpaceContext(
+                tables=tables,
+                columns=frozenset(),
+                notes_file=notes_arg,
+            )
+            existing_uid: str | None = None
+            try:
+                existing_uid = str(engine.aetherspace(space_name).uid)
+            except ConfigError:
+                existing_uid = None
+            if existing_uid is not None:
+                engine.aetherspace(space_name, space_context=context, uid=existing_uid)
+            else:
+                engine.aetherspace(space_name, space_context=context)
 
     @staticmethod
     def _apply_bundled_federation_mappings(
@@ -553,7 +669,8 @@ class _SandboxPendingMethods:
         shutil.copyfile(source, target)
         if handle is not None:
             handle.register_cwd_sidecar(target)
-        engine.apply_federation_declaration()
+        document = json.loads(source.read_text(encoding="utf-8"))
+        engine.apply_federation(document)
 
     @staticmethod
     @contextmanager
@@ -564,97 +681,152 @@ class _SandboxPendingMethods:
         mode: str | None = None,
     ) -> Iterator[PipelineSession]:
         """Yield a federation session configured for the sandbox scenario tied to *question*."""
-        scenario = Sandbox._load_sandbox_scenarios_by_question().get(Sandbox._normalize_sandbox_question(question), {})
+        extract_path = Sandbox._sandbox_extract_path_for_engine(engine)
+        scenario = Sandbox._load_sandbox_scenarios_by_question(extract_path).get(
+            Sandbox._normalize_sandbox_question(question),
+            {},
+        )
         mechanism = str(scenario.get("mechanism", ""))
         session_engine = engine
-        if mechanism == "federation_aetherspace":
-            bundle_access = Sandbox._open_data_bundle()
-            try:
-                Sandbox._ensure_federation_catalog_aetherspace(engine, bundle_access.path)
-            finally:
-                if bundle_access.owns_cleanup:
-                    shutil.rmtree(bundle_access.path, ignore_errors=True)
-        elif mechanism == "federation_mapping_confirm":
-            bundle_access = Sandbox._open_data_bundle()
-            try:
-                Sandbox._apply_bundled_federation_mappings(engine, bundle_access.path)
-            finally:
-                if bundle_access.owns_cleanup:
-                    shutil.rmtree(bundle_access.path, ignore_errors=True)
+        if mechanism in {"federation_aetherspace", "federation_mapping_confirm"}:
+            if extract_path is not None:
+                if mechanism == "federation_aetherspace":
+                    Sandbox._ensure_federation_member_aetherspaces(engine, extract_path)
+                else:
+                    Sandbox._apply_bundled_federation_mappings(engine, extract_path)
+            else:
+                override = bool(os.environ.get("AETHERDIALECT_SANDBOX_DATA_ZIP", "").strip())
+                bundle_access = Sandbox._open_data_bundle(maintainer_access=override)
+                try:
+                    if mechanism == "federation_aetherspace":
+                        Sandbox._ensure_federation_member_aetherspaces(engine, bundle_access.path)
+                    else:
+                        Sandbox._apply_bundled_federation_mappings(engine, bundle_access.path)
+                finally:
+                    if bundle_access.owns_cleanup:
+                        shutil.rmtree(bundle_access.path, ignore_errors=True)
         with session_engine.session(mode=mode or "writer") as session:
-            yield cast(PipelineSession, session)
+            yield cast("PipelineSession", session)
 
     @staticmethod
     @contextmanager
-    def _preset_offline_handle_cm(
+    def _offline_handle_cm(
         engine_cls: type[Any],
         *,
-        preset: SandboxPreset | str,
-        restricted_consumer: bool = False,
+        role: SchemaRole = SchemaRole.OWNER,
+        engine_context: EngineContext | None = None,
         include: SchemaInclude = SchemaInclude.TABLES,
         artifacts_dir: str | None = None,
         cleanup_artifacts: bool = True,
+        federation: bool = False,
         declaration_file: str | None = None,
         members: Mapping[str, str] | None = None,
         federation_context: FederationContext | None = None,
+        bundle_dir: str | None = None,
+        maintainer_access: bool = False,
+        llm_config: str | os.PathLike[str] | None = None,
+        connection: Any | None = None,
+        owns_connection: bool = False,
     ) -> Iterator[SandboxHandle]:
-        """Internal corpus entry: build a preset-scoped offline handle without public preset parameters."""
+        """Internal offline handle entry using production ``Sandbox.engine`` / ``federation`` construction."""
+        del engine_cls
         self_created_artifacts = artifacts_dir is None
         owned_artifacts = cleanup_artifacts and self_created_artifacts
-        if preset == "federation":
-            sandbox = Sandbox(
-                artifacts_dir=artifacts_dir,
-                cleanup=False,
-                auto_seed=False,
-            )
-            try:
-                yield Sandbox._create_federation_offline_sandbox(
-                    engine_cls,
+        if bundle_dir is not None:
+            Sandbox._require_maintainer_access(enabled=maintainer_access, hook="bundle_dir")
+        if connection is not None:
+            Sandbox._require_maintainer_access(enabled=maintainer_access, hook="connection")
+        sandbox = Sandbox(
+            artifacts_dir=artifacts_dir,
+            cleanup=False,
+            auto_seed=connection is None and not federation,
+            bundle_dir=bundle_dir,
+            llm_config=llm_config,
+            maintainer_access=maintainer_access,
+        )
+        handle: SandboxHandle | None = None
+        try:
+            if federation:
+                handle = Sandbox._create_federation_offline_sandbox(
+                    Sandbox._aether_engine_cls(),
                     sandbox=sandbox,
                     owned_artifacts=owned_artifacts,
                     declaration_file=declaration_file,
                     members=members,
                     federation_context=federation_context,
                 )
-            finally:
+            else:
+                if connection is not None:
+                    sandbox._datasets[SANDBOX_DEFAULT_DATASET_NAME] = _SandboxDataset(
+                        connection=connection,
+                        owns_connection=owns_connection,
+                    )
+                    Sandbox._mark_sandbox_managed_connection(connection, sandbox)
+                elif SANDBOX_DEFAULT_DATASET_NAME not in sandbox._datasets:
+                    sandbox.load_dataset(SANDBOX_DEFAULT_DATASET_NAME)
+                resolved_connection = sandbox.connection(SANDBOX_DEFAULT_DATASET_NAME)
+                engine = sandbox.engine(engine_context, role=role, include=include)
+                handle = SandboxHandle(
+                    engine,
+                    connection=resolved_connection,
+                    artifacts_dir=sandbox.artifacts_dir,
+                    owned_artifacts=owned_artifacts,
+                    owns_connection=owns_connection,
+                    config_path=sandbox._config_path,
+                    extract_dir=sandbox._extract_dir,
+                    saved_embedded_runtime_state=sandbox._saved_embedded_runtime_state,
+                    sandbox=sandbox,
+                )
+            yield handle
+        finally:
+            if handle is not None and not handle._closed:
+                handle.close()
+            elif handle is None:
                 sandbox.close()
-            return
 
-        reset_shared_engine_cache = not self_created_artifacts
+    @staticmethod
+    @contextmanager
+    def _federation_offline_handle_cm(
+        engine_cls: type[Any],
+        *,
+        artifacts_dir: str | None = None,
+        cleanup_artifacts: bool = True,
+        declaration_file: str | None = None,
+        members: Mapping[str, str] | None = None,
+        federation_context: FederationContext | None = None,
+        bundle_dir: str | None = None,
+        maintainer_access: bool = False,
+        llm_config: str | os.PathLike[str] | None = None,
+    ) -> Iterator[SandboxHandle]:
+        """Internal federation offline handle using ``Sandbox.federation``."""
+        self_created_artifacts = artifacts_dir is None
+        owned_artifacts = cleanup_artifacts and self_created_artifacts
+        if bundle_dir is not None:
+            Sandbox._require_maintainer_access(enabled=maintainer_access, hook="bundle_dir")
         sandbox = Sandbox(
             artifacts_dir=artifacts_dir,
             cleanup=False,
-            auto_seed=True,
+            auto_seed=False,
+            bundle_dir=bundle_dir,
+            llm_config=llm_config,
+            maintainer_access=maintainer_access,
         )
+        handle: SandboxHandle | None = None
         try:
-            connection = sandbox.connection(SANDBOX_DEFAULT_DATASET_NAME)
-            preset_engine_context = (
-                EngineContext(allow_objects=CONSUMER_EXAMPLE_NARROW_ALLOW_OBJECTS)
-                if restricted_consumer and preset == "consumer_reader"
-                else None
-            )
-            engine = sandbox.create_preset_engine(
+            handle = Sandbox._create_federation_offline_sandbox(
                 engine_cls,
-                preset=preset,
-                connection=connection,
-                restricted_consumer=False,
-                include=include,
-                reset_shared_engine_cache=reset_shared_engine_cache,
-                engine_context=preset_engine_context,
-            )
-            yield SandboxHandle(
-                engine,
-                connection=connection,
-                artifacts_dir=sandbox.artifacts_dir,
-                owned_artifacts=owned_artifacts,
-                owns_connection=False,
-                config_path=sandbox._config_path,
-                extract_dir=sandbox._extract_dir,
-                saved_embedded_runtime_state=sandbox._saved_embedded_runtime_state,
                 sandbox=sandbox,
+                owned_artifacts=owned_artifacts,
+                declaration_file=declaration_file,
+                members=members,
+                federation_context=federation_context,
             )
+            yield handle
         finally:
-            sandbox.close()
+            if handle is not None and not handle._closed:
+                handle.close()
+            elif handle is None:
+                sandbox.close()
 
     @staticmethod
     def create_offline_sandbox(
@@ -675,6 +847,7 @@ class _SandboxPendingMethods:
         maintainer_access: bool = False,
     ) -> SandboxHandle:
         """Enter the offline sandbox: in-memory DuckDB with bundled seed data and mock LLM fixtures."""
+        include = SchemaInclude.coerce(include)
         if bundle_dir is not None:
             Sandbox._require_maintainer_access(enabled=maintainer_access, hook="bundle_dir")
         if seed_sql is not None:
@@ -704,20 +877,34 @@ class _SandboxPendingMethods:
             resolved_owns_connection = False
         else:
             resolved_owns_connection = False if owns_connection is None else owns_connection
+            sandbox._datasets[SANDBOX_DEFAULT_DATASET_NAME] = _SandboxDataset(
+                connection=connection,
+                owns_connection=resolved_owns_connection,
+            )
+            Sandbox._mark_sandbox_managed_connection(connection, sandbox)
 
         reset_shared_engine_cache = not self_created_artifacts and bundle_dir is None and seed_sql is None
-        engine = sandbox.create_preset_engine(
-            engine_cls,
-            preset="owner_writer",
-            connection=connection,
-            deny_columns=deny_columns,
-            restricted_consumer=False,
-            include=include,
-            reset_shared_engine_cache=reset_shared_engine_cache,
-            engine_context=engine_context,
-            notes_file=notes_file,
-            sql_file=sql_file,
+        if reset_shared_engine_cache:
+            engine_dir = Sandbox._sandbox_memory_engine_dir(sandbox.artifacts_dir)
+            if engine_dir.is_dir():
+                Sandbox._unlink_artifact_lock_files(sandbox.artifacts_dir)
+                shutil.rmtree(engine_dir, ignore_errors=True)
+        resolved_context = engine_context
+        if deny_columns or notes_file or sql_file:
+            base = resolved_context or EngineContext()
+            merged_deny = (base.deny_columns or frozenset()) | (deny_columns or frozenset())
+            resolved_context = replace(
+                base,
+                deny_columns=merged_deny if merged_deny else base.deny_columns,
+                notes_file=notes_file or base.notes_file,
+                sql_file=sql_file or base.sql_file,
+            )
+        role = (
+            SchemaRole.CONSUMER
+            if (resolved_context is not None and resolved_context.allow_objects)
+            else SchemaRole.OWNER
         )
+        engine = sandbox.engine(resolved_context, role=role, include=include)
         return SandboxHandle(
             engine,
             connection=connection,
@@ -747,7 +934,29 @@ class _SandboxNormalizeHelpers:
 
 
 class _SandboxCorpusMethods:
-    """Temporary holder; methods are reassigned onto Sandbox below."""
+    """Sandbox method mixin; members are bound onto Sandbox below."""
+
+    @staticmethod
+    def _sandbox_extract_path_for_engine(engine: Any) -> Path | None:
+        """Return the active sandbox bundle path attached to *engine*, when present."""
+        attached = getattr(engine, "_sandbox_extract_path", None)
+        if isinstance(attached, Path) and attached.exists():
+            return attached
+        if isinstance(attached, str) and attached.strip():
+            path = Path(attached)
+            if path.exists():
+                return path
+        connection = getattr(engine, "_native_connection", None)
+        host = Sandbox.sandbox_host_for_connection(connection) if connection is not None else None
+        if host is not None:
+            return host._extract_path
+        members = getattr(engine, "_members", None)
+        if isinstance(members, Mapping):
+            for member in members.values():
+                nested = Sandbox._sandbox_extract_path_for_engine(member)
+                if nested is not None:
+                    return nested
+        return None
 
     @staticmethod
     def _read_sandbox_json_member(leaf: str, extract_path: Path | None = None) -> str | None:
@@ -755,7 +964,8 @@ class _SandboxCorpusMethods:
         if extract_path is not None:
             path = extract_path / leaf
             return path.read_text(encoding="utf-8") if path.is_file() else None
-        bundle = Sandbox.data_zip_path()
+        override = bool(os.environ.get("AETHERDIALECT_SANDBOX_DATA_ZIP", "").strip())
+        bundle = Sandbox.data_zip_path(maintainer_access=override)
         if bundle.is_dir():
             path = bundle / leaf
             return path.read_text(encoding="utf-8") if path.is_file() else None
@@ -832,7 +1042,7 @@ class _SandboxCorpusMethods:
 
     @staticmethod
     def _load_sandbox_expectations_index(extract_path: Path | None = None) -> dict[str, dict[str, object]]:
-        """Legacy question-only index (owner_writer + questions rows only)."""
+        """Question-only index for the owner_writer / questions tier."""
         catalog = Sandbox._load_sandbox_expectations_catalog(extract_path)
         index: dict[str, dict[str, object]] = {}
         for (profile, tier, question_norm), expect in catalog.by_context.items():
@@ -878,7 +1088,7 @@ class _SandboxCorpusMethods:
             for question_norm, expect in loaded.items():
                 active_runtime.faithfulness_by_question[question_norm] = Sandbox._faithfulness_from_expect(expect)
         else:
-            active_runtime.faithfulness_by_question.update(Sandbox._legacy_faithfulness_expectations())
+            active_runtime.faithfulness_by_question.update(Sandbox._static_faithfulness_expectations())
         active_runtime.faithfulness_loaded = True
 
     @staticmethod
@@ -943,9 +1153,9 @@ class _SandboxCorpusMethods:
         return Sandbox._load_sandbox_expectations_index().get(Sandbox._normalize_sandbox_question(question))
 
     @staticmethod
-    def _legacy_faithfulness_expectations() -> dict[str, SandboxFaithfulnessExpectation]:
+    def _static_faithfulness_expectations() -> dict[str, SandboxFaithfulnessExpectation]:
         out: dict[str, SandboxFaithfulnessExpectation] = {}
-        for question, spec in SANDBOX_LEGACY_FAITHFULNESS_SPECS.items():
+        for question, spec in SANDBOX_STATIC_FAITHFULNESS_SPECS.items():
             required_raw = spec.get("required_tables", ())
             required_tables = (
                 frozenset(required_raw) if isinstance(required_raw, (frozenset, set, tuple, list)) else frozenset()
@@ -981,16 +1191,20 @@ class _SandboxCorpusMethods:
         if isinstance(intent, RuntimeIntent):
             cte_steps = intent.cte_steps or []
             cte_aliases = {(s.cte_name or "").strip() for s in cte_steps if (s.cte_name or "").strip()}
-            cte_aliases.update(str(name).strip() for name in (intent.planner_cte_names or []) if str(name).strip())
+            cte_aliases.update(str(name).strip() for name in (intent.interpret_cte_names or []) if str(name).strip())
             base_from_ctes: set[str] = set()
             for cte in cte_steps:
                 base_from_ctes.update(t for t in (cte.tables or []) if t and t not in cte_aliases)
             main_base = {t for t in (intent.tables or []) if t and t not in cte_aliases}
             names: set[str] = set(base_from_ctes) | set(main_base)
             if sql:
+                try:
+                    sqlglot_dialect = Dialect.active_sqlglot_dialect()
+                except RuntimeError:
+                    sqlglot_dialect = "duckdb"
                 names.update(
                     t
-                    for t in Dialect.sql_tables_referenced(sql, sqlglot_dialect=Dialect.active_sqlglot_dialect())
+                    for t in Dialect.sql_tables_referenced(sql, sqlglot_dialect=sqlglot_dialect)
                     if t and t not in cte_aliases
                 )
             return {str(t).lower() for t in names if t}
@@ -998,10 +1212,12 @@ class _SandboxCorpusMethods:
         tables = list(getattr(intent, "tables", None) or getattr(summary, "tables", None) or [])
         names = {str(t).lower() for t in tables if t}
         if sql:
+            try:
+                sqlglot_dialect = Dialect.active_sqlglot_dialect()
+            except RuntimeError:
+                sqlglot_dialect = "duckdb"
             names.update(
-                str(t).lower()
-                for t in Dialect.sql_tables_referenced(sql, sqlglot_dialect=Dialect.active_sqlglot_dialect())
-                if t
+                str(t).lower() for t in Dialect.sql_tables_referenced(sql, sqlglot_dialect=sqlglot_dialect) if t
             )
         return names
 
@@ -1188,50 +1404,69 @@ class _SandboxCorpusMethods:
         append_failure_trace(trace, Sandbox._validate_trace_path())
 
     @staticmethod
+    def _member_for_sandbox_question(question: str) -> str:
+        """Return the member-aligned consumer partition for a bundled sandbox question."""
+        normalized = Sandbox._normalize_sandbox_question(question)
+        for member, questions in SANDBOX_MEMBER_SPACE_QUESTIONS.items():
+            for candidate in questions:
+                if Sandbox._normalize_sandbox_question(candidate) == normalized:
+                    return member
+        return "catalog"
+
+    @staticmethod
+    def _consumer_engine_context_for_member(member: str) -> EngineContext:
+        tables = SANDBOX_MEMBER_SPACE_TABLES.get(member)
+        if tables is None:
+            allowed = ", ".join(sorted(SANDBOX_MEMBER_SPACE_TABLES))
+            raise ConfigError(f"unknown sandbox member {member!r}; allowed: {allowed}")
+        return EngineContext(allow_objects=tables)
+
+    @staticmethod
     def _validate_question_slot(
         engine_cls: type[Any],
         question: str,
         *,
         tier: str,
-        preset: SandboxPreset | str = SandboxPreset.OWNER_WRITER,
+        role: SchemaRole = SchemaRole.OWNER,
+        engine_context: EngineContext | None = None,
         mode: str | None = None,
-        apply_overrides: bool = False,
-        restricted_consumer: bool = False,
+        apply_structure: bool = False,
         slot_id: str | None = None,
         sandbox_factory: Callable[..., Any] | None = None,
         include: SchemaInclude = SchemaInclude.TABLES,
     ) -> dict[str, str] | None:
         """Run one offline slot and return a failure row when expectations are not met."""
+        profile = "consumer_reader" if role == SchemaRole.CONSUMER else "owner_writer"
         step: object | None = None
         captured_logs: list[str] = []
         try:
             with pipeline_capture(auto_responses=["y"]) as capture:
                 if sandbox_factory is not None:
                     sandbox_cm = sandbox_factory(
-                        preset=preset,
-                        restricted_consumer=restricted_consumer,
+                        role=role,
+                        engine_context=engine_context,
                         include=include,
                     )
                 else:
-                    sandbox_cm = Sandbox._preset_offline_handle_cm(
+                    sandbox_cm = Sandbox._offline_handle_cm(
                         engine_cls,
-                        preset=preset,
-                        restricted_consumer=restricted_consumer,
+                        role=role,
+                        engine_context=engine_context,
                         include=include,
                     )
                 with sandbox_cm as sb:
-                    if apply_overrides:
-                        sb.apply_bundled_schema_overrides()
+                    if apply_structure and sb._sandbox is not None:
+                        Sandbox._stage_demo_schema_structure(sb.engine, sb._sandbox._extract_path)
                     session_cm = sb.engine.session(mode=mode) if mode else sb.engine.session()
                     with session_cm as session:
                         step = session.accept_until_done(question)
                 captured_logs = list(capture.get("logs", []))
-            if not Sandbox.question_ok(step, question, slot_id=slot_id, profile=preset, tier=tier):
+            if not Sandbox.question_ok(step, question, slot_id=slot_id, profile=profile, tier=tier):
                 faith_detail = Sandbox.check_sandbox_faithfulness(
                     step,
                     question,
                     slot_id=slot_id,
-                    profile=preset,
+                    profile=profile,
                     tier=tier,
                 )
                 row = {
@@ -1263,9 +1498,9 @@ class _SandboxCorpusMethods:
         try:
             with pipeline_capture(auto_responses=["y"]) as capture:
                 if sandbox_factory is not None:
-                    sandbox_cm = sandbox_factory()
+                    sandbox_cm = sandbox_factory(federation=True)
                 else:
-                    sandbox_cm = Sandbox._preset_offline_handle_cm(engine_cls, preset="federation")
+                    sandbox_cm = Sandbox._federation_offline_handle_cm(engine_cls)
                 with sandbox_cm as sb:
                     with Sandbox.federation_scenario_session(sb.engine, question, mode=mode) as session:
                         step = session.accept_until_done(question)
@@ -1313,16 +1548,16 @@ class _SandboxCorpusMethods:
                 engine_cls,
                 question,
                 tier="validation_failures",
-                apply_overrides=True,
+                apply_structure=True,
             )
         if mechanism == "schema_validation_failure":
             return Sandbox._validate_question_slot(
                 engine_cls,
                 question,
                 tier="validation_failures",
-                preset="consumer_reader",
+                role=SchemaRole.CONSUMER,
+                engine_context=Sandbox._consumer_engine_context_for_member("catalog"),
                 mode="reader",
-                restricted_consumer=True,
             )
         return Sandbox._validate_question_slot(engine_cls, question, tier="validation_failures")
 
@@ -1376,7 +1611,7 @@ class _SandboxCorpusMethods:
         """Run offline sandbox validation and return failure rows."""
         Sandbox._reset_validate_trace_file()
         failures: list[dict[str, str]] = []
-        for question in Sandbox.sandbox_questions():
+        for question in Sandbox._sandbox_questions():
             row = Sandbox._validate_question_slot(engine_cls, question, tier="questions")
             if row is not None:
                 failures.append(row)
@@ -1386,12 +1621,14 @@ class _SandboxCorpusMethods:
             if row is not None:
                 failures.append(row)
 
-        for question in Sandbox.sandbox_questions():
+        for question in Sandbox._sandbox_questions():
+            member = Sandbox._member_for_sandbox_question(question)
             row = Sandbox._validate_question_slot(
                 engine_cls,
                 question,
                 tier="consumer_reader",
-                preset="consumer_reader",
+                role=SchemaRole.CONSUMER,
+                engine_context=Sandbox._consumer_engine_context_for_member(member),
                 mode="reader",
             )
             if row is not None:
@@ -1403,7 +1640,7 @@ class _SandboxCorpusMethods:
                 failures.append(row)
 
         if smoke:
-            feedback_demo = Sandbox.sandbox_feedback_demo()
+            feedback_demo = Sandbox._sandbox_feedback_demo()
             anchor = str(feedback_demo.get("anchor_question", "")).strip()
             rejection = str(feedback_demo.get("allowed_rejection_text", "")).strip()
             if anchor and rejection:
@@ -1431,13 +1668,13 @@ class _SandboxCorpusMethods:
         if reuse_row is not None:
             failures.append(reuse_row)
 
-        for recipe in SANDBOX_RECIPES:
+        for scenario_name in Sandbox._recipe_dispatch(engine_cls):
             try:
-                Sandbox._execute_sandbox_recipe(recipe, engine_cls)
+                Sandbox._execute_sandbox_recipe(scenario_name, engine_cls)
             except Exception as exc:
-                failures.append({"kind": "recipe", "tier": "", "name": recipe, "detail": str(exc)})
+                failures.append({"kind": "scenario", "tier": "", "name": scenario_name, "detail": str(exc)})
 
-        feedback_demo = Sandbox.sandbox_feedback_demo()
+        feedback_demo = Sandbox._sandbox_feedback_demo()
         anchor = str(feedback_demo.get("anchor_question", "")).strip()
         rejection = str(feedback_demo.get("allowed_rejection_text", "")).strip()
         if anchor and rejection:
@@ -1545,7 +1782,8 @@ class _SandboxCorpusMethods:
 
     @staticmethod
     def _load_sandbox_questions_sections() -> dict[str, list[str]]:
-        bundle_access = Sandbox._open_data_bundle()
+        override = bool(os.environ.get("AETHERDIALECT_SANDBOX_DATA_ZIP", "").strip())
+        bundle_access = Sandbox._open_data_bundle(maintainer_access=override)
         try:
             return Sandbox._parse_questions_file(str(bundle_access.path / "questions.txt"))
         except OSError as exc:
@@ -1555,18 +1793,31 @@ class _SandboxCorpusMethods:
                 shutil.rmtree(bundle_access.path, ignore_errors=True)
 
     @staticmethod
-    def sandbox_questions() -> list[str]:
+    def _sandbox_questions() -> list[str]:
         """Return curated natural-language sandbox practice questions."""
         return list(Sandbox._load_sandbox_questions_sections()["questions"])
 
     @staticmethod
+    def _sandbox_member_space_questions(space: str | None = None) -> list[str] | dict[str, list[str]]:
+        """Return practice questions that stay in-scope for member- aligned AetherSpaces. These are subsets of the full practice corpus (not extra questions). Every listed question remains valid on single-engine ``master`` and on the full four-member federation. Pass *space* (``storefront`` / ``catalog`` / ``logistics`` / ``crm``) for one list, or omit it for the full mapping."""
+        if space is None:
+            return {name: list(questions) for name, questions in SANDBOX_MEMBER_SPACE_QUESTIONS.items()}
+        key = str(space).strip().lower()
+        if key not in SANDBOX_MEMBER_SPACE_QUESTIONS:
+            raise ConfigError(
+                f"unknown member space {space!r}; expected one of {sorted(SANDBOX_MEMBER_SPACE_QUESTIONS)}",
+            )
+        return list(SANDBOX_MEMBER_SPACE_QUESTIONS[key])
+
+    @staticmethod
     def _sandbox_build_section(section: SandboxBuildSection | str) -> list[str]:
-        """Return build-only question file sections (not part of ``sandbox_questions()``)."""
+        """Return build-only question file sections (not part of the practice corpus)."""
         return list(Sandbox._load_sandbox_questions_sections()[section])
 
     @staticmethod
     def _load_sandbox_catalog() -> dict[str, object]:
-        bundle_access = Sandbox._open_data_bundle()
+        override = bool(os.environ.get("AETHERDIALECT_SANDBOX_DATA_ZIP", "").strip())
+        bundle_access = Sandbox._open_data_bundle(maintainer_access=override)
         try:
             catalog_path = bundle_access.path / "sandbox_catalog.json"
             if not catalog_path.is_file():
@@ -1582,12 +1833,12 @@ class _SandboxCorpusMethods:
                 shutil.rmtree(bundle_access.path, ignore_errors=True)
 
     @staticmethod
-    def sandbox_catalog() -> dict[str, object]:
-        """Return the bundled user-facing sandbox discovery catalog."""
+    def _sandbox_catalog() -> dict[str, object]:
+        """Return the bundled sandbox discovery catalog (maintainer/corpus use only)."""
         return dict(Sandbox._load_sandbox_catalog())
 
     @staticmethod
-    def sandbox_paraphrase_pairs() -> list[dict[str, object]]:
+    def _sandbox_paraphrase_pairs() -> list[dict[str, object]]:
         """Return canonical→paraphrase wordings from the bundled sandbox catalog."""
         rows = Sandbox._load_sandbox_catalog().get("paraphrase_pairs")
         if not isinstance(rows, list):
@@ -1595,7 +1846,7 @@ class _SandboxCorpusMethods:
         return [dict(row) for row in rows if isinstance(row, dict)]
 
     @staticmethod
-    def sandbox_validation_failure_demo() -> list[dict[str, str]]:
+    def _sandbox_validation_failure_demo() -> list[dict[str, str]]:
         """Return example validation-failure questions and short descriptions."""
         rows = Sandbox._load_sandbox_catalog().get("validation_failure_demo")
         if not isinstance(rows, list):
@@ -1616,7 +1867,7 @@ class _SandboxCorpusMethods:
         return out
 
     @staticmethod
-    def sandbox_feedback_demo() -> dict[str, str]:
+    def _sandbox_feedback_demo() -> dict[str, str]:
         """Return the scripted reject/retry feedback demo (anchor + allowed rejection text)."""
         row = Sandbox._load_sandbox_catalog().get("feedback_demo")
         if not isinstance(row, dict):
@@ -1698,21 +1949,6 @@ class _SandboxCorpusMethods:
             return sum(1 for _ in fh)
 
     @staticmethod
-    def _apply_bundled_schema_overrides(t2s: Any, handle: SandboxHandle | None = None) -> None:
-        """Copy bundled override JSON to artifacts_dir and call ``apply_schema_overrides`` on the engine."""
-        bundle_access = Sandbox._open_data_bundle()
-        try:
-            source = bundle_access.path / "schema_overrides_demo.json"
-            target = Path(t2s._artifacts_dir) / SCHEMA_OVERRIDES_DEFAULT_FILENAME
-            shutil.copyfile(source, target)
-            if handle is not None:
-                handle.register_cwd_sidecar(target)
-            t2s.apply_schema_overrides()
-        finally:
-            if bundle_access.owns_cleanup:
-                shutil.rmtree(bundle_access.path, ignore_errors=True)
-
-    @staticmethod
     def _stage_migration_corpus_variant(
         extract_path: Path,
         *,
@@ -1722,20 +1958,15 @@ class _SandboxCorpusMethods:
         demo_root = extract_path / variant
         artifacts_src = demo_root / "artifacts_v1"
         map_path = demo_root / "schema_migration_map.json"
-        seed_path = extract_path / "rental_shop_seed.sql"
-        if not artifacts_src.is_dir() or not map_path.is_file() or not seed_path.is_file():
+        schema_path = extract_path / SANDBOX_DEFAULT_SCHEMA_SQL
+        if not artifacts_src.is_dir() or not map_path.is_file() or not schema_path.is_file():
             raise FileNotFoundError(f"Migration corpus variant assets incomplete under {demo_root}.")
 
-        work = Path(tempfile.mkdtemp(prefix="aetherdialect_migration_variant_"))
-        try:
-            post_sql = work / "rental_shop_post_migration.sql"
-            post_sql.write_text(Sandbox._post_migration_seed_sql(seed_path, map_path), encoding="utf-8")
-            shutil.copytree(artifacts_src, Path(artifacts_dir), dirs_exist_ok=True)
-            engine_dir = Sandbox._sandbox_memory_engine_dir(artifacts_dir)
-            Sandbox._copy_baseline_cache_files(artifacts_src, engine_dir)
-            connection = Sandbox._load_memory_connection(str(post_sql))
-        finally:
-            shutil.rmtree(work, ignore_errors=True)
+        shutil.copytree(artifacts_src, Path(artifacts_dir), dirs_exist_ok=True)
+        engine_dir = Sandbox._sandbox_memory_engine_dir(artifacts_dir)
+        Sandbox._copy_baseline_cache_files(artifacts_src, engine_dir)
+        connection = Sandbox._load_main_memory_connection(extract_path)
+        Sandbox._apply_migration_column_renames(connection, map_path)
 
         notes_file = extract_path / "rental_shop_notes.txt"
         sql_file = extract_path / "rental_shop.sql"
@@ -1783,17 +2014,15 @@ class _SandboxCorpusMethods:
             demo_root = extract / "migration_demo"
             artifacts_src = demo_root / "artifacts_v1"
             map_path = demo_root / "schema_migration_map.json"
-            seed_path = extract / "rental_shop_seed.sql"
-            if not artifacts_src.is_dir() or not map_path.is_file() or not seed_path.is_file():
+            schema_path = extract / SANDBOX_DEFAULT_SCHEMA_SQL
+            if not artifacts_src.is_dir() or not map_path.is_file() or not schema_path.is_file():
                 raise FileNotFoundError(f"Migration demo assets incomplete under {demo_root}.")
-
-            post_sql = work / "rental_shop_post_migration.sql"
-            post_sql.write_text(Sandbox._post_migration_seed_sql(seed_path, map_path), encoding="utf-8")
 
             artifacts_dir = str(work / "artifacts")
             shutil.copytree(artifacts_src, artifacts_dir)
 
-            connection = Sandbox._load_memory_connection(str(post_sql))
+            connection = Sandbox._load_main_memory_connection(extract)
+            Sandbox._apply_migration_column_renames(connection, map_path)
             execution_engine = DuckDBDialect.create_duckdb_sqlalchemy_engine(connection)
             notes_file = extract / "rental_shop_notes.txt"
             notes_arg = str(notes_file) if notes_file.is_file() else None
@@ -1829,7 +2058,7 @@ class _SandboxCorpusMethods:
             t2s._sandbox_mode = True
             if verbose:
                 print("  Migration map applied; asking post-migration question.")
-            practice_q = Sandbox.sandbox_questions()
+            practice_q = Sandbox._sandbox_questions()
             post_q = practice_q[0] if practice_q else "How many films are in the Rental Shop catalog?"
             with t2s.session() as session:
                 step = Sandbox._accept_until_done(session, post_q)
@@ -1850,7 +2079,7 @@ class _SandboxCorpusMethods:
 
     @staticmethod
     def _practice_questions() -> list[str]:
-        return Sandbox.sandbox_questions()
+        return Sandbox._sandbox_questions()
 
     @staticmethod
     def _recipe_chat_basics(handle: SandboxHandle) -> None:
@@ -1873,7 +2102,7 @@ class _SandboxCorpusMethods:
             if not step.done and step.reply_shape == "yes_no":
                 step = session.step("n")
             if not step.done and step.reply_shape == "free_text":
-                rejection = Sandbox.sandbox_feedback_demo().get("allowed_rejection_text", "")
+                rejection = Sandbox._sandbox_feedback_demo().get("allowed_rejection_text", "")
                 step = session.step(str(rejection) if rejection else "wrong intent")
             while not step.done and step.reply_shape == "yes_no":
                 step = session.step("y")
@@ -1886,14 +2115,25 @@ class _SandboxCorpusMethods:
             print(f"  shared artifacts_dir={shared}")
             tour = Sandbox._practice_questions()
             q = tour[0] if tour else "How many films are in the Rental Shop catalog?"
-            with Sandbox._preset_offline_handle_cm(
-                engine_cls, preset="consumer_reader", artifacts_dir=shared
+            catalog_ctx = Sandbox._consumer_engine_context_for_member("catalog")
+            with Sandbox._offline_handle_cm(
+                engine_cls,
+                role=SchemaRole.CONSUMER,
+                engine_context=catalog_ctx,
+                artifacts_dir=shared,
+                cleanup_artifacts=False,
             ) as reader:
-                reader.apply_bundled_schema_overrides()
+                if reader._sandbox is not None:
+                    Sandbox._stage_demo_schema_structure(reader.engine, reader._sandbox._extract_path)
                 queue = Sandbox._write_queue_path(reader.engine)
                 assert queue.is_file(), "reader should enqueue learning events"
                 print(f"  write_queue lines={Sandbox._count_utf8_lines(queue)}")
-            with Sandbox._preset_offline_handle_cm(engine_cls, preset="owner_writer", artifacts_dir=shared) as writer:
+            with Sandbox._offline_handle_cm(
+                engine_cls,
+                role=SchemaRole.OWNER,
+                artifacts_dir=shared,
+                cleanup_artifacts=False,
+            ) as writer:
                 with writer.engine.session(mode="writer") as session:
                     session.ask(q)
                 queue = Sandbox._write_queue_path(writer.engine)
@@ -1903,9 +2143,10 @@ class _SandboxCorpusMethods:
             shutil.rmtree(shared, ignore_errors=True)
 
     @staticmethod
-    def _recipe_overrides(handle: SandboxHandle) -> None:
-        Sandbox._print_goal("overrides — owner applies bundled schema_overrides_demo.json")
-        handle.apply_bundled_schema_overrides()
+    def _recipe_structure(handle: SandboxHandle) -> None:
+        Sandbox._print_goal("overrides — owner applies bundled schema_structure_demo.json")
+        if handle._sandbox is not None:
+            Sandbox._stage_demo_schema_structure(handle.engine, handle._sandbox._extract_path)
 
     @staticmethod
     def _recipe_migration(engine_cls: type[Any]) -> None:
@@ -1921,10 +2162,10 @@ class _SandboxCorpusMethods:
                 with owner.engine.session() as session:
                     step = Sandbox._accept_until_done(session, fails[0])
                 print(f"  schema_invalid done={step.done} kind={step.kind!r}")
-        with Sandbox._preset_offline_handle_cm(
+        with Sandbox._offline_handle_cm(
             engine_cls,
-            preset="consumer_reader",
-            restricted_consumer=True,
+            role=SchemaRole.CONSUMER,
+            engine_context=Sandbox._consumer_engine_context_for_member("catalog"),
         ) as consumer:
             with consumer.engine.session(mode="reader") as session:
                 step = Sandbox._accept_until_done(session, "How many items are there?")
@@ -1932,10 +2173,8 @@ class _SandboxCorpusMethods:
 
     @staticmethod
     def _recipe_maintenance(handle: SandboxHandle) -> None:
-        Sandbox._print_goal("maintenance — show_config and table inventory")
-        snap = handle.engine.show_config()
-        print(f"  config lines={len(snap.text.splitlines())}")
-        meta = handle.engine.export_metadata()
+        Sandbox._print_goal("maintenance — structure export and table inventory")
+        meta = handle.engine.export_structure()
         table_count = int(meta.get("table_count") or 0)
         print(f"  table_count={table_count}")
         assert table_count == 34, f"Rental Shop sandbox expects 34 tables, got {table_count}"
@@ -1949,12 +2188,17 @@ class _SandboxCorpusMethods:
                 if step.error and "No mock fixture" in step.error:
                     print(f"  mock fixture missing: {step.error[:80]}...")
             with sb.engine.session(mode="reader") as session:
-                session.ask(Sandbox.sandbox_questions()[0])
+                session.ask(Sandbox._sandbox_questions()[0])
                 try:
                     session.ask("second question while suspended")
                 except SessionActiveError:
                     print("  SessionActiveError raised")
-        with Sandbox._preset_offline_handle_cm(engine_cls, preset="consumer_reader") as sb:
+        catalog_ctx = Sandbox._consumer_engine_context_for_member("catalog")
+        with Sandbox._offline_handle_cm(
+            engine_cls,
+            role=SchemaRole.CONSUMER,
+            engine_context=catalog_ctx,
+        ) as sb:
             try:
                 with sb.engine.session(mode="writer"):
                     pass
@@ -2031,24 +2275,24 @@ class _SandboxCorpusMethods:
 
     @staticmethod
     def _recipe_aetherspace(engine_cls: type[Any]) -> None:
-        Sandbox._print_goal("aetherspace — catalog space scoped to item/film/category")
+        Sandbox._print_goal("aetherspace — member-aligned spaces (catalog + storefront)")
         bundle_access = Sandbox._open_data_bundle()
         try:
-            notes_path = bundle_access.path / "sandbox_space_catalog_notes.txt"
-            notes_arg = str(notes_path) if notes_path.is_file() else None
             with Sandbox.create_offline_sandbox(engine_cls) as sb:
-                catalog = SpaceContext(
-                    tables=frozenset({"item", "film", "category", "item_category"}),
-                    columns=frozenset(),
-                )
-                sb.engine.aetherspace("catalog", space_context=catalog, notes_file=notes_arg)
+                Sandbox._ensure_federation_member_aetherspaces(sb.engine, bundle_access.path)
+                catalog_qs = Sandbox._sandbox_member_space_questions("catalog")
+                assert isinstance(catalog_qs, list)
+                in_scope_q = catalog_qs[0] if catalog_qs else "How many books do we have?"
                 with sb.engine.session(space="catalog") as session:
-                    step = session.accept_until_done("How many films are in the catalog?")
-                    print(f"  in_scope ok={step.done and step.kind == SESSION_KIND_RESULT and not step.error}")
+                    step = session.accept_until_done(in_scope_q)
+                    print(f"  catalog in_scope ok={step.done and step.kind == SESSION_KIND_RESULT and not step.error}")
+                storefront_qs = Sandbox._sandbox_member_space_questions("storefront")
+                assert isinstance(storefront_qs, list)
+                out_of_catalog_q = storefront_qs[0] if storefront_qs else "What is the total revenue by store?"
                 with sb.engine.session(space="catalog") as session:
-                    step = session.accept_until_done("What is total revenue by store?")
+                    step = session.accept_until_done(out_of_catalog_q)
                     blocked = step.sql is None or bool(step.error)
-                    print(f"  out_of_scope blocked={blocked}")
+                    print(f"  catalog out_of_scope blocked={blocked}")
         finally:
             if bundle_access.owns_cleanup:
                 shutil.rmtree(bundle_access.path, ignore_errors=True)
@@ -2081,7 +2325,7 @@ class _SandboxCorpusMethods:
             "chat_basics": lambda: Sandbox._with_handle(Sandbox._recipe_chat_basics, engine_cls),
             "rejections": lambda: Sandbox._with_handle(Sandbox._recipe_rejections, engine_cls),
             "reader_writer": lambda: Sandbox._recipe_reader_writer(engine_cls),
-            "overrides": lambda: Sandbox._with_handle(Sandbox._recipe_overrides, engine_cls),
+            "structure": lambda: Sandbox._with_handle(Sandbox._recipe_structure, engine_cls),
             "migration": lambda: Sandbox._recipe_migration(engine_cls),
             "validation_failures": lambda: Sandbox._recipe_validation_failures(engine_cls),
             "maintenance": lambda: Sandbox._with_handle(Sandbox._recipe_maintenance, engine_cls),
@@ -2095,19 +2339,17 @@ class _SandboxCorpusMethods:
 
     @staticmethod
     def _execute_sandbox_recipe(name: str, engine_cls: type[Any]) -> None:
-        """Run a single internal sandbox validation recipe."""
-        if name not in SANDBOX_RECIPES:
-            raise ValueError(f"Unknown sandbox recipe {name!r}; expected one of {SANDBOX_RECIPES}")
+        """Run a single internal sandbox validation scenario."""
         dispatch = Sandbox._recipe_dispatch(engine_cls).get(name)
         if dispatch is None:
-            raise ValueError(f"Unknown recipe {name!r}")
+            raise ValueError(f"Unknown sandbox scenario {name!r}")
         dispatch()
 
     @staticmethod
     def _execute_sandbox_tour(engine_cls: type[Any], *, interactive: bool = False) -> None:
-        """Run every internal sandbox validation recipe in curriculum order."""
+        """Run every internal sandbox validation scenario in curriculum order."""
         del interactive
-        for name in SANDBOX_RECIPES:
+        for name in Sandbox._recipe_dispatch(engine_cls):
             Sandbox._execute_sandbox_recipe(name, engine_cls)
 
 
@@ -2142,14 +2384,14 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
     @staticmethod
     def _sandbox_llm_mode_from_config(config_path: str | None) -> SandboxLlmMode:
         if config_path is None:
-            return SandboxLlmMode.MOCK
+            return SandboxLlmMode.SANDBOX
         payload = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
         llm_block = payload.get("llm")
-        provider = "mock"
+        provider = "sandbox"
         if isinstance(llm_block, dict):
-            provider = str(llm_block.get("provider", "mock")).strip().lower() or "mock"
-        if provider == "mock":
-            return SandboxLlmMode.MOCK
+            provider = str(llm_block.get("provider", "sandbox")).strip().lower() or "sandbox"
+        if provider in ("sandbox", "mock"):
+            return SandboxLlmMode.SANDBOX
         return SandboxLlmMode.NETWORK
 
     @staticmethod
@@ -2280,22 +2522,23 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
         return str(extract_dir.joinpath(*parts))
 
     @staticmethod
-    def _post_migration_seed_sql(seed_path: Path, migration_map_path: Path) -> str:
-        """Apply column renames from the bundled migration map to seed SQL text."""
-        text = seed_path.read_text(encoding="utf-8")
+    def _apply_migration_column_renames(connection: Any, migration_map_path: Path) -> None:
+        """Apply bundled column renames from a migration map onto an in- memory DuckDB connection."""
         payload = json.loads(migration_map_path.read_text(encoding="utf-8"))
         for rename in payload.get("column_renames", []):
             if not isinstance(rename, dict):
                 continue
+            table = str(rename.get("table", "")).strip()
             from_col = str(rename.get("from", "")).strip()
             to_col = str(rename.get("to", "")).strip()
-            if not from_col or not to_col or from_col == to_col:
+            if not table or not from_col or not to_col or from_col == to_col:
                 continue
-            text = text.replace(f" {from_col} ", f" {to_col} ")
-            text = text.replace(f"({from_col},", f"({to_col},")
-            text = text.replace(f" {from_col},", f" {to_col},")
-            text = text.replace(f" {from_col})", f" {to_col})")
-        return text
+            quoted_table = '"' + table.replace('"', '""') + '"'
+            quoted_from = '"' + from_col.replace('"', '""') + '"'
+            quoted_to = '"' + to_col.replace('"', '""') + '"'
+            connection.execute(
+                f"ALTER TABLE {quoted_table} RENAME COLUMN {quoted_from} TO {quoted_to}",
+            )
 
     @staticmethod
     def _load_bundled_schema_literals(extract_path: Path) -> dict[str, str] | None:
@@ -2342,15 +2585,125 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
         return parts
 
     @staticmethod
-    def _load_memory_connection(seed_sql: str) -> Any:
-        """Create ``:memory:`` DuckDB, execute seed SQL, return native connection."""
+    def _load_memory_connection(sql_path: str) -> Any:
+        """Create ``:memory:`` DuckDB and execute DDL/SQL statements from *sql_path*."""
         require_driver("duckdb")
         duckdb = importlib.import_module("duckdb")
-        sql = Path(seed_sql).read_text(encoding="utf-8")
+        sql = Path(sql_path).read_text(encoding="utf-8")
         connection = duckdb.connect(":memory:")
         for statement in Sandbox._split_sql_statements(sql):
             if statement.strip():
                 connection.execute(statement)
+        return connection
+
+    @staticmethod
+    def _table_exists_on_connection(connection: Any, table: str) -> bool:
+        """Return True when *table* is already present on *connection*."""
+        row = connection.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE lower(table_name) = lower(?) "
+            "AND lower(table_schema) IN ('main', 'public') "
+            "LIMIT 1",
+            [table],
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _load_table_rows_into_connection(connection: Any, data_dir: Path) -> int:
+        """Load CSV/parquet table files from *data_dir* into *connection*. Return loaded table count."""
+        if not data_dir.is_dir():
+            return 0
+        loaded = 0
+        for path in sorted(data_dir.iterdir()):
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            table = path.stem
+            if not table or table.startswith("."):
+                continue
+            quoted = '"' + table.replace('"', '""') + '"'
+            posix = path.resolve().as_posix().replace("'", "''")
+            if suffix == ".csv":
+                source_sql = f"SELECT * FROM read_csv_auto('{posix}')"
+            elif suffix in {".parquet", ".pq"}:
+                source_sql = f"SELECT * FROM read_parquet('{posix}')"
+            else:
+                continue
+            if Sandbox._table_exists_on_connection(connection, table):
+                connection.execute(f"DELETE FROM {quoted}")
+                connection.execute(f"INSERT INTO {quoted} {source_sql}")
+            else:
+                connection.execute(f"CREATE TABLE {quoted} AS {source_sql}")
+            loaded += 1
+        return loaded
+
+    @staticmethod
+    def _resolve_default_schema_sql(extract_path: Path) -> Path | None:
+        path = extract_path / SANDBOX_DEFAULT_SCHEMA_SQL
+        if path.is_file():
+            return path
+        return None
+
+    @staticmethod
+    def _resolve_default_data_dir(extract_path: Path) -> Path | None:
+        path = extract_path / SANDBOX_DEFAULT_DATA_DIR
+        if path.is_dir():
+            return path
+        return None
+
+    @staticmethod
+    def _resolve_member_schema_sql(extract_path: Path, member_name: str) -> Path | None:
+        for name, schema_name in SANDBOX_BUNDLED_MEMBER_SCHEMAS:
+            if name == member_name:
+                path = extract_path / schema_name
+                if path.is_file():
+                    return path
+        return None
+
+    @staticmethod
+    def _resolve_member_data_dir(extract_path: Path, member_name: str) -> Path | None:
+        for name, data_name in SANDBOX_BUNDLED_MEMBER_DATA_DIRS:
+            if name == member_name:
+                path = extract_path / data_name
+                if path.is_dir():
+                    return path
+        return None
+
+    @staticmethod
+    def _resolve_member_notes_file(extract_path: Path, member_name: str) -> str | None:
+        for name, notes_name in SANDBOX_BUNDLED_MEMBER_NOTES:
+            if name == member_name:
+                path = extract_path / notes_name
+                if path.is_file():
+                    return str(path)
+        return None
+
+    @staticmethod
+    def _load_main_memory_connection(extract_path: Path) -> Any:
+        """Load the default sandbox dataset from CREATE-only DDL plus CSV row files."""
+        schema_path = Sandbox._resolve_default_schema_sql(extract_path)
+        if schema_path is None:
+            raise ConfigError(f"no schema SQL found for default sandbox dataset ({SANDBOX_DEFAULT_SCHEMA_SQL})")
+        connection = Sandbox._load_memory_connection(str(schema_path))
+        data_dir = Sandbox._resolve_default_data_dir(extract_path)
+        if data_dir is None:
+            raise ConfigError(
+                f"no CSV data dir found for default sandbox dataset ({SANDBOX_DEFAULT_DATA_DIR})",
+            )
+        Sandbox._load_table_rows_into_connection(connection, data_dir)
+        return connection
+
+    @staticmethod
+    def _load_member_memory_connection(extract_path: Path, member_name: str) -> Any:
+        """Load a federation member from CREATE-only schema SQL plus CSV row files."""
+        schema_path = Sandbox._resolve_member_schema_sql(extract_path, member_name)
+        if schema_path is None:
+            raise ConfigError(f"no schema SQL found for federation member {member_name!r}")
+        connection = Sandbox._load_memory_connection(str(schema_path))
+        data_dir = Sandbox._resolve_member_data_dir(extract_path, member_name)
+        if data_dir is None:
+            raise ConfigError(f"no CSV data dir found for federation member {member_name!r}")
+        Sandbox._load_table_rows_into_connection(connection, data_dir)
         return connection
 
     @staticmethod
@@ -2370,10 +2723,6 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
         )
 
     @staticmethod
-    def _consumer_execution_allow_objects() -> frozenset[str]:
-        return CONSUMER_ALLOW_OBJECTS
-
-    @staticmethod
     def _consumer_reader_schema_context(
         *,
         notes_file: str | None = None,
@@ -2382,38 +2731,34 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
         return Sandbox._owner_writer_schema_context(notes_file=notes_file, sql_file=sql_file)
 
     @staticmethod
-    def _effective_consumer_allow_objects(master: EngineContext) -> frozenset[str]:
-        owner_allow = Sandbox._consumer_execution_allow_objects()
-        if master.allow_objects:
-            user_allow = frozenset(master.allow_objects)
-            extra = user_allow - owner_allow
-            if extra:
-                raise ConfigError(
-                    f"consumer allow_objects {sorted(extra)!r} exceed sandbox owner scope",
-                )
-            return user_allow
-        return owner_allow
-
-    @staticmethod
-    def _consumer_schema_context_for_construction(master: EngineContext) -> EngineContext:
-        """Narrow *master* to the consumer execution scope before engine construction."""
-        eff_allow = Sandbox._effective_consumer_allow_objects(master)
-        return replace(master, allow_objects=eff_allow)
-
-    @staticmethod
-    def _apply_sandbox_consumer_execution_scope(engine: Any) -> None:
+    def _apply_sandbox_consumer_execution_scope(
+        engine: Any,
+        *,
+        allow_objects: frozenset[str] | None = None,
+    ) -> None:
+        """Reapply the caller-intended consumer *allow_objects* when a trusted baseline bypassed reflection."""
+        if allow_objects is None:
+            return
         master = engine._runtime_config.engine_context
-        eff_allow = Sandbox._effective_consumer_allow_objects(master)
-        execution_ctx = replace(
-            master,
-            allow_objects=eff_allow,
-        )
+        execution_ctx = replace(master, allow_objects=allow_objects)
         engine._runtime_config = replace(
             engine._runtime_config,
             execution_context=execution_ctx,
             engine_context=execution_ctx,
         )
-        engine._consumer_visible_objects = frozenset(eff_allow)
+        engine._consumer_visible_objects = frozenset(allow_objects)
+
+    @staticmethod
+    def resolve_sandbox_notes_file(notes_file: str, *, extract_path: Path) -> str:
+        """Resolve *notes_file* to an on-disk path, including bare names under the sandbox extract."""
+        raw = str(notes_file).strip()
+        path = Path(os.path.expanduser(raw))
+        if path.is_file():
+            return str(path)
+        bundled = extract_path / path.name
+        if bundled.is_file():
+            return str(bundled)
+        raise ConfigError(f"notes_file not found: {notes_file!r}")
 
     @staticmethod
     def _read_notes_file_text(notes_file: str) -> str:
@@ -2424,34 +2769,36 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
             return fh.read()
 
     @staticmethod
-    def _bundled_catalog_space_notes_text(extract_path: Path) -> str | None:
-        path = extract_path / "sandbox_space_catalog_notes.txt"
-        if path.is_file():
-            return path.read_text(encoding="utf-8")
-        return None
+    def require_sandbox_space_lock(name: str, tables: frozenset[str]) -> None:
+        """Restrict sandbox aetherspaces to master plus the four bundled member-aligned spaces."""
+        key = str(name).strip().lower()
+        if key == MASTER_AETHERSPACE_NAME:
+            return
+        expected = SANDBOX_MEMBER_SPACE_TABLES.get(key)
+        if expected is None or frozenset(tables) != expected:
+            allowed = ", ".join(sorted(SANDBOX_MEMBER_SPACE_TABLES))
+            raise ConfigError(
+                f"sandbox aetherspaces are limited to master and the four bundled member spaces ({allowed}) "
+                "with their exact table sets",
+            )
 
     @staticmethod
     def validate_sandbox_aetherspace_notes_pairing(
-        space_context: SpaceContext,
+        space_name: str,
         notes_file: str,
         *,
         extract_path: Path,
-    ) -> None:
-        """Require bundled catalog notes content and the documented table pairing."""
-        notes_content = Sandbox._read_notes_file_text(notes_file)
-        bundled = Sandbox._bundled_catalog_space_notes_text(extract_path)
-        if bundled is None or notes_content != bundled:
+    ) -> str:
+        """Require *notes_file* to name the bundled notes file for this locked member space (bare shipped basename only). Returns the resolved on-disk notes path."""
+        key = str(space_name).strip().lower()
+        expected_name = SANDBOX_MEMBER_SPACE_NOTES_FILES.get(key)
+        if expected_name is None or Path(notes_file).name != expected_name:
+            allowed = ", ".join(f"{name}→{fname}" for name, fname in sorted(SANDBOX_MEMBER_SPACE_NOTES_FILES.items()))
             raise ConfigError(
-                "custom notes_file content is not accepted on arbitrary sandbox spaces; "
-                "create the space without notes, or use the documented catalog demo pairing "
-                "(sandbox_space_catalog_notes.txt with tables item, film, category, item_category)",
+                "custom notes_file is not accepted on sandbox member spaces; create the space without notes, "
+                f"or use the bundled notes file for this space ({allowed})",
             )
-        if frozenset(space_context.tables) != SANDBOX_CATALOG_SPACE_TABLES:
-            raise ConfigError(
-                "custom notes_file content is not accepted on arbitrary sandbox spaces; "
-                "create the space without notes, or use the documented catalog demo pairing "
-                f"(sandbox_space_catalog_notes.txt with tables {sorted(SANDBOX_CATALOG_SPACE_TABLES)!r})",
-            )
+        return Sandbox.resolve_sandbox_notes_file(notes_file, extract_path=extract_path)
 
     @staticmethod
     def _release_engine_runtime_handles(engine: Any) -> None:
@@ -2533,8 +2880,7 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
             return
         if Sandbox.sandbox_host_for_connection(connection) is not None and not getattr(engine, "_sandbox_mode", False):
             raise ConfigError(
-                "This engine uses a Sandbox connection but has not been adopted; "
-                "call sandbox.adopt(engine) before session().",
+                "This engine uses a Sandbox connection but has not been adopted; call sandbox.adopt(engine) before session().",
             )
 
     @staticmethod
@@ -2543,12 +2889,7 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
 
     @classmethod
     def bundled_dataset_seed(cls, name: str) -> str:
-        """Return the bundled seed filename for a sandbox dataset *name*."""
-        if name == SANDBOX_DEFAULT_DATASET_NAME:
-            return "rental_shop_seed.sql"
-        for member_name, seed_name in SANDBOX_BUNDLED_MEMBER_SEEDS:
-            if member_name == name:
-                return seed_name
+        """Return the bundled INSERT seed SQL filename for a dataset *name*. Bundled sandbox datasets load from CREATE-only DDL plus CSV row directories; use this helper for maintainer custom SQL overrides."""
         raise KeyError(name)
 
     def __init__(
@@ -2589,11 +2930,13 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
             if not config_path.is_file():
                 raise ConfigError(f"llm_config not found: {config_path}")
             self._config_path = str(config_path)
-            SandboxRuntimeState.set_sandbox_recorded_corpus_question_count(None)
         else:
             self._config_path = Sandbox._write_sandbox_toml(fixtures_file=Sandbox._fixtures_path(self._extract_path))
-            SandboxRuntimeState.set_sandbox_recorded_corpus_question_count(len(self.questions()))
         self._llm_mode = Sandbox._sandbox_llm_mode_from_config(self._config_path)
+        if self._llm_mode == "mock":
+            SandboxRuntimeState.set_sandbox_recorded_corpus_question_count(len(self.questions()))
+        else:
+            SandboxRuntimeState.set_sandbox_recorded_corpus_question_count(None)
         Sandbox._pin_bundled_schema_literals(self._extract_path)
         MockProvider.reset_mock_provider(clear_literals=True)
         TemplateOps.clear_sandbox_paraphrase_source()
@@ -2607,13 +2950,22 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
 
     def _seed_default_datasets(self) -> None:
         if SANDBOX_DEFAULT_DATASET_NAME not in self._datasets:
-            self.load_dataset(SANDBOX_DEFAULT_DATASET_NAME)
-        for member_name, _seed_name in SANDBOX_BUNDLED_MEMBER_SEEDS:
+            connection = Sandbox._load_main_memory_connection(self._extract_path)
+            self._datasets[SANDBOX_DEFAULT_DATASET_NAME] = _SandboxDataset(
+                connection=connection,
+                owns_connection=True,
+            )
+            Sandbox._mark_sandbox_managed_connection(connection, self)
+        for member_name, _schema_name in SANDBOX_BUNDLED_MEMBER_SCHEMAS:
             if member_name in self._datasets:
                 continue
-            seed_path = self._extract_path / _seed_name
-            if seed_path.is_file():
-                self.load_dataset(member_name)
+            if Sandbox._resolve_member_schema_sql(self._extract_path, member_name) is None:
+                continue
+            if Sandbox._resolve_member_data_dir(self._extract_path, member_name) is None:
+                continue
+            connection = Sandbox._load_member_memory_connection(self._extract_path, member_name)
+            self._datasets[member_name] = _SandboxDataset(connection=connection, owns_connection=True)
+            Sandbox._mark_sandbox_managed_connection(connection, self)
 
     def _bundled_notes_and_sql(self) -> tuple[str | None, str | None]:
         notes_file = Sandbox._bundle_path(self._extract_path, "rental_shop_notes.txt")
@@ -2640,9 +2992,7 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
         return replace(ctx, include=include)
 
     def _seed_role_baseline(self, *, role: SchemaRole, include: SchemaInclude) -> None:
-        preset: SandboxPreset = (
-            SandboxPreset.CONSUMER_READER if role == SchemaRole.CONSUMER else SandboxPreset.OWNER_WRITER
-        )
+        preset = "consumer_reader" if role == SchemaRole.CONSUMER else "owner_writer"
         baseline = Sandbox._baseline_dir_for_preset(self._extract_path, preset, include=include)
         if baseline is None:
             return
@@ -2676,19 +3026,15 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
         custom_seed = seed_sql or sql_file
         if custom_seed:
             Sandbox._require_maintainer_access(enabled=self._maintainer_access, hook="load_dataset seed paths")
-            seed_path = custom_seed
+            connection = Sandbox._load_memory_connection(custom_seed)
+        elif dataset_name == SANDBOX_DEFAULT_DATASET_NAME:
+            connection = Sandbox._load_main_memory_connection(self._extract_path)
+        elif Sandbox._resolve_member_schema_sql(self._extract_path, dataset_name) is not None:
+            connection = Sandbox._load_member_memory_connection(self._extract_path, dataset_name)
         else:
-            try:
-                bundled_seed = Sandbox.bundled_dataset_seed(dataset_name)
-            except KeyError as exc:
-                raise ConfigError(
-                    f"unknown sandbox dataset {dataset_name!r}; bundled datasets: "
-                    f"{sorted(SANDBOX_BUNDLED_DATASET_NAMES)}",
-                ) from exc
-            seed_path = str(self._extract_path / bundled_seed)
-        if not Path(seed_path).is_file():
-            raise ConfigError(f"seed SQL not found: {seed_path}")
-        connection = Sandbox._load_memory_connection(seed_path)
+            raise ConfigError(
+                f"unknown sandbox dataset {dataset_name!r}; bundled datasets: {sorted(SANDBOX_BUNDLED_DATASET_NAMES)}",
+            )
         self._datasets[dataset_name] = _SandboxDataset(connection=connection, owns_connection=True)
         Sandbox._mark_sandbox_managed_connection(connection, self)
         return dataset_name
@@ -2705,7 +3051,7 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
 
     @property
     def config_file(self) -> str | None:
-        """Path to the temporary mock-provider TOML written for this environment."""
+        """Path to the temporary sandbox-provider TOML written for this environment."""
         self._ensure_open()
         return self._config_path
 
@@ -2740,6 +3086,7 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
         *,
         role: SchemaRole = SchemaRole.OWNER,
         include: SchemaInclude = SchemaInclude.TABLES,
+        limits: EngineLimits | None = None,
     ) -> Any:
         """Build an :class:`~aetherdialect.AetherEngine` on the default dataset using *engine_context*."""
         self._ensure_open()
@@ -2758,16 +3105,13 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
             bundled_sql=sql_arg,
             extract_path=self._extract_path,
         )
-        role_preset: SandboxPreset = (
-            SandboxPreset.CONSUMER_READER if role == SchemaRole.CONSUMER else SandboxPreset.OWNER_WRITER
-        )
+        role_preset = "consumer_reader" if role == SchemaRole.CONSUMER else "owner_writer"
         if engine_context is None:
             schema_context = Sandbox._schema_context_for_preset(
                 role_preset,
                 notes_file=resolved_notes,
                 sql_file=resolved_sql,
                 deny_columns=None,
-                restricted_consumer=False,
                 include=include,
             )
         else:
@@ -2777,33 +3121,43 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
                 notes_file=resolved_notes,
                 sql_file=resolved_sql,
             )
-        if role == "consumer":
-            schema_context = Sandbox._consumer_schema_context_for_construction(schema_context)
+        intended_consumer_allow: frozenset[str] | None = None
+        if role == "consumer" and schema_context.allow_objects:
+            intended_consumer_allow = frozenset(schema_context.allow_objects)
         trust_baseline = Sandbox._sandbox_trusts_bundled_baseline(
             preset=role_preset,
             schema_context=schema_context,
             bundled_notes=notes,
             bundled_sql=sql_arg,
             deny_columns=None,
-            restricted_consumer=False,
             include=include,
-            engine_context=engine_context,
+            engine_context=None if role == SchemaRole.CONSUMER else engine_context,
             notes_file=engine_context.notes_file if engine_context is not None else None,
             sql_file=engine_context.sql_file if engine_context is not None else None,
         )
+        for notice in init_notices:
+            notify(str(notice), stage="init")
         execution_engine = DuckDBDialect.create_duckdb_sqlalchemy_engine(connection)
+        construction_context: EngineContext | str | None = schema_context
+        if role == SchemaRole.CONSUMER:
+            engine_dir = Sandbox._sandbox_memory_engine_dir(self._artifacts_dir)
+            if (engine_dir / "schema_context.json").is_file():
+                construction_context = None
         engine = Sandbox._aether_engine_cls()(
-            schema_context,
+            construction_context,
             artifacts_dir=self._artifacts_dir,
             config_file=self._config_path,
             execution_engine=execution_engine,
             native_connection=connection,
             role=role,
-            trust_bundled_baseline=trust_baseline,
-            init_notices=init_notices,
+            _trust_bundled_baseline=trust_baseline,
+            limits=limits or EngineLimits(),
         )
         if role == "consumer":
-            Sandbox._apply_sandbox_consumer_execution_scope(engine)
+            Sandbox._apply_sandbox_consumer_execution_scope(
+                engine,
+                allow_objects=intended_consumer_allow,
+            )
         self._attach_sandbox_runtime_to_engine(engine)
         self.adopt(engine)
         return engine
@@ -2815,6 +3169,7 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
         declaration_file: str | None = None,
         members: Mapping[str, str] | None = None,
         context: FederationContext | None = None,
+        limits: FederationLimits | None = None,
     ) -> Any:
         """Build an :class:`~aetherdialect.AetherFederation` over named sandbox datasets."""
         self._ensure_open()
@@ -2830,33 +3185,36 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
                 f"federation_id {federation_id!r} does not match declaration {authored_manifest.federation_id!r}",
             )
         baseline = Sandbox._baseline_dir_for_preset(self._extract_path, "federation")
-        if baseline is not None:
-            Sandbox._seed_federation_composite_baseline(
-                baseline=baseline,
-                artifacts_dir=self._artifacts_dir,
-                federation_id=authored_manifest.federation_id,
-            )
         notes, sql_arg = self._bundled_notes_and_sql()
         member_specs: tuple[tuple[str, str], ...]
         if members is not None:
             if self._maintainer_access:
-                member_specs = tuple((str(name), str(seed)) for name, seed in members.items())
+                member_specs = tuple((str(name), str(schema)) for name, schema in members.items())
             else:
                 resolved: list[tuple[str, str]] = []
                 for member_name, dataset_name in members.items():
-                    try:
-                        bundled_seed = Sandbox.bundled_dataset_seed(str(dataset_name))
-                    except KeyError as exc:
+                    schema_path = Sandbox._resolve_member_schema_sql(self._extract_path, str(dataset_name))
+                    if schema_path is None:
                         raise ConfigError(
-                            f"federation member {member_name!r} must name a bundled dataset; got {dataset_name!r}",
-                        ) from exc
-                    resolved.append((str(member_name), str(self._extract_path / bundled_seed)))
+                            f"federation member {member_name!r} must name a bundled dataset with schema SQL; "
+                            f"got {dataset_name!r}",
+                        )
+                    resolved.append((str(member_name), str(schema_path)))
                 member_specs = tuple(resolved)
         else:
             member_specs = Sandbox._default_federation_member_specs(self._extract_path)
+        required_members = frozenset(name for name, _schema in SANDBOX_BUNDLED_MEMBER_SCHEMAS)
+        provided_members = frozenset(name for name, _schema in member_specs)
+        if provided_members != required_members:
+            raise ConfigError(
+                "sandbox federation requires all four members "
+                f"{sorted(required_members)}; got {sorted(provided_members)}",
+            )
         engines: dict[str, Any] = {}
         provisional_bindings: dict[str, FederationSourceBinding] = {}
-        for member_name, _member_seed in member_specs:
+        resolved_fed_limits = limits if limits is not None else FederationLimits()
+        member_engine_limits = resolved_fed_limits.member_defaults
+        for member_name, _member_schema in member_specs:
             provisional_bindings[member_name] = FederationSourceBinding(
                 source_id=member_name,
                 engine="duckdb",
@@ -2864,14 +3222,15 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
                 context="master",
                 role=SchemaRole.OWNER,
             )
-        for member_name, member_seed in member_specs:
-            if not Path(member_seed).is_file():
-                raise ConfigError(f"member seed SQL not found for {member_name!r}: {member_seed}")
+        for member_name, member_schema in member_specs:
+            if not Path(member_schema).is_file():
+                raise ConfigError(f"member schema SQL not found for {member_name!r}: {member_schema}")
             allow_tables = Sandbox._federation_partition_tables_from_bundle(self._extract_path, member_name)
             member_engine, _member_conn = Sandbox._create_federation_member_engine(
                 Sandbox._aether_engine_cls(),
+                federation_id=authored_manifest.federation_id,
                 member_name=member_name,
-                seed_path=member_seed,
+                schema_path=member_schema,
                 extract_path=self._extract_path,
                 artifacts_dir=self._artifacts_dir,
                 config_path=config_path,
@@ -2880,18 +3239,33 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
                 allow_tables=allow_tables,
                 baseline=baseline,
                 binding=provisional_bindings[member_name],
+                limits=member_engine_limits,
             )
             engines[member_name] = member_engine
-        for member_name, member_engine in engines.items():
-            binding_from_member_engine(member_name, member_engine)
-        federation = Sandbox._aether_federation_cls()(
-            authored_manifest.federation_id,
-            members=engines,
-            declaration_file=str(decl_path),
-            context=context,
-            artifacts_dir=self._artifacts_dir,
-        )
+        for member_engine in engines.values():
+            binding_from_member_engine(member_engine)
+        Sandbox._stamp_member_union_disjointness_samples(engines)
+        if baseline is not None:
+            composite_path = baseline / FEDERATION_COMPOSITE_SCHEMA_FILENAME
+            if composite_path.is_file():
+                bundled_composite = load_schema_graph_snapshot(str(composite_path))
+                if bundled_composite is not None:
+                    set_bundled_composite_classifications(
+                        schema_graph_classification_payload(bundled_composite),
+                    )
+        try:
+            federation = Sandbox._aether_federation_cls()(
+                authored_manifest.federation_id,
+                members=list(engines.values()),
+                declaration=str(decl_path),
+                context=context,
+                artifacts_dir=self._artifacts_dir,
+                limits=resolved_fed_limits,
+            )
+        finally:
+            clear_bundled_composite_classifications()
         federation._sandbox_mode = True
+        self._attach_sandbox_runtime_to_engine(federation)
         for member_engine in engines.values():
             self._attach_sandbox_runtime_to_engine(member_engine)
         TemplateOps.set_sandbox_paraphrase_source(Sandbox._paraphrase_registry_from_catalog_path(self._extract_path))
@@ -2899,6 +3273,7 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
 
     def _attach_sandbox_runtime_to_engine(self, engine: Any) -> None:
         engine._sandbox_runtime = self._runtime
+        engine._sandbox_extract_path = self._extract_path
 
     def adopt(self, engine: Any) -> None:
         """Apply sandbox mock configuration and warmup suppression to a caller-built engine."""
@@ -2919,15 +3294,16 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
             return ()
         return Sandbox._sandbox_questions_from_path(self._extract_path)
 
-    def apply_bundled_schema_overrides(self, engine: Any) -> None:
-        """Copy bundled override JSON to the engine artifacts dir and apply schema overrides."""
-        self._ensure_open()
-        source = self._extract_path / "schema_overrides_demo.json"
+    @staticmethod
+    def _stage_demo_schema_structure(engine: Any, extract_path: Path) -> None:
+        """Load bundled structure edits and apply them through ``apply_structure``."""
+        source = extract_path / "schema_structure_demo.json"
         if not source.is_file():
-            raise FileNotFoundError(f"Missing bundled schema overrides: {source}")
-        target = Path(engine._artifacts_dir) / SCHEMA_OVERRIDES_DEFAULT_FILENAME
-        shutil.copyfile(source, target)
-        engine.apply_schema_overrides()
+            raise FileNotFoundError(f"Missing bundled schema structure demo: {source}")
+        document = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            raise ValueError(f"schema structure demo must be a JSON object: {source}")
+        engine.apply_structure(document)
 
     def load_migration_corpus_variant(
         self,
@@ -2980,7 +3356,7 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
             self._migration_variant_state = state
         dialect = DuckDBDialect(DuckDBRuntimeConfig())
         live_graph = dialect.reflect_only(state.schema_context)
-        return MainExecutionOps.preview_schema_migration(artifacts_dir=self._artifacts_dir, schema_graph=live_graph)
+        return MainInitOps.preview_schema_migration(artifacts_dir=self._artifacts_dir, schema_graph=live_graph)
 
     def apply_migration_corpus_variant(
         self,
@@ -3020,100 +3396,6 @@ class Sandbox(_SandboxPendingMethods, _SandboxNormalizeHelpers, _SandboxCorpusMe
             handle.engine = migrated
             handle._connection = connection
         return migrated
-
-    def create_preset_engine(
-        self,
-        engine_cls: type[Any],
-        *,
-        preset: SandboxPreset | str,
-        connection: Any,
-        deny_columns: frozenset[str] | None = None,
-        restricted_consumer: bool = False,
-        include: SchemaInclude = SchemaInclude.TABLES,
-        reset_shared_engine_cache: bool = False,
-        engine_context: EngineContext | None = None,
-        notes_file: str | None = None,
-        sql_file: str | None = None,
-    ) -> Any:
-        """Build a preset offline engine on *connection* using bundled baselines and fixtures."""
-        self._ensure_open()
-        extract_path = self._extract_path
-        notes, sql_arg = self._bundled_notes_and_sql()
-        resolved_notes, resolved_sql, init_notices = Sandbox._resolve_sandbox_notes_and_sql(
-            engine_context=engine_context,
-            notes_file=notes_file,
-            sql_file=sql_file,
-            bundled_notes=notes,
-            bundled_sql=sql_arg,
-            extract_path=extract_path,
-        )
-        schema_context = Sandbox._schema_context_for_preset(
-            preset,
-            notes_file=resolved_notes,
-            sql_file=resolved_sql,
-            deny_columns=deny_columns,
-            restricted_consumer=restricted_consumer,
-            include=include,
-            engine_context=engine_context,
-        )
-        if preset == "consumer_reader":
-            schema_context = Sandbox._consumer_schema_context_for_construction(schema_context)
-        trust_baseline = Sandbox._sandbox_trusts_bundled_baseline(
-            preset=preset,
-            schema_context=schema_context,
-            bundled_notes=notes,
-            bundled_sql=sql_arg,
-            deny_columns=deny_columns,
-            restricted_consumer=restricted_consumer,
-            include=include,
-            engine_context=engine_context,
-            notes_file=notes_file,
-            sql_file=sql_file,
-        )
-        baseline = Sandbox._baseline_dir_for_preset(extract_path, preset, include=include) if trust_baseline else None
-        engine_dir = Sandbox._sandbox_memory_engine_dir(self._artifacts_dir)
-
-        if reset_shared_engine_cache and engine_dir.is_dir():
-            Sandbox._unlink_artifact_lock_files(self._artifacts_dir)
-            shutil.rmtree(engine_dir, ignore_errors=True)
-
-        graph_path = engine_dir / "schema_graph.json.gz"
-        if baseline is None:
-            if trust_baseline:
-                debug(f"create_offline_sandbox: no bundled schema baseline under {extract_path / 'artifacts_baseline'}")
-        elif graph_path.is_file():
-            debug(f"create_offline_sandbox: schema cache already present at {engine_dir}")
-        else:
-            engine_dir.mkdir(parents=True, exist_ok=True)
-            Sandbox._copy_baseline_cache_files(baseline, engine_dir)
-            Sandbox._seed_bundled_aetherspaces(extract_path, engine_dir)
-            copied = [name for name in SANDBOX_BASELINE_CACHE_FILES if (engine_dir / name).is_file()]
-            debug(
-                f"create_offline_sandbox: seeded baseline {baseline} -> {engine_dir} ({', '.join(copied) or 'no files'})",
-            )
-        if include == "views":
-            Sandbox._apply_rental_shop_views(connection, extract_path=extract_path)
-
-        execution_engine = DuckDBDialect.create_duckdb_sqlalchemy_engine(connection)
-        role = Sandbox._role_for_preset(preset)
-        engine = engine_cls(
-            schema_context,
-            artifacts_dir=self._artifacts_dir,
-            config_file=self._config_path,
-            execution_engine=execution_engine,
-            native_connection=connection,
-            role=role,
-            trust_bundled_baseline=trust_baseline,
-            init_notices=init_notices,
-        )
-        if preset == "consumer_reader":
-            Sandbox._apply_sandbox_consumer_execution_scope(engine)
-        if Sandbox._load_bundled_schema_literals(extract_path) is None:
-            slot = "consumer" if preset == "consumer_reader" else "owner"
-            MockProvider.pin_schema_literal_slot(slot, engine._schema_graph.schema_literal_json)
-        self._attach_sandbox_runtime_to_engine(engine)
-        self.adopt(engine)
-        return engine
 
     def close(self) -> None:
         if self._closed:
@@ -3188,6 +3470,7 @@ class SandboxHandle:
         "_cwd_sidecars",
         "_closed",
         "_saved_embedded_runtime_state",
+        "_lifecycle_cm",
     )
 
     def __init__(
@@ -3216,6 +3499,7 @@ class SandboxHandle:
         self._cwd_sidecars: list[Path] = []
         self._closed = False
         self._saved_embedded_runtime_state = saved_embedded_runtime_state
+        self._lifecycle_cm: Any | None = None
         if owned_artifacts:
             _ARTIFACT_REFCOUNT[artifacts_dir] = _ARTIFACT_REFCOUNT.get(artifacts_dir, 0) + 1
 
@@ -3247,6 +3531,8 @@ class SandboxHandle:
         if self._closed:
             return
         self._closed = True
+        lifecycle_cm = self._lifecycle_cm
+        self._lifecycle_cm = None
         sandbox = self._sandbox
         if sandbox is None:
             TemplateOps.clear_sandbox_paraphrase_source()
@@ -3311,6 +3597,11 @@ class SandboxHandle:
                             shutil.rmtree(self._artifacts_dir, ignore_errors=True)
                         else:
                             time.sleep(0.05 * (attempt + 1))
+        if lifecycle_cm is not None:
+            try:
+                lifecycle_cm.__exit__(None, None, None)
+            except (RuntimeError, StopIteration, AttributeError):
+                pass
 
     def __enter__(self) -> SandboxHandle:
         return self
@@ -3330,16 +3621,11 @@ class SandboxHandle:
 
     def session(self, *args: Any, **kwargs: Any) -> PipelineSession:
         self._ensure_open()
-        return cast(PipelineSession, self.engine.session(*args, **kwargs))
+        return cast("PipelineSession", self.engine.session(*args, **kwargs))
 
     def asession(self, *args: Any, **kwargs: Any) -> Any:
         self._ensure_open()
         return self.engine.asession(*args, **kwargs)
-
-    def apply_bundled_schema_overrides(self) -> None:
-        """Copy bundled override JSON to artifacts_dir and apply schema overrides."""
-        self._ensure_open()
-        Sandbox._apply_bundled_schema_overrides(self.engine, self)
 
     def load_migration_corpus_variant(self, variant: str = "migration_demo") -> None:
         """Switch this handle to a bundled post-migration seed with stale pre-migration artifacts."""

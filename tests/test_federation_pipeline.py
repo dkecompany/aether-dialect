@@ -23,25 +23,25 @@ from aetherdialect._contracts_core import (
     SourceStep,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
-    federation_turn_cancelled,
-    pop_federation_execution_context,
-    push_federation_execution_context,
-)
-from aetherdialect._federation import (
-    compose_composite_graph,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import (
     federation_plan_combine_hash,
     federation_stage_execution_waves,
     order_federation_execution_steps,
-    parse_federation_manifest,
     validate_coordinator_join_fan_out,
 )
+from aetherdialect._federation_manifest import parse_federation_manifest
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import (
+from aetherdialect._pipeline_execute import (
     _execute_federation_steps_parallel,
     execute_federated_prepare,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._utils import (
+    federation_turn_cancelled,
+    pop_federation_execution_context,
+    push_federation_execution_context,
+)
 
 
 def _graph(table: str, *, source_id: str) -> SchemaGraph:
@@ -240,8 +240,8 @@ def test_parallel_member_submit_captures_contextvars() -> None:
         return pd.DataFrame({"id": [1]})
 
     with (
-        patch("aetherdialect._pipeline.copy_context", side_effect=_counting_copy),
-        patch("aetherdialect._pipeline._execute_federation_source_step", side_effect=_member),
+        patch("aetherdialect._pipeline_execute.copy_context", side_effect=_counting_copy),
+        patch("aetherdialect._pipeline_execute._execute_federation_source_step", side_effect=_member),
     ):
         _execute_federation_steps_parallel(
             prepared.plan.steps,
@@ -297,7 +297,7 @@ def test_parallel_member_worker_observes_turn_cancellation() -> None:
             release_workers.set()
 
         cancel_thread = threading.Thread(target=_cancel_when_ready)
-        with patch("aetherdialect._pipeline._execute_federation_source_step", side_effect=_member):
+        with patch("aetherdialect._pipeline_execute._execute_federation_source_step", side_effect=_member):
             cancel_thread.start()
             with pytest.raises(FederationRuntimeError, match="cancelled"):
                 _execute_federation_steps_parallel(
@@ -392,10 +392,10 @@ def test_federation_executor_emits_phase_for_derived_wave_stages() -> None:
     dialect = MagicMock()
     dialect.finalize_render.return_value = prepared.glue_sql
     with (
-        patch("aetherdialect._pipeline.emit_ask_phase", side_effect=_capture_emit),
-        patch("aetherdialect._pipeline._execute_federation_source_step", side_effect=_member),
+        patch("aetherdialect._pipeline_execute.emit_ask_phase", side_effect=_capture_emit),
+        patch("aetherdialect._pipeline_execute._execute_federation_source_step", side_effect=_member),
         patch(
-            "aetherdialect._pipeline.execute_federation_coordinator",
+            "aetherdialect._pipeline_execute.execute_federation_coordinator",
             return_value=pd.DataFrame({"id": [1]}),
         ),
     ):
@@ -443,7 +443,7 @@ def test_federation_gate_kwargs_master_member_uses_member_context() -> None:
         },
         include_derived_roster=True,
     )
-    gates = MainExecutionOps._federation_gate_kwargs_by_source(owner, port, manifest)
+    gates = MainExecutionOps.federation_gate_kwargs_by_source(owner, port, manifest)
     member_gate = gates["alpha"]
     assert member_gate["context_name"] == MASTER_AETHERSPACE_NAME
     assert member_gate["schema_context"] == EngineContext()
@@ -465,7 +465,7 @@ def test_consumer_sql_gate_kwargs_does_not_supply_composite_to_master_members() 
         space_tables=None,
         space_columns=None,
     )
-    kwargs = MainExecutionOps._consumer_sql_gate_kwargs(port)
+    kwargs = MainExecutionOps.consumer_sql_gate_kwargs(port)
     assert kwargs["schema_context"] is composite_ctx
     manifest = parse_federation_manifest(
         {
@@ -476,6 +476,6 @@ def test_consumer_sql_gate_kwargs_does_not_supply_composite_to_master_members() 
         },
         include_derived_roster=True,
     )
-    gates = MainExecutionOps._federation_gate_kwargs_by_source(owner, port, manifest)
+    gates = MainExecutionOps.federation_gate_kwargs_by_source(owner, port, manifest)
     assert gates["alpha"]["schema_context"] == EngineContext()
     assert gates["alpha"]["schema_context"] is not composite_ctx

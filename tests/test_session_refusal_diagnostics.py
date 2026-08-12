@@ -13,20 +13,24 @@ from aetherdialect._constants import (
     DIAGNOSTIC_CODE_REFUSAL_HOP_CEILING,
     DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
     DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST,
-    REFUSAL_CATALOGUE,
     REFUSAL_DIAGNOSTIC_CODES,
-    REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE,
 )
-from aetherdialect._contracts_base import (
+from aetherdialect._constants_runtime import REFUSAL_CATALOGUE, REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE
+from aetherdialect._contracts_base import FailureCategory, NormalizedExpr
+from aetherdialect._contracts_core import (
     AggregateJoinFanOutError,
     ComparisonJoinScopeExceededError,
-    FailureCategory,
+    GenerationPath,
     NoJoinPathError,
     NullInNegatedListError,
+    RuntimeIntent,
+    SelectCol,
 )
-from aetherdialect._contracts_core import GenerationPath, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, IntentIssue, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._pipeline_generate import _join_path_failure_outcome
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import (
     emit_session_refusal_diagnostic,
     refusal_diagnostic_code_for_exception,
     refusal_diagnostic_code_for_federation_reason,
@@ -34,10 +38,6 @@ from aetherdialect._core_utils import (
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._main_execution import PipelineSession
-from aetherdialect._pipeline import _join_path_failure_outcome
-from aetherdialect._templates import TemplateOps
 
 
 @pytest.mark.fast
@@ -130,8 +130,8 @@ def test_join_path_failure_outcome_emits_refusal_diagnostic() -> None:
     tok = set_diagnostic_collector(buf)
     try:
         with (
-            patch("aetherdialect._pipeline.print_rephrase_hint"),
-            patch("aetherdialect._templates.TemplateOps.save_template_store"),
+            patch("aetherdialect._utils.print_rephrase_hint"),
+            patch("aetherdialect._templates_ops.TemplateOps.save_template_store"),
         ):
             outcome = _join_path_failure_outcome(
                 exc,
@@ -202,6 +202,6 @@ def test_validation_failed_terminal_step_carries_refusal_diagnostic() -> None:
     }
     with patch.object(session, "_emit_turn_llm_usage", return_value=()):
         step = session._completed_step()
-    codes = {d.code for d in step.diagnostics}
-    assert DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE in codes
-    assert step.error == "These tables could not be connected: alpha, beta."
+    assert step.error is not None
+    assert step.error.detail_code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
+    assert step.answer is None

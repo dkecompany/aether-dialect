@@ -1,5 +1,5 @@
 {
-  "version": "0.2.1",
+  "version": "0.2.3",
   "entries": [
     {
       "question": "How many rentals happened on 2025-01-01?",
@@ -31,7 +31,7 @@
           "inventory"
         ],
         "select": "count inventory rows",
-        "filter": "keep only rows where rental.rental_date equals the date literal 2025-01-01",
+        "where": "keep only rows where rental.rental_date equals the date literal 2025-01-01",
         "group_by": "",
         "having": "",
         "order_by": "",
@@ -94,7 +94,7 @@
           "film"
         ],
         "select": "count film rows",
-        "filter": "",
+        "where": "",
         "group_by": "",
         "having": "",
         "order_by": "",
@@ -150,7 +150,7 @@
           "staff"
         ],
         "select": "payroll deduction amount grouped by employee SSN",
-        "filter": "",
+        "where": "",
         "group_by": "staff.ssn",
         "having": "",
         "order_by": "",

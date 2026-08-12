@@ -1,4 +1,4 @@
-"""Schema classify role/type degrade and honest failure preamble."""
+"""Schema classify role/type degrade and failure preamble."""
 
 from __future__ import annotations
 
@@ -8,9 +8,8 @@ import pytest
 
 from aetherdialect._config import PolicyConfig
 from aetherdialect._constants import SCHEMA_CLASSIFY_ERROR_DETAIL_CAP
-from aetherdialect._contracts_base import ColumnRole, TableRole
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._schema_catalog import _coerce_llm_assigned_role, apply_column_roles_llm
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaGraph, TableMetadata, TableRole
+from aetherdialect._schema_profile import _coerce_llm_assigned_role, apply_column_roles_llm
 
 
 def _usable_col(**kwargs: Any) -> ColumnMetadata:
@@ -54,6 +53,7 @@ def test_no_llm_retry_burn_on_physical_type(monkeypatch: pytest.MonkeyPatch) -> 
         *,
         column_scope: dict[str, frozenset[str]] | None = None,
         cache_payload_out: list[dict[str, Any]] | None = None,
+        structural_knowledge=None,
     ):
         calls["n"] += 1
         payload = {
@@ -79,7 +79,7 @@ def test_no_llm_retry_burn_on_physical_type(monkeypatch: pytest.MonkeyPatch) -> 
             )
         }
 
-    monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+    monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
     apply_column_roles_llm(graph)
     assert calls["n"] == 1
     assert graph.tables["t"].columns["label"].role != ColumnRole.NUMERIC_MEASURE.value
@@ -96,6 +96,7 @@ def test_error_preamble_names_role_type(monkeypatch: pytest.MonkeyPatch) -> None
         *,
         column_scope: dict[str, frozenset[str]] | None = None,
         cache_payload_out: list[dict[str, Any]] | None = None,
+        structural_knowledge=None,
     ):
         return {
             "t": (
@@ -105,7 +106,7 @@ def test_error_preamble_names_role_type(monkeypatch: pytest.MonkeyPatch) -> None
             )
         }
 
-    monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", fake_classify)
+    monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", fake_classify)
     monkeypatch.setattr(PolicyConfig, "MAX_ROLE_CLASSIFICATION_RETRIES", 0)
     with pytest.raises(RuntimeError, match="missing descriptions"):
         apply_column_roles_llm(graph)

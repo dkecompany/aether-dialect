@@ -6,16 +6,15 @@ from dataclasses import replace
 
 import pytest
 
-from aetherdialect._contracts_base import FederationDeclarationError
+from aetherdialect._contracts_base import FederationDeclarationError, NormalizedExpr
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent, SelectCol, SourceStep
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    compose_composite_graph,
-    parse_federation_manifest,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import (
     plan_federated_intent,
     validate_federation_scalar_grain_member_frames,
 )
-from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -53,7 +52,7 @@ _MANIFEST = {
 @pytest.mark.fast
 def test_scalar_grain_member_refuses_multi_member_plan_at_plan_time(monkeypatch) -> None:
     """Scalar-grain member required for combine must be refused during planning."""
-    from aetherdialect._federation import _build_source_sub_intent
+    from aetherdialect._federation_plan import _build_source_sub_intent
 
     def _force_scalar_member_a(*args, **kwargs):
         built = _build_source_sub_intent(*args, **kwargs)
@@ -62,7 +61,7 @@ def test_scalar_grain_member_refuses_multi_member_plan_at_plan_time(monkeypatch)
         return built
 
     monkeypatch.setattr(
-        "aetherdialect._federation._build_source_sub_intent",
+        "aetherdialect._federation_plan._build_source_sub_intent",
         _force_scalar_member_a,
     )
 

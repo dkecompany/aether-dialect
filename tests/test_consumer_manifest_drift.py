@@ -7,9 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import ConfigError, EngineContext, MigrationTier
+from aetherdialect._contracts_base import EngineContext, MigrationTier
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import read_artifact_manifest, write_artifact_manifest
 from aetherdialect._main_execution import (
     MainExecutionOps,
 )
@@ -18,8 +17,9 @@ from aetherdialect._schema_graph import (
     diff_schemas,
     recompute_join_paths_multi,
 )
-from aetherdialect._schema_overrides import save_schema_to_cache
-from aetherdialect._templates import TemplateOps
+from aetherdialect._schema_reflect import save_schema_to_cache
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import read_artifact_manifest, write_artifact_manifest
 
 
 def _graph(*, structural_hash: str, profiling_hash: str = "profile_1") -> SchemaGraph:
@@ -77,7 +77,8 @@ def _drift_owner_live_pair() -> tuple[SchemaGraph, SchemaGraph]:
 
 
 @pytest.mark.fast
-def test_consumer_init_refuses_remap_tier(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_consumer_init_uses_owner_cache_not_live_remap(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Consumers open from owner cache + privilege probe; they do not live-reflect REMAP refuse."""
     owner, live = _drift_owner_live_pair()
     schema_diff = diff_schemas(owner, live)
     assert schema_diff.table_renames == (("items", "products"),)
@@ -109,21 +110,30 @@ def test_consumer_init_refuses_remap_tier(tmp_path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("DUCKDB_DATABASE", ":memory:")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
 
+    dialect = MagicMock()
+    dialect.filter_selectable_relation_names = MagicMock(side_effect=lambda names, **_kw: set(names))
+
     with (
-        patch("aetherdialect._main_execution.MainExecutionOps.compute_engine_storage_dir", return_value=artifacts_dir),
-        patch("aetherdialect._main_execution.DialectRegistry.get", return_value=MagicMock()),
+        patch("aetherdialect._main_init.MainInitOps.compute_engine_storage_dir", return_value=artifacts_dir),
+        patch("aetherdialect._dialect.DialectRegistry.get", return_value=dialect),
         patch(
-            "aetherdialect._main_execution.build_schema_graph_with_diff",
-            return_value=(live, schema_diff),
+            "aetherdialect._main_init.build_schema_graph_with_diff",
+            side_effect=AssertionError("consumers must not live-reflect via build_schema_graph_with_diff"),
+        ),
+        patch(
+            "aetherdialect._main_init.MainInitOps.probe_credential_visible_tables",
+            return_value=frozenset(owner.tables.keys()),
         ),
     ):
-        with pytest.raises(ConfigError, match="Schema has drifted since artifacts were published"):
-            MainExecutionOps.initialize_aether_engine(
-                artifacts_dir=artifacts_dir,
-                schema_role="consumer",
-                execution_engine=MagicMock(),
-                log_sink=lambda _msg: None,
-            )
+        bundle = MainExecutionOps.initialize_aether_engine(
+            artifacts_dir=artifacts_dir,
+            schema_role="consumer",
+            execution_engine=MagicMock(),
+            log_sink=lambda _msg: None,
+        )
+
+    assert "items" in bundle.schema_graph.tables
+    assert "products" not in bundle.schema_graph.tables
 
 
 @pytest.mark.fast
@@ -149,8 +159,8 @@ def test_reload_reader_learning_detects_fingerprint_drift(tmp_path) -> None:
         _templates=None,
         _dialect=None,
     )
-    with patch("aetherdialect._main_execution.finalize_with_overrides"):
-        MainExecutionOps._reload_reader_learning_if_manifest_drift(owner)
+    with patch("aetherdialect._schema_finalize.finalize_with_structure"):
+        MainExecutionOps.reload_reader_learning_if_manifest_drift(owner)
 
     assert owner._store is not None
     assert owner._templates == TemplateOps.store_to_templates(owner._store)
@@ -176,5 +186,5 @@ def test_reload_reader_learning_no_op_when_fingerprints_match(tmp_path) -> None:
         _templates={"keep": object()},
         _dialect=None,
     )
-    MainExecutionOps._reload_reader_learning_if_manifest_drift(owner)
+    MainExecutionOps.reload_reader_learning_if_manifest_drift(owner)
     assert owner._store is sentinel_store

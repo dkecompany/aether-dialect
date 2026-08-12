@@ -11,7 +11,7 @@ from aetherdialect._config import PolicyConfig
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
-from aetherdialect._schema_catalog import (
+from aetherdialect._schema_profile import (
     _build_frequent_values_sql,
     _build_minmax_sql,
     _build_mode_sql,

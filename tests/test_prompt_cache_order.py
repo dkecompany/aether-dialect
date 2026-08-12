@@ -8,18 +8,27 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._contracts_core import InterpretPlan
-from aetherdialect._core_utils import (
-    prompt_cache_schema_scope,
-    prompt_json,
-    stable_json,
+from aetherdialect._constants_runtime import (
+    FUZZY_REUSE_PARAM_PROMPT_KEY_ORDER,
+    META_SCHEMA_CATALOG_PROMPT_KEY_ORDER,
+    SEMANTIC_REPAIR_PROMPT_KEY_ORDER,
 )
-from aetherdialect._intent_process import (
+from aetherdialect._contracts_base import DomainKnowledgeEntry
+from aetherdialect._contracts_core import InterpretPlan
+from aetherdialect._intent_loop import (
     build_intent_ground_prompt,
     build_intent_interpret_prompt,
+    build_intent_semantic_repair_prompt,
 )
 from aetherdialect._llm_provider import LLMProvider, MockProvider
 from aetherdialect._sql_gen import build_join_choice_prompt
+from aetherdialect._utils import (
+    domain_context_payload,
+    prompt_cache_schema_scope,
+    prompt_json,
+    schema_prompt_cache_id,
+    stable_json,
+)
 
 
 @pytest.fixture
@@ -66,8 +75,6 @@ class TestPromptJson:
         assert ordered.index('"extra_a"') < ordered.index('"extra_b"')
 
     def test_fuzzy_reuse_prompt_places_param_slots_before_question(self) -> None:
-        from aetherdialect._constants import FUZZY_REUSE_PARAM_PROMPT_KEY_ORDER
-
         body = {
             "task": "extract",
             "extraction_rules": [],
@@ -121,6 +128,59 @@ class TestJoinPromptOrdering:
         assert _key_index(user, "output_format") < _key_index(user, "question")
         assert _key_index(user, "scopes") < _key_index(user, "question")
 
+    def test_join_prior_feedback_in_user_not_system(self) -> None:
+        scopes = [
+            {
+                "scope": "main",
+                "tables": ["a", "b"],
+                "candidates": [{"candidate_id": "J01", "join_path_signature": []}],
+            },
+        ]
+        feedback = ["avoid orders-customers via billing"]
+        system, user = build_join_choice_prompt(
+            "how many?",
+            "SELECT 1",
+            scopes,
+            prior_join_feedback=feedback,
+        )
+        assert "avoid orders-customers via billing" in user
+        assert "avoid orders-customers via billing" not in system
+        assert _key_index(user, "question") < _key_index(user, "prior_join_feedback")
+
+
+class TestMetaSchemaCatalogOrdering:
+    def test_meta_schema_catalog_schema_before_question(self) -> None:
+        body = {"question": "how many tables?", "schema": {"tables": {"orders": {}}}}
+        ordered = prompt_json(body, META_SCHEMA_CATALOG_PROMPT_KEY_ORDER)
+        assert _key_index(ordered, "schema") < _key_index(ordered, "question")
+
+
+class TestSemanticRepairOrdering:
+    def test_semantic_repair_schema_before_errors_and_intent(self) -> None:
+        payload = build_intent_semantic_repair_prompt(
+            "count customers",
+            '{"tables":["customers"]}',
+            [],
+            [],
+            '{"tables":{"customers":{}}}',
+        )
+        assert _key_index(payload, "schema_info") < _key_index(payload, "errors_to_fix")
+        assert _key_index(payload, "schema_info") < _key_index(payload, "current_intent")
+        assert SEMANTIC_REPAIR_PROMPT_KEY_ORDER.index("schema_info") < SEMANTIC_REPAIR_PROMPT_KEY_ORDER.index(
+            "errors_to_fix"
+        )
+
+
+class TestDomainContextOrdering:
+    def test_domain_context_payload_sorted_by_key(self) -> None:
+        entries = (
+            DomainKnowledgeEntry(key="zebra", kind="note", text="z"),
+            DomainKnowledgeEntry(key="alpha", kind="note", text="a"),
+        )
+        payload = domain_context_payload(entries)
+        assert payload is not None
+        assert [row["key"] for row in payload] == ["alpha", "zebra"]
+
 
 class TestMockFixtureLookupUnchanged:
     def test_mock_fixture_user_key_still_order_independent(self) -> None:
@@ -134,8 +194,8 @@ class TestMockFixtureLookupUnchanged:
 
 
 class TestPromptCacheKey:
-    def test_resolve_without_schema_hash(self) -> None:
-        assert LLMProvider.resolve_prompt_cache_key("intent") is None
+    def test_resolve_without_schema_hash_still_returns_family_key(self) -> None:
+        assert LLMProvider.resolve_prompt_cache_key("intent") == "intent"
 
     def test_resolve_with_schema_hash(self) -> None:
         with prompt_cache_schema_scope("schema-graph-abc"):
@@ -152,15 +212,15 @@ class TestPromptCacheKey:
             with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
                 with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
                     with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
-                        with patch("aetherdialect._core_utils.debug"):
-                            with patch("aetherdialect._core_utils.pipeline_trace"):
+                        with patch("aetherdialect._utils.debug"):
+                            with patch("aetherdialect._utils.pipeline_trace"):
                                 LLMProvider.chat("sys", "usr", max_retries=1, task="intent")
 
         kwargs = client.responses.create.call_args.kwargs
         assert kwargs.get("prompt_cache_key") == "intent:graph-123"
 
     @pytest.mark.usefixtures("_non_mock_llm_provider")
-    def test_llm_chat_omits_prompt_cache_key_without_schema_scope(self) -> None:
+    def test_llm_chat_attaches_family_only_prompt_cache_key_without_schema_scope(self) -> None:
         mock_resp = MagicMock()
         mock_resp.output_text = "{}"
         client = MagicMock()
@@ -169,22 +229,26 @@ class TestPromptCacheKey:
         with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
             with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
                 with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
-                    with patch("aetherdialect._core_utils.debug"):
-                        with patch("aetherdialect._core_utils.pipeline_trace"):
+                    with patch("aetherdialect._utils.debug"):
+                        with patch("aetherdialect._utils.pipeline_trace"):
                             LLMProvider.chat("sys", "usr", max_retries=1, task="join")
 
         kwargs = client.responses.create.call_args.kwargs
-        assert "prompt_cache_key" not in kwargs
+        assert kwargs.get("prompt_cache_key") == "join"
+
+    def test_llm_request_kwargs_attaches_prompt_cache_key(self) -> None:
+        with prompt_cache_schema_scope("batch-graph-9"):
+            kwargs = LLMProvider._llm_request_kwargs("sys", "usr", task="intent", timeout=30.0)
+        assert kwargs.get("prompt_cache_key") == "intent:batch-graph-9"
 
     @pytest.mark.usefixtures("_non_mock_llm_provider")
     def test_fuzzy_reuse_extraction_attaches_prompt_cache_key(self) -> None:
         from types import SimpleNamespace
 
-        from aetherdialect._contracts_base import PredicateGroup
-        from aetherdialect._contracts_core import ConcreteIntent, Template, ValueHistory, WhereParam
+        from aetherdialect._contracts_base import NormalizedExpr, PredicateGroup, WhereParam
+        from aetherdialect._contracts_core import ConcreteIntent, Template, ValueHistory
         from aetherdialect._contracts_schema import SQLShape, TemplateStats
-        from aetherdialect._intent_process import NormalizedExpr
-        from aetherdialect._pipeline import extract_fuzzy_reuse_params
+        from aetherdialect._pipeline_generate import extract_fuzzy_reuse_params
 
         intent_sig = ConcreteIntent(
             intent_id="t1",
@@ -222,7 +286,9 @@ class TestPromptCacheKey:
             stats=TemplateStats(accept=1, reject=0),
             trust_level=1,
         )
-        schema = SimpleNamespace(schema_graph_id="reuse-graph-42")
+        schema = SimpleNamespace(schema_graph_id="reuse-graph-42", deny_columns={}, tables={})
+        with prompt_cache_schema_scope(schema_prompt_cache_id(schema)):
+            expected_cache_key = LLMProvider.resolve_prompt_cache_key("default")
         mock_resp = MagicMock()
         mock_resp.output_text = '{"param_values": {"p1": "new"}}'
         client = MagicMock()
@@ -231,8 +297,8 @@ class TestPromptCacheKey:
         with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
             with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
                 with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=client):
-                    with patch("aetherdialect._core_utils.debug"):
-                        with patch("aetherdialect._core_utils.pipeline_trace"):
+                    with patch("aetherdialect._utils.debug"):
+                        with patch("aetherdialect._utils.pipeline_trace"):
                             extract_fuzzy_reuse_params(
                                 "new question",
                                 template,
@@ -242,7 +308,7 @@ class TestPromptCacheKey:
                             )
 
         kwargs = client.responses.create.call_args.kwargs
-        assert kwargs.get("prompt_cache_key") == "default:reuse-graph-42"
+        assert kwargs.get("prompt_cache_key") == expected_cache_key
 
 
 def test_interpret_prompt_parses_as_json() -> None:

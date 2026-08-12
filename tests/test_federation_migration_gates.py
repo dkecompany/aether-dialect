@@ -10,34 +10,30 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherFederation
-from aetherdialect._constants import FEDERATION_MIGRATION_MAP_FILENAME
-from aetherdialect._contracts_base import (
-    ConfigError,
-    LLMConfig,
-    MigrationPendingError,
-    RuntimeConfig,
-)
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import load_runtime_config, write_gzip_json_atomic
-from aetherdialect._federation import (
-    FederationMappings,
+from aetherdialect._contracts_base import MigrationPendingError
+from aetherdialect._contracts_core import LLMConfig, RuntimeConfig
+from aetherdialect._contracts_schema import ColumnMetadata, FederationMappings, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import (
     apply_federation_migration_map,
     clear_federation_composite_template_store,
-    compose_composite_graph,
     compute_federation_storage_dir,
     detect_broken_cross_source_joins,
-    federation_artifact_paths,
     federation_source_artifacts_dir,
     load_federation_plan_templates,
-    parse_federation_manifest,
     parse_federation_migration_map,
     persist_federation_tree,
     reconcile_federation_member_graphs,
     save_federation_plan_template,
     validate_federation_migration_map,
 )
+from aetherdialect._federation_manifest import (
+    federation_artifact_paths,
+    parse_federation_manifest,
+)
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import load_runtime_config, write_gzip_json_atomic
 from tests.federation_helpers import enriched_manifest, write_federation_declaration_file
 
 
@@ -130,7 +126,8 @@ def _write_member_schema_artifact(
     graph: SchemaGraph,
 ) -> None:
     binding = next(binding for binding in manifest.sources if binding.source_id == source_id)
-    member_dir = federation_source_artifacts_dir(str(artifacts_dir), binding)
+    fed_id = str(getattr(manifest, "federation_id", "") or "").strip() or None
+    member_dir = federation_source_artifacts_dir(str(artifacts_dir), binding, federation_id=fed_id)
     os.makedirs(member_dir, exist_ok=True)
     write_gzip_json_atomic(
         os.path.join(member_dir, "schema_graph.json.gz"),
@@ -150,9 +147,12 @@ def _bootstrap_federation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tu
     AetherFederation(
         "fed_gate",
         members=mock_members,
-        declaration_file=str(declaration_path),
+        declaration=str(declaration_path),
         artifacts_dir=str(tmp_path),
     )
+    manifest = enriched_manifest(members, _MANIFEST, member_graphs=members)
+    for sid, graph in members.items():
+        _write_member_schema_artifact(tmp_path, manifest, sid, graph)
     return mock_members, declaration_path
 
 
@@ -174,7 +174,7 @@ def test_federation_owner_member_drift_raises_before_persist(tmp_path: Path, mon
         AetherFederation(
             "fed_gate",
             members=mock_members,
-            declaration_file=str(declaration_path),
+            declaration=str(declaration_path),
             artifacts_dir=str(tmp_path),
         )
 
@@ -184,8 +184,13 @@ def test_federation_owner_member_drift_raises_before_persist(tmp_path: Path, mon
 
 
 @pytest.mark.fast
-def test_federation_consumer_member_drift_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_federation_consumer_open_uses_owner_cache_despite_live_member_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consumer open loads owner disk graphs; live member schema drift must not force recompose."""
     mock_members, declaration_path = _bootstrap_federation(tmp_path, monkeypatch)
+    for member in mock_members.values():
+        member._dialect.filter_selectable_relation_names = MagicMock(side_effect=lambda _schema, names: list(names))
     drifted = _member_graph(
         "entity_a",
         source_id="alpha",
@@ -194,21 +199,23 @@ def test_federation_consumer_member_drift_raises(tmp_path: Path, monkeypatch: py
     )
     mock_members["alpha"]._schema_graph = drifted
 
-    with pytest.raises(ConfigError, match="Federation member graphs have drifted"):
-        AetherFederation(
-            "fed_gate",
-            members=mock_members,
-            declaration_file=str(declaration_path),
-            artifacts_dir=str(tmp_path),
-            role="consumer",
-        )
+    fed = AetherFederation(
+        "fed_gate",
+        members=mock_members,
+        declaration=str(declaration_path),
+        artifacts_dir=str(tmp_path),
+        role="consumer",
+    )
+    assert "entity_a" in fed._schema_graph.tables
+    assert fed._consumer_visible_objects is not None
+    assert "entity_a" in fed._consumer_visible_objects
 
 
 @pytest.mark.fast
 def test_member_drift_invalidates_plan_templates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     mock_members, declaration_path = _bootstrap_federation(tmp_path, monkeypatch)
     fed_dir = compute_federation_storage_dir(str(tmp_path), "fed_gate")
-    from aetherdialect._contracts_base import FederationPlanTemplate
+    from aetherdialect._contracts_schema import FederationPlanTemplate
 
     save_federation_plan_template(
         fed_dir,
@@ -235,7 +242,7 @@ def test_member_drift_invalidates_plan_templates(tmp_path: Path, monkeypatch: py
         AetherFederation(
             "fed_gate",
             members=mock_members,
-            declaration_file=str(declaration_path),
+            declaration=str(declaration_path),
             artifacts_dir=str(tmp_path),
         )
 
@@ -254,7 +261,7 @@ def test_federation_destructive_migration_clears_composite_templates(tmp_path: P
     persist_federation_tree(
         fed_dir,
         manifest=manifest,
-        mappings=FederationMappings(version="0.2.1"),
+        mappings=FederationMappings(version="0.2.3"),
         composite=composite,
         member_graphs=members,
     )
@@ -263,7 +270,7 @@ def test_federation_destructive_migration_clears_composite_templates(tmp_path: P
     assert (Path(fed_dir) / "intent_templates").is_dir()
 
     migration = parse_federation_migration_map({"version": "1", "action": "destructive"})
-    apply_federation_migration_map(migration, manifest, FederationMappings(version="0.2.1"), fed_dir)
+    apply_federation_migration_map(migration, manifest, FederationMappings(version="0.2.3"), fed_dir)
 
     assert not (Path(fed_dir) / "intent_templates").exists()
     assert clear_federation_composite_template_store(fed_dir) is False
@@ -304,16 +311,15 @@ def test_missing_cross_source_join_column_exports_remap_skeleton(
     mock_members["alpha"]._schema_graph = broken_graph
 
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(MigrationPendingError, match="Federation migration required"):
+    with pytest.raises(MigrationPendingError, match="Federation migration required") as pending:
         AetherFederation(
             "fed_gate",
             members=mock_members,
-            declaration_file=str(declaration_path),
+            declaration=str(declaration_path),
             artifacts_dir=str(tmp_path),
         )
 
-    skeleton_path = Path(compute_federation_storage_dir(str(tmp_path), "fed_gate")) / FEDERATION_MIGRATION_MAP_FILENAME
-    skeleton = json.loads(skeleton_path.read_text(encoding="utf-8"))
+    skeleton = pending.value.skeleton_document or {}
     assert skeleton["dropped_cross_source_joins"] == [
         {"left": "entity_a.email", "right": "entity_b.email"},
     ]
@@ -367,12 +373,12 @@ def test_reconcile_federation_member_graphs_stamps_disk_fallback() -> None:
 def test_federation_init_always_recomposes_even_with_cached_composite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with patch("aetherdialect._main_execution.compose_composite_graph", wraps=compose_composite_graph) as compose:
+    with patch("aetherdialect._main_init.compose_composite_graph", wraps=compose_composite_graph) as compose:
         mock_members, declaration_path = _bootstrap_federation(tmp_path, monkeypatch)
         AetherFederation(
             "fed_gate",
             members=mock_members,
-            declaration_file=str(declaration_path),
+            declaration=str(declaration_path),
             artifacts_dir=str(tmp_path),
         )
         assert compose.call_count >= 2
@@ -407,6 +413,6 @@ def test_disk_member_graph_does_not_mask_live_drift(tmp_path: Path, monkeypatch:
         AetherFederation(
             "fed_gate",
             members=mock_members,
-            declaration_file=str(declaration_path),
+            declaration=str(declaration_path),
             artifacts_dir=str(tmp_path),
         )

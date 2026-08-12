@@ -9,7 +9,7 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._utils import (
+from aetherdialect._utils_intent import (
     morph_variants,
     patch_where_literal_on_intent,
     zero_row_where_remediation_candidates,

@@ -12,11 +12,10 @@ from aetherdialect._contracts_core import (
     FeedbackCounts,
     SelectCol,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._pipeline import handle_direct_sql_reuse
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
+from aetherdialect._pipeline_execute import handle_direct_sql_reuse
 
 
 def _orders_schema() -> SchemaGraph:
@@ -79,9 +78,9 @@ def _template_with_integer_filter() -> Template:
 
 
 @pytest.mark.fast
-@patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
+@patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}')
 @patch(
-    "aetherdialect._pipeline.extract_fuzzy_reuse_params",
+    "aetherdialect._pipeline_generate.extract_fuzzy_reuse_params",
     return_value={"p1": "7"},
 )
 def test_wrong_type_aborts_reuse(mock_extract, _mock_llm) -> None:
@@ -93,13 +92,13 @@ def test_wrong_type_aborts_reuse(mock_extract, _mock_llm) -> None:
     dialect.execute.return_value = [("row",)]
     store: dict = {"templates": {"T1": tmpl}}
     with (
-        patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, [])),
-        patch("aetherdialect._templates.TemplateOps.save_template_store"),
-        patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s),
-        patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question"),
-        patch("aetherdialect._pipeline.save_result_csv_for_store"),
-        patch("aetherdialect._pipeline.print_query_result"),
-        patch("aetherdialect._templates.TemplateOps.promote_trust"),
+        patch("aetherdialect._pipeline_generate.validate_sql", return_value=(True, None, None, [])),
+        patch("aetherdialect._templates_ops.TemplateOps.save_template_store"),
+        patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s),
+        patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question"),
+        patch("aetherdialect._pipeline_execute.save_result_csv_for_store"),
+        patch("aetherdialect._pipeline_execute.print_query_result"),
+        patch("aetherdialect._templates_ops.TemplateOps.promote_trust"),
     ):
         result = handle_direct_sql_reuse(
             "new_fuzzy_q",

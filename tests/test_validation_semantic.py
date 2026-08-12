@@ -4,7 +4,6 @@ from aetherdialect._constants import COMPATIBLE_TYPE_PAIRS
 from aetherdialect._contracts_base import (
     FailureCategory,
     HavingParam,
-    LogicalIntent,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
@@ -22,22 +21,16 @@ from aetherdialect._contracts_schema import (
     CaseWhenBranch,
     CaseWhenExpr,
     ColumnMetadata,
+    LogicalIntent,
     SchemaGraph,
     TableMetadata,
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._validation_execute import (
-    curated_warmup_post_binding_issues,
-    curated_warmup_semantic_issues,
-)
-from aetherdialect._validation_semantic import (
+from aetherdialect._validation_rules import (
     _check_mixed_aggregation_in_expr,
     _check_mixed_aggregation_in_group,
     _check_nested_aggregation,
-    _english_plural_forms,
-    _find_fk_column_for_target,
-    _resolve_word_to_table,
     _term_has_aggregation,
     _validate_concat_group,
     _validate_single_expr_types,
@@ -73,6 +66,10 @@ from aetherdialect._validation_semantic import (
     validate_threshold_missing_having,
     validate_where_expr_types,
     validate_where_no_aggregation,
+)
+from aetherdialect._validation_sql import (
+    curated_warmup_post_binding_issues,
+    curated_warmup_semantic_issues,
 )
 
 
@@ -217,18 +214,6 @@ class TestValidateSemanticContradictions:
         issues = validate_semantic_contradictions([sc], "count of items", "scalar", "one")
         assert len(issues) == 0
 
-    def test_nl_contradiction_pattern_never_total(self):
-        """NL mentioning 'never' and 'total' triggers warning."""
-        sc = SelectCol(expr=NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["SUM(t.a)"])]))
-        issues = validate_semantic_contradictions(
-            [sc],
-            natural_language="Show me records that never have a total over 100",
-            grain="grouped",
-            expected_rows="few",
-        )
-        nl_issues = [i for i in issues if "never" in i.message.lower() or "contradiction" in i.message.lower()]
-        assert len(nl_issues) >= 1
-
     def test_scalar_with_many_rows(self):
         """Error for scalar grain but expecting many rows."""
         sc = SelectCol(expr=NormalizedExpr.from_agg("count", "t.a"))
@@ -272,9 +257,9 @@ class TestValidateExprVsExprFilters:
 
     def test_date_subtraction_vs_integer_duration_no_type_mismatch(self):
         """Date subtraction compared to an integer duration column is valid."""
-        from aetherdialect._contracts_base import ColumnRole
         from aetherdialect._contracts_schema import (
             ColumnMetadata,
+            ColumnRole,
             SchemaGraph,
             TableMetadata,
         )
@@ -1453,9 +1438,7 @@ class TestValidateHavingOperatorIsNumeric:
     """Tests for validate_having_operator_is_numeric."""
 
     def test_numeric_ops_clean(self):
-        from aetherdialect._validation_semantic import (
-            validate_having_operator_is_numeric,
-        )
+        from aetherdialect._validation_rules import validate_having_operator_is_numeric
 
         hp = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
@@ -1465,9 +1448,7 @@ class TestValidateHavingOperatorIsNumeric:
         assert validate_having_operator_is_numeric([hp]) == []
 
     def test_ilike_rejected(self):
-        from aetherdialect._validation_semantic import (
-            validate_having_operator_is_numeric,
-        )
+        from aetherdialect._validation_rules import validate_having_operator_is_numeric
 
         hp = HavingParam(
             left_expr=NormalizedExpr.from_agg("count", "t.a"),
@@ -1572,10 +1553,9 @@ class TestValidateCaseBranchAggregationConsistency:
 
 
 class TestValidateThresholdMissingHaving:
-    """Tests for validate_threshold_missing_having."""
+    """Tests for validate_threshold_missing_having (NL heuristics retired)."""
 
-    def test_fires_when_grouped_agg_threshold_no_having(self):
-        """Issue raised when grain='grouped', agg exists, threshold phrase matches, but no HAVING is defined."""
+    def test_returns_no_issues(self):
         issues = validate_threshold_missing_having(
             "Customers with more than 5 orders",
             [
@@ -1585,100 +1565,7 @@ class TestValidateThresholdMissingHaving:
             [],
             "grouped",
         )
-        assert len(issues) == 1
-        assert issues[0].category == "threshold_missing_having"
-        assert issues[0].severity == "error"
-
-    def test_silent_when_having_present(self):
-        """No issue when HAVING is already defined."""
-        hp = HavingParam(
-            left_expr=NormalizedExpr.from_agg("count", "orders.id"),
-            op=">",
-            value_type="number",
-            raw_value=5,
-        )
-        issues = validate_threshold_missing_having(
-            "Customers with more than 5 orders",
-            [
-                SelectCol(expr=NormalizedExpr.from_column("customer.name")),
-                SelectCol(expr=NormalizedExpr.from_agg("count", "orders.id")),
-            ],
-            [hp],
-            "grouped",
-        )
         assert issues == []
-
-    def test_silent_when_not_grouped(self):
-        """No issue when grain is row_level."""
-        issues = validate_threshold_missing_having(
-            "Orders with more than 5 items",
-            [SelectCol(expr=NormalizedExpr.from_agg("count", "items.id"))],
-            [],
-            "row_level",
-        )
-        assert issues == []
-
-    def test_silent_when_no_aggregation(self):
-        """No issue when no aggregated select column exists."""
-        issues = validate_threshold_missing_having(
-            "Customers with more than 5 orders",
-            [SelectCol(expr=NormalizedExpr.from_column("customer.name"))],
-            [],
-            "grouped",
-        )
-        assert issues == []
-
-    def test_silent_when_no_threshold_phrase(self):
-        """No issue when question has no threshold phrase."""
-        issues = validate_threshold_missing_having(
-            "List all customers and their order counts",
-            [
-                SelectCol(expr=NormalizedExpr.from_column("customer.name")),
-                SelectCol(expr=NormalizedExpr.from_agg("count", "orders.id")),
-            ],
-            [],
-            "grouped",
-        )
-        assert issues == []
-
-    def test_silent_when_empty_question(self):
-        """No issue when natural_language is empty."""
-        issues = validate_threshold_missing_having(
-            "",
-            [SelectCol(expr=NormalizedExpr.from_agg("count", "orders.id"))],
-            [],
-            "grouped",
-        )
-        assert issues == []
-
-    def test_at_least_phrase_fires(self):
-        """'at least' threshold phrase triggers issue."""
-        issues = validate_threshold_missing_having(
-            "Actors in at least 10 films",
-            [
-                SelectCol(expr=NormalizedExpr.from_column("actor.name")),
-                SelectCol(expr=NormalizedExpr.from_agg("count", "film.id")),
-            ],
-            [],
-            "grouped",
-        )
-        assert len(issues) == 1
-
-    def test_context_label_propagated(self):
-        """Context label appears in issue_id and context dict."""
-        issues = validate_threshold_missing_having(
-            "Items with more than 3 reviews",
-            [
-                SelectCol(expr=NormalizedExpr.from_column("items.name")),
-                SelectCol(expr=NormalizedExpr.from_agg("count", "reviews.id")),
-            ],
-            [],
-            "grouped",
-            context="cte_step",
-        )
-        assert len(issues) == 1
-        assert "cte_step" in issues[0].issue_id
-        assert issues[0].context["location"] == "cte_step"
 
 
 class TestValidateForEachGrouping:
@@ -1826,142 +1713,17 @@ class TestValidateQuestionAggKeywordCoverage:
 
 
 class TestValidateCountThresholdMissingHaving:
-    """Tests for validate_count_threshold_missing_having."""
+    """Tests for validate_count_threshold_missing_having (NL heuristics retired)."""
 
-    @staticmethod
-    def _make_schema():
-        """Schema with film, inventory, and store for threshold tests."""
-        return SchemaGraph(
-            tables={
-                "film": TableMetadata(
-                    name="film",
-                    columns={
-                        "film_id": ColumnMetadata(
-                            name="film_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                        "title": ColumnMetadata(
-                            name="title",
-                            data_type="varchar",
-                            value_type="string",
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="film_id",
-                ),
-                "inventory": TableMetadata(
-                    name="inventory",
-                    columns={
-                        "inventory_id": ColumnMetadata(
-                            name="inventory_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                        "film_id": ColumnMetadata(
-                            name="film_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_foreign_key=True,
-                            fk_target=("film", "film_id"),
-                        ),
-                        "store_id": ColumnMetadata(
-                            name="store_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_foreign_key=True,
-                            fk_target=("store", "store_id"),
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="inventory_id",
-                ),
-                "store": TableMetadata(
-                    name="store",
-                    columns={
-                        "store_id": ColumnMetadata(
-                            name="store_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="store_id",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="",
-        )
-
-    def test_emits_error_when_having_missing(self):
-        """Threshold phrase without HAVING produces an error."""
-        schema = self._make_schema()
+    def test_returns_no_issues(self):
+        schema = SchemaGraph(tables={}, join_paths_multi={}, effective_structural_hash="")
         issues = validate_count_threshold_missing_having(
             "list films available in exactly 2 stores",
             ["film", "inventory"],
             [],
             schema,
         )
-        assert len(issues) == 1
-        assert issues[0].severity == "error"
-        assert issues[0].category == "count_threshold_missing_having"
-        assert "inventory.store_id" in issues[0].message
-
-    def test_no_issue_when_having_present(self):
-        """No issue when a HAVING clause already exists."""
-        schema = self._make_schema()
-        hp = HavingParam(
-            left_expr=NormalizedExpr(
-                add_groups=[MulGroup(coefficient=1.0, multiply=["COUNT(DISTINCT inventory.store_id)"])]
-            ),
-            op="=",
-            value_type="integer",
-            raw_value=2,
-        )
-        issues = validate_count_threshold_missing_having(
-            "list films available in exactly 2 stores",
-            ["film", "inventory"],
-            [hp],
-            schema,
-        )
         assert issues == []
-
-    def test_no_issue_when_pattern_absent(self):
-        """No issue when question has no count-threshold pattern."""
-        schema = self._make_schema()
-        issues = validate_count_threshold_missing_having(
-            "list all films",
-            ["film"],
-            [],
-            schema,
-        )
-        assert issues == []
-
-    def test_no_issue_when_word_not_in_schema(self):
-        """No issue when threshold word does not resolve to a table."""
-        schema = self._make_schema()
-        issues = validate_count_threshold_missing_having(
-            "list films in exactly 2 warehouses",
-            ["film"],
-            [],
-            schema,
-        )
-        assert issues == []
-
-    def test_fk_column_in_context(self):
-        """Issue context includes the FK column reference."""
-        schema = self._make_schema()
-        issues = validate_count_threshold_missing_having(
-            "films in exactly 3 stores",
-            ["film", "inventory"],
-            [],
-            schema,
-        )
-        assert issues[0].context["fk_column"] == "inventory.store_id"
-        assert issues[0].context["threshold_count"] == "3"
 
 
 class TestValidateSemanticContradictionsExtended:
@@ -2002,66 +1764,29 @@ class TestValidateSemanticContradictionsExtended:
         issues = validate_semantic_contradictions([sc], "count", "scalar", "few")
         assert any("scalar" in i.message and "few" in i.message for i in issues)
 
-    def test_nl_zero_greater_than_warning(self):
-        """'zero' and 'greater than' together yield a warning-level NL contradiction."""
-        sc = SelectCol(expr=NormalizedExpr.from_column("orders.amount"))
-        issues = validate_semantic_contradictions([sc], "Show zero rows greater than 10", "row_level", "many")
-        assert any(i.severity == "warning" and "zero" in i.message.lower() for i in issues)
-
-    def test_nl_empty_count_warning(self):
-        """'empty' and 'count' together yield a warning."""
-        sc = SelectCol(expr=NormalizedExpr.from_column("orders.amount"))
-        issues = validate_semantic_contradictions([sc], "empty result count", "row_level", "many")
-        assert any(i.severity == "warning" for i in issues)
-
-    def test_nl_no_records_count_warning(self):
-        """'no records' and 'count' together yield a warning."""
-        sc = SelectCol(expr=NormalizedExpr.from_column("orders.amount"))
-        issues = validate_semantic_contradictions([sc], "no records in count query", "row_level", "many")
-        assert any("no records" in i.message.lower() or "count" in i.message.lower() for i in issues)
-
 
 class TestValidateQuestionDistinctHint:
-    """Tests for validate_question_distinct_hint."""
+    """Tests for validate_question_distinct_hint (NL heuristics retired)."""
 
-    def test_empty_question_no_issues(self):
-        assert validate_question_distinct_hint("", [SelectCol(expr=NormalizedExpr.from_column("t.a"))]) == []
-
-    def test_no_distinct_keyword_no_issues(self):
-        issues = validate_question_distinct_hint(
-            "list all customers",
-            [SelectCol(expr=NormalizedExpr.from_column("customers.name"))],
-        )
-        assert issues == []
-
-    def test_fires_when_unique_in_question_no_distinct_in_expr(self):
+    def test_returns_no_issues(self):
         issues = validate_question_distinct_hint(
             "list unique customer names",
             [SelectCol(expr=NormalizedExpr.from_column("customers.name"))],
         )
-        assert len(issues) == 1
-        assert issues[0].category == "missing_distinct"
-        assert issues[0].severity == "warning"
-
-    def test_silent_when_distinct_appears_in_multiply_term(self):
-        sc = SelectCol(
-            expr=NormalizedExpr(add_groups=[MulGroup(multiply=["DISTINCT customers.name"], coefficient=1.0)]),
-        )
-        issues = validate_question_distinct_hint("unique names", [sc])
         assert issues == []
 
 
 class TestValidateLogicalIntentNumericCoverageExtended:
     """Additional branches for validate_logical_intent_numeric_coverage."""
 
-    def test_top_n_number_excluded_from_missing_numeric(self):
-        """Numbers only referenced in 'top N' phrases do not produce missing-numeric issues."""
-        li = LogicalIntent(tables=("t",), select="*", where="Show top 5 customers")
+    def test_limit_number_excluded_from_missing_numeric(self):
+        """Numbers matching intent limit do not produce missing-numeric issues."""
+        li = LogicalIntent(tables=("t",), select="*", where="Show top 5 customers", limit="5")
         issues = validate_logical_intent_numeric_coverage(
             li,
             [],
             [],
-            None,
+            5,
             "main",
         )
         assert issues == []
@@ -2318,116 +2043,6 @@ class TestValidateAggVsAggHavingStarTarget:
         hp = HavingParam(left_expr=left, op=">", right_expr=right, value_type="number")
         issues = validate_agg_vs_agg_having([hp], typed_schema)
         assert isinstance(issues, list)
-
-
-class TestPrivateHelpersValidationSemantic:
-    """Direct tests for small private helpers."""
-
-    def test_english_plural_forms_y_to_ies(self):
-        forms = _english_plural_forms("category")
-        assert "category" in forms
-        assert "categories" in forms
-
-    def test_english_plural_forms_sh(self):
-        forms = _english_plural_forms("store")
-        assert "store" in forms
-        assert "stores" in forms
-
-    def test_resolve_word_to_table_plural(self):
-        schema = SchemaGraph(
-            tables={
-                "customer": TableMetadata(
-                    name="customer",
-                    columns={
-                        "customer_id": ColumnMetadata(
-                            name="customer_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="customer_id",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="",
-        )
-        assert _resolve_word_to_table("customers", schema) == "customer"
-
-    def test_find_fk_column_for_target(self):
-        schema = SchemaGraph(
-            tables={
-                "rental": TableMetadata(
-                    name="rental",
-                    columns={
-                        "rental_id": ColumnMetadata(
-                            name="rental_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                        "customer_id": ColumnMetadata(
-                            name="customer_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_foreign_key=True,
-                            fk_target=("customer", "customer_id"),
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="rental_id",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="",
-        )
-        assert _find_fk_column_for_target("customer", ["rental"], schema) == "rental.customer_id"
-
-
-class TestValidateCountThresholdMissingHavingExtended:
-    def test_generic_hint_when_no_fk_column(self):
-        schema = SchemaGraph(
-            tables={
-                "film": TableMetadata(
-                    name="film",
-                    columns={
-                        "film_id": ColumnMetadata(
-                            name="film_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="film_id",
-                ),
-                "store": TableMetadata(
-                    name="store",
-                    columns={
-                        "store_id": ColumnMetadata(
-                            name="store_id",
-                            data_type="integer",
-                            value_type="integer",
-                            is_primary_key=True,
-                        ),
-                    },
-                    foreign_keys=[],
-                    primary_key="store_id",
-                ),
-            },
-            join_paths_multi={},
-            effective_structural_hash="",
-        )
-        issues = validate_count_threshold_missing_having(
-            "films in exactly 2 stores",
-            ["film"],
-            [],
-            schema,
-        )
-        assert len(issues) == 1
-        assert issues[0].context.get("fk_column") == ""
-        assert "<fk_column_referencing_store>" in issues[0].message
 
 
 class TestValidateForEachGroupingExtended:

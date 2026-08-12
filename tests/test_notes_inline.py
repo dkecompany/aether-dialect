@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._contracts_base import BusinessKnowledgeEntry, ConfigError, EngineContext, SpaceContext
+from aetherdialect._contracts_base import ConfigError, DomainKnowledgeEntry, EngineContext, SpaceContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._schema_catalog import extract_business_knowledge_from_notes
+from aetherdialect._schema_profile import extract_domain_knowledge_from_notes
 
 
 def _schema() -> SchemaGraph:
@@ -39,16 +39,27 @@ def test_notes_and_notes_file_both_set_raises(tmp_path) -> None:
 
 
 @pytest.mark.fast
-def test_notes_string_extracts_bk() -> None:
+def test_notes_string_extracts_dk() -> None:
     schema = _schema()
     ctx = EngineContext(notes="ARR means annual recurring revenue.")
     assert ctx.notes_file is None
     assert ctx.notes == "ARR means annual recurring revenue."
-    llm_payload = [{"key": "arr", "kind": "glossary", "text": "ARR means annual recurring revenue."}]
-    with patch("aetherdialect._schema_catalog.LLMProvider.chat", return_value=json.dumps(llm_payload)):
-        with patch("aetherdialect._schema_catalog.EngineConfig.llm_credentials_configured", return_value=True):
-            from aetherdialect._core_utils import notes_content_from_context
+    notes = "ARR means annual recurring revenue."
+    llm_payload = {
+        "records": [
+            {
+                "key": "arr",
+                "kind": "glossary",
+                "text": notes,
+                "referenced_entities": [],
+            }
+        ],
+        "coverage": [{"span": notes, "disposition": "fact", "record_index": 0}],
+    }
+    with patch("aetherdialect._schema_profile.LLMProvider.chat", return_value=json.dumps(llm_payload)):
+        with patch("aetherdialect._schema_profile.EngineConfig.llm_credentials_configured", return_value=True):
+            from aetherdialect._utils import notes_content_from_context
 
             content = notes_content_from_context(ctx)
-            entries = extract_business_knowledge_from_notes(content, schema)
-    assert any(isinstance(e, BusinessKnowledgeEntry) and e.key == "arr" for e in entries)
+            entries = extract_domain_knowledge_from_notes(content, schema)
+    assert any(isinstance(e, DomainKnowledgeEntry) and e.key == "arr" for e in entries)

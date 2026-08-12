@@ -6,11 +6,11 @@ from decimal import Decimal
 
 import pytest
 
-from aetherdialect._federation import (
+from aetherdialect._contracts_core import SessionStep
+from aetherdialect._federation_execute import (
     _coordinator_result_to_dataframe,
     _execute_coordinator_sql_with_timeout,
 )
-from aetherdialect._main_execution import SessionStep
 
 
 @pytest.mark.fast

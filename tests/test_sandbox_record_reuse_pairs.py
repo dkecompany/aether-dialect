@@ -74,7 +74,7 @@ def test_record_all_records_mapped_reuse_pairs_when_flag_set(sandbox_corpus, mon
     session.record_inline_reuse_param_fixtures = MagicMock(return_value=(True, ""))
 
     monkeypatch.setattr("aetherdialect.aetherdialect._init_log_sink", lambda _line: None)
-    monkeypatch.setattr(sandbox_corpus, "_begin_eval_results", lambda _path: None)
+    monkeypatch.setattr(sandbox_corpus, "_begin_eval_results", lambda *_a, **_k: None)
     monkeypatch.setattr(sandbox_corpus, "_BUILD_VERBOSE", False)
 
     ok = session.record_all(slots=[slot], record_reuse_pairs=True)
@@ -105,7 +105,7 @@ def test_record_all_skips_mapped_reuse_pairs_without_flag(sandbox_corpus, monkey
     session.record_inline_reuse_param_fixtures = MagicMock(return_value=(True, ""))
 
     monkeypatch.setattr("aetherdialect.aetherdialect._init_log_sink", lambda _line: None)
-    monkeypatch.setattr(sandbox_corpus, "_begin_eval_results", lambda _path: None)
+    monkeypatch.setattr(sandbox_corpus, "_begin_eval_results", lambda *_a, **_k: None)
     monkeypatch.setattr(sandbox_corpus, "_BUILD_VERBOSE", False)
 
     ok = session.record_all(slots=[slot], record_reuse_pairs=False)

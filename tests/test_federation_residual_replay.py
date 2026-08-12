@@ -1,13 +1,13 @@
 """Federation replay distinguishes combine shape from residual clauses."""
 
-from aetherdialect._contracts_base import FederationPlanTemplate, OrderByCol
+from aetherdialect._contracts_base import NormalizedExpr, OrderByCol
 from aetherdialect._contracts_core import FederatedPlan, JoinSpec, ResidualSpec
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import FederationPlanTemplate
+from aetherdialect._federation_execute import (
     federation_plan_combine_hash,
     federation_plan_matches_template,
     federation_plan_residual_hash,
 )
-from aetherdialect._intent_process import NormalizedExpr
 
 
 def _join_plan(*, residual: ResidualSpec | None) -> FederatedPlan:

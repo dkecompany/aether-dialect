@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_core import FeedbackKind, QuestionFeedbackEntry, RejectionBucket, RuntimeIntent
-from aetherdialect._pipeline import should_skip_intent_confirmation
-from aetherdialect._templates import TemplateOps
+from aetherdialect._pipeline_generate import should_skip_intent_confirmation
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _intent() -> RuntimeIntent:

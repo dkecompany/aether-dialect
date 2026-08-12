@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_core import GenerationPath, NormalizedExpr, RuntimeIntent, SelectCol
-from aetherdialect._pipeline import (
+from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import GenerationPath, RuntimeIntent, SelectCol
+from aetherdialect._pipeline_execute import (
     build_result_dataframe,
     intent_result_column_headers,
     result_columns_for_session,

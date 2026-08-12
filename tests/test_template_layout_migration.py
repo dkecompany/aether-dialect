@@ -12,8 +12,8 @@ from aetherdialect._constants import (
     ARTIFACT_MANIFEST_FILENAME,
     TEMPLATE_STORE_HEADER_FILENAME,
 )
-from aetherdialect._core_utils import write_gzip_json_atomic
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import write_gzip_json_atomic
 
 
 def _write_stale_manifest(artifacts_dir: str, *, artifact_format_version: int) -> None:

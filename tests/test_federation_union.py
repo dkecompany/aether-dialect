@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_REFUSAL_UNION_COLUMN_MISSING
-from aetherdialect._contracts_base import LogicalTableMapping, LogicalTableMember
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import refusal_diagnostic_code_for_federation_reason
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
     FederationMappings,
+    LogicalTableMapping,
+    LogicalTableMember,
+    SchemaGraph,
+    TableMetadata,
+)
+from aetherdialect._federation_execute import (
     federation_ineligible_answerable_hint,
     federation_ineligible_reason_code,
-    parse_federation_manifest,
-    plan_federated_intent,
 )
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._utils import refusal_diagnostic_code_for_federation_reason
 
 
 def _union_lines_schema() -> SchemaGraph:
@@ -48,7 +53,7 @@ def test_missing_union_column_refusal_names_column() -> None:
         include_derived_roster=True,
     )
     mappings = FederationMappings(
-        version="0.2.1",
+        version="0.2.3",
         logical_tables=(
             LogicalTableMapping(
                 logical="lines",

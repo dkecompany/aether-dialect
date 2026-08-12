@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._constants import AUDIT_EVENT_ASK_SUSPEND, PIPELINE_SUSPEND_ID_INTENT_CONFIRM
-from aetherdialect._main_execution import PipelineSession
-from aetherdialect._pipeline import PipelineSuspended
+from aetherdialect._contracts_core import PipelineSuspended
+from aetherdialect._main_session import PipelineSession
 
 
 def _session_owner() -> MagicMock:

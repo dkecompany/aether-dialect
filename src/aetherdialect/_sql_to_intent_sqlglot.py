@@ -15,12 +15,12 @@ from ._constants import (
     DISTINCT_ON_CTE_NAME_PREFIX,
     DISTINCT_ON_RANK_COLUMN,
     SELF_JOIN_CTE_NAME_PREFIX,
-    SIMPLE_AGG_NAMES,
     SQL_TO_INTENT_LIMIT_OFFSET_PARAM_KEY,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_NUM,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_STR,
     SQL_TO_INTENT_PARAM_KEY_PREFIX,
     SQLGLOT_AGG_FUNC_KEY_ALIASES,
+    VALID_AGGREGATION_FUNCTIONS,
     WINDOW_DEFAULT_FRAME_END_WITH_ORDER,
     WINDOW_DEFAULT_FRAME_END_WITHOUT_ORDER,
     WINDOW_DEFAULT_FRAME_KIND_WITH_ORDER,
@@ -886,7 +886,7 @@ def _aggregate_to_expr(
 
     fn_name = _dialect_map_scalar_func(dialect, _func_name(node))
     fn_name = SQLGLOT_AGG_FUNC_KEY_ALIASES.get(fn_name, fn_name)
-    if fn_name not in SIMPLE_AGG_NAMES:
+    if fn_name not in VALID_AGGREGATION_FUNCTIONS:
         return None
     distinct_flag = False
     inner_node: exp.Expression | None = None

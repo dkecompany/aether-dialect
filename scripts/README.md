@@ -7,7 +7,8 @@ Self-contained scripts to build the **rental_shop** CSV bundle (34-table multi-c
 | Section | Contents |
 | --- | --- |
 | [Quick start](#quick-start) | CSV bundle and engine load |
-| [source_rental_shop.py](#source_rental_shoppypy) | Bundle generation |
+| [source_rental_shop.py](#source_rental_shoppy) | Bundle generation |
+| [rental_shop_sandbox_export.py](#rental_shop_sandbox_exportpy) | Sandbox subset + federation CSV/seed writers |
 | [load_rental_shop_engines.py](#load_rental_shop_enginespy) | Multi-engine load |
 | [Federation build](#federation-build) | Partition seeds, live load, verify |
 | [Data sources](#data-sources) | Lexicons and external feeds |
@@ -26,18 +27,28 @@ Self-contained scripts to build the **rental_shop** CSV bundle (34-table multi-c
 .venv\Scripts\python.exe scripts\load_rental_shop_engines.py --all --drop-first
 ```
 
+Direct CSV bundle download (same URL the cascade uses when no local zip/dir exists):
+
+https://stdialectsampledata.blob.core.windows.net/aether-dialect-sample-data/rental_shop.zip
+
 For a from-scratch maintainer run with LLM enrichment, see [Maintainer publish](#maintainer-publish) below.
 
 ## `source_rental_shop.py`
 
 Ensures `scripts/data/rental_shop_csvs/` exists. One mode flag per invocation (except `--pack`, which combines with `--generate`).
 
+Public sandbox/federation row writers live in [`rental_shop_sandbox_export.py`](#rental_shop_sandbox_exportpy) and are re-exported from this module for callers.
+
 | Invocation | Behaviour |
 | --- | --- |
-| *(no flags)* / `--download` | **Download cascade:** use existing `rental_shop_csvs/` if present; else extract `scripts/data/rental_shop.zip`; else fetch `DEFAULT_BUNDLE_URL` (Azure blob constant in the script). |
+| *(no flags)* / `--download` | **Download cascade:** use existing `rental_shop_csvs/` if present; else extract `scripts/data/rental_shop.zip`; else fetch `DEFAULT_BUNDLE_URL`. |
 | `--generate` | Synthesize CSVs from frozen `inputs.zip` (required manifest below) plus Open Library books and Zenodo games. Fail-fast if any lexicon member is missing or too short. Runs FK and semantic verification. |
 | `--generate --enrich-llm` | Same as `--generate`, then LLM-enrich **`item.description` only** (requires `OPENAI_API_KEY`; disk cache under `scripts/data/_llm_cache/`). |
 | `--pack` | Zip `rental_shop_csvs/` → `scripts/data/rental_shop.zip` (alone, or after `--generate`). |
+
+**`DEFAULT_BUNDLE_URL`** (constant in `source_rental_shop.py`):
+
+https://stdialectsampledata.blob.core.windows.net/aether-dialect-sample-data/rental_shop.zip
 
 **Invalid combinations** (script exits with an error):
 
@@ -46,7 +57,30 @@ Ensures `scripts/data/rental_shop_csvs/` exists. One mode flag per invocation (e
 
 Output directory: `scripts/data/rental_shop_csvs/` (gitignored). Optional env: `RENTAL_SHOP_BUNDLE_SHA256` (verify downloaded zip), `RENTAL_SHOP_LLM_MODEL`, `RENTAL_SHOP_LLM_BATCH_SIZE`.
 
+## `rental_shop_sandbox_export.py`
+
+Implementation module for sandbox-scale subsetting and federation CSV/DDL export. Prefer importing the public names from `source_rental_shop` (stable re-exports); this file is the single writer body so `sandbox_corpus` does not redefine scale.
+
+| Callable (also on `source_rental_shop`) | Behaviour |
+| --- | --- |
+| `compute_sandbox_subset` / `row_allowed` | Deterministic ID subset (seed `SANDBOX_SAMPLE_SEED`) over an existing sqlite corpus |
+| `export_sandbox_main_data_dir` | Write downsampled `rental_shop_data/` CSV tables |
+| `export_sandbox_federation_partition_schemas` | Write downsampled CREATE-only `federation_*_schema.sql` for the four members |
+| `export_sandbox_federation_partition_data_dirs` | Write downsampled `federation_*_data/` CSV trees |
+| `export_federation_member_data_dirs_from_existing_csvs` | Full live member CSV dirs from existing `rental_shop_csvs/` + sqlite (ownership + payment split only; no source re-synthesis) |
+
+Also owns payment-split helpers, corpus realism mutators, and partition map constants used by loaders and corpus assemble.
+
+`sandbox_corpus.assemble_staging` calls the sandbox-scale emitters and writes **only** under `scripts/sandbox_staging/`. Full `scripts/data/federation_*_data/` comes from `export_federation_member_data_dirs_from_existing_csvs` (see [Federation build](#federation-build)).
+
 ## `load_rental_shop_engines.py`
+
+Loads `scripts/data/rental_shop_csvs/` into one or more engines. Per-engine wrappers live under `scripts/<engine>/` (`load_rental_shop.py`, `test_connection.py`). Include with `--oracle` / exclude with `--exclude-oracle` (same pattern as `--sqlserver`).
+
+```text
+.venv\Scripts\python.exe scripts\load_rental_shop_engines.py --oracle --drop-first
+.venv\Scripts\python.exe scripts\oracle\test_connection.py
+```
 
 Loads CSVs + canonical DDL into supported engines from `scripts/data/rental_shop.sql`.
 
@@ -59,7 +93,7 @@ Loads CSVs + canonical DDL into supported engines from `scripts/data/rental_shop
 | `--csv-dir` | CSV directory (default `scripts/data/rental_shop_csvs/`). |
 | `--ddl` | DDL path (default `scripts/data/rental_shop.sql`). |
 
-With **no arguments**, all ten engines load. Include and exclude flags cannot be combined unless `--all` is present.
+With **no arguments**, all eleven engines load. Include and exclude flags cannot be combined unless `--all` is present.
 
 **BigQuery:** set `BIGQUERY_LOCATION` to the dataset data region (e.g. `australia-southeast1`), not the project default.
 
@@ -76,9 +110,9 @@ With **no arguments**, all ten engines load. Include and exclude flags cannot be
 
 | Flag | Behaviour |
 | --- | --- |
-| `--federation-load {storefront,catalog,logistics,crm,all}` | Apply the matching `federation_*_seed.sql` files, then run partition verify. |
+| `--federation-load {storefront,catalog,logistics,crm,all}` | Load matching `federation_*_schema.sql` + `federation_*_data/` CSV dirs, then run partition verify. |
 | `--federation-verify {storefront,catalog,logistics,crm,all}` | Row-count verify only — no reload. |
-| `--drop-first` | **Blast radius:** drop and recreate only the four federation partition namespaces above. Full `rental_shop` schemas/databases on those engines are **not** modified. |
+| `--drop-first` | **Scope:** drop and recreate only the four federation partition namespaces above. Full `rental_shop` schemas/databases on those engines are **not** modified. |
 | `--verbose` | Print per-table row counts during federation verify. |
 
 **Invalid combinations** (script exits with an error before any mode runs):
@@ -100,7 +134,10 @@ Ordered maintainer sequence for the four-member offline/live federation topology
 # 1 — Ensure CSV bundle (no live DB)
 .venv\Scripts\python.exe scripts\source_rental_shop.py
 
-# 2 — Corpus staging: export partition seeds and refresh federation_partition.json (no live DB)
+# 1b — Regenerate full federation member CSV dirs from existing rental_shop_csvs (no live DB)
+.venv\Scripts\python.exe -c "from source_rental_shop import export_federation_member_data_dirs_from_existing_csvs; export_federation_member_data_dirs_from_existing_csvs()"
+
+# 2 — Corpus staging: downsampled sandbox pack inputs under scripts/sandbox_staging only (no live DB)
 .venv\Scripts\python.exe scripts\sandbox_corpus.py
 
 # 3 — Load all four live partitions (live DB: postgres + mysql + mariadb)
@@ -110,7 +147,14 @@ Ordered maintainer sequence for the four-member offline/live federation topology
 .venv\Scripts\python.exe scripts\load_rental_shop_engines.py --federation-verify all
 ```
 
-Step 2 calls `export_federation_partition_seeds` during `assemble_staging`, overwriting the four committed `federation_*_seed.sql` files and `federation_partition.json` from `scripts/sqlite/rental_shop.sqlite`. Until that rebuild runs, the seed files ship as **payment-only placeholders** (`NON-CANONICAL` header comment); `federation_partition.json` always lists the authoritative per-member table roster.
+Step 1b writes full `federation_*_data/` under `scripts/data/` via `export_federation_member_data_dirs_from_existing_csvs` (table ownership + payment split only; requires existing `rental_shop_csvs/` and sqlite corpus). Step 2 `assemble_staging` calls `export_sandbox_main_data_dir`, `export_sandbox_federation_partition_schemas`, and `export_sandbox_federation_partition_data_dirs` from `source_rental_shop`, writing downsampled federation schemas and CSV dirs only under `scripts/sandbox_staging/`. Offline sandbox loads CREATE-only DDL plus per-table CSV row dirs.
+
+Validate without packing:
+
+```text
+.venv\Scripts\python.exe -c "from sandbox_corpus import run_staging_pack_assertions; run_staging_pack_assertions()"
+.venv\Scripts\python.exe -c "from sandbox_corpus import finalize_validate; finalize_validate()"
+```
 
 Declaration topology is hand-maintained in `federation_declaration.json` (logical tables, cross-source joins, replica/union semantics). See [Sandbox data reference](../docs/SANDBOX_DATA_REFERENCE.md#federation-topology) for member table lists and join shape.
 
@@ -130,20 +174,24 @@ Activity anchor for generated dates: `2026-07-01` (`RENTAL_SHOP_AS_OF` env overr
 
 | Path | Role |
 | --- | --- |
+| `scripts/source_rental_shop.py` | CSV bundle CLI + public re-exports of sandbox/federation writers |
+| `scripts/rental_shop_sandbox_export.py` | Sandbox subset + federation CSV/DDL writer implementation |
 | `scripts/data/rental_shop_csvs/` | Generated or downloaded CSV exports (gitignored) |
-| `scripts/data/rental_shop.zip` | Packed CSV bundle for publish/download (gitignored) |
+| `scripts/data/rental_shop.zip` | Packed CSV bundle for publish/download (gitignored); also at [Azure blob URL](https://stdialectsampledata.blob.core.windows.net/aether-dialect-sample-data/rental_shop.zip) |
 | `scripts/data/rental_shop.sql` | Canonical DDL (hand-maintained) |
 | `scripts/data/rental_shop_notes.txt` | Domain notes for schema context |
-| `scripts/data/rental_shop_overrides.json` | Shipped sensitivity overrides (`version` **1**) |
+| `scripts/data/rental_shop_overrides.json` | Corpus build structure document (`version` **1**); applied as `applied_structure.json` in the offline bundle |
 | `scripts/data/sandbox_questions.txt` | Offline sandbox question corpus (`# questions`, `# validation_failures`, `# feedback_samples`) |
 | `scripts/data/federation_declaration.json` | Hand-maintained federation topology (logical tables, joins, coordinator limits) |
-| `scripts/data/federation_partition.json` | Per-member physical table roster; **committed artifact** refreshed by corpus `assemble_staging` |
-| `scripts/data/federation_storefront_seed.sql` | Storefront partition DuckDB seed (**committed artifact**; placeholder until corpus export) |
-| `scripts/data/federation_catalog_seed.sql` | Catalog partition DuckDB seed (**committed artifact**; placeholder until corpus export) |
-| `scripts/data/federation_logistics_seed.sql` | Logistics partition DuckDB seed (**committed artifact**; placeholder until corpus export) |
-| `scripts/data/federation_crm_seed.sql` | CRM partition DuckDB seed (**committed artifact**; placeholder until corpus export) |
+| `scripts/data/federation_partition.json` | Per-member physical table roster (**committed artifact**) |
+| `scripts/data/federation_storefront_schema.sql` | Storefront CREATE-only schema (**committed artifact**) |
+| `scripts/data/federation_catalog_schema.sql` | Catalog CREATE-only schema (**committed artifact**) |
+| `scripts/data/federation_logistics_schema.sql` | Logistics CREATE-only schema (**committed artifact**) |
+| `scripts/data/federation_crm_schema.sql` | CRM CREATE-only schema (**committed artifact**) |
+| `scripts/data/federation_*_data/` | Per-member full CSV row dirs (gitignored; produced by `source_rental_shop`) |
+| `scripts/data/federation_*_notes.txt` | Per-member domain notes |
 | `scripts/data/inputs.zip` | Frozen lexicons and name lists |
-| `scripts/sandbox_staging/` | Sandbox bundle staging (gitignored) |
+| `scripts/sandbox_staging/` | Sandbox bundle staging; downsampled federation CSV trees live here until packed (gitignored) |
 | `scripts/<engine>/` | Per-engine load wrappers |
 
 ## Sandbox data model (corpus metadata)
@@ -156,8 +204,11 @@ Hand-maintained metadata under `scripts/data/` — distinct from `sandbox_questi
 | `sandbox_scenarios.json` | Non-standard recording flows: validation-failure mechanisms, feedback-sample anchor questions, allowed rejection text | `sandbox_corpus.py` recording router |
 | `sandbox_handcrafted_fixtures.json` | Pre-authored intent/SQL fixture fragments for selected questions (bypasses live LLM for those slots) | `sandbox_corpus.py` recording router |
 | `sandbox_migration_demo.json` | Bundled column-rename migration demo map | `sandbox_corpus.py` → `migration_map_demo.json` in staging |
-| `sandbox_overrides_demo.json` | Bundled sensitivity/override demo (`staff` hidden columns, `film` description) | `sandbox_corpus.py` → `schema_overrides_demo.json` in staging |
-| `sandbox_space_catalog_notes.txt` | Second AetherSpace notes file for catalog-space demo (inherited-then-refined descriptions) | Bundled into sandbox zip |
+| `sandbox_structure_demo.json` | Bundled sensitivity/structure demo (`staff` hidden columns, `film` description) | `sandbox_corpus.py` → `schema_structure_demo.json` in staging |
+| `federation_storefront_notes.txt` | Storefront member / AetherSpace notes (human domain knowledge) | Bundled into sandbox zip; space + federation member |
+| `federation_catalog_notes.txt` | Catalog member / AetherSpace notes | Bundled into sandbox zip; space + federation member |
+| `federation_logistics_notes.txt` | Logistics member / AetherSpace notes | Bundled into sandbox zip; space + federation member |
+| `federation_crm_notes.txt` | CRM member / AetherSpace notes | Bundled into sandbox zip; space + federation member |
 
 Expectations and scenarios are copied into staging unchanged during builds. User-facing discovery ships as `sandbox_catalog.json` inside `data.zip` (built from scenarios plus paraphrase pairs recorded or generated during corpus build).
 
@@ -166,11 +217,12 @@ Expectations and scenarios are copied into staging unchanged during builds. User
 1. `source_rental_shop.py --generate --enrich-llm`
 2. Confirm FK integrity passes (`verify_csv_integrity()` in the script)
 3. `source_rental_shop.py --pack`
-4. Upload `rental_shop.zip` to Azure; update `DEFAULT_BUNDLE_URL` in `source_rental_shop.py`
+4. Upload `rental_shop.zip` to Azure; keep `DEFAULT_BUNDLE_URL` in `source_rental_shop.py` aligned with the public blob:
+   `https://stdialectsampledata.blob.core.windows.net/aether-dialect-sample-data/rental_shop.zip`
 
 ## Sandbox corpus
 
-Rebuild the shipped offline bundle after DDL, notes, overrides, or question-corpus changes:
+Rebuild the shipped offline bundle after DDL, notes, structure documents, or question-corpus changes:
 
 ```text
 .venv\Scripts\python.exe scripts\sandbox_corpus.py
@@ -182,7 +234,7 @@ Rebuild the shipped offline bundle after DDL, notes, overrides, or question-corp
 
 | Flag | Behaviour |
 | --- | --- |
-| *(no flags)* | Full build: assemble staging, build baseline, record fixtures, validate, and pack. |
+| *(no flags)* | Full build: assemble staging, build baseline, record fixtures, and validate (no `data.zip` pack). |
 | `--repair` | Re-record failing fixture slots when staging fingerprint matches last build. |
 | `--force` | With `--repair` only: re-record every recording slot (not only uncommitted ones). |
 | `--smoke` | End-to-end pipeline with one practice question plus validation/feedback/scenario slots; writes `sandbox_staging.zip` only. |
@@ -192,10 +244,10 @@ Invalid combinations are rejected at startup: `--force` without `--repair`; `--r
 
 ### What full rebuild does
 
-1. Stages seed SQL, notes, overrides, baseline artifacts, and question lists under `scripts/sandbox_staging/`.
-2. Records mock LLM fixtures by driving `AetherEngine.offline_sandbox()` sessions against staged seed (in-memory DuckDB — not file-backed dev DuckDB).
-3. Validates staging (practice questions, consumer reader paths, feedback flows, schema overrides demo).
-4. Packs `src/aetherdialect/sandbox/data.zip` only after validation passes.
+1. Stages DDL, CSV row dirs, notes, structure documents, baseline artifacts, and question lists under `scripts/sandbox_staging/`.
+2. Records mock LLM fixtures by driving `AetherEngine.offline_sandbox()` sessions against staged CSV+DDL (in-memory DuckDB — not file-backed dev DuckDB).
+3. Validates staging (practice questions, consumer reader paths, feedback flows, structure document demo).
+4. Runs pack-time parity assertions (`run_staging_pack_assertions`) without creating `data.zip`.
 
 ### Recording policy
 
@@ -207,7 +259,18 @@ Invalid combinations are rejected at startup: `--force` without `--repair`; `--r
 
 Default recording runs **owner writer slots only** (~50 live LLM traces). Pack-time validation replays **both** owner and consumer reader paths against committed fixtures — consumer expectations stay in `sandbox_expectations.json` but are not re-recorded. Optional `--record-reuse-pairs` records mapped paraphrase pairs in the same warm session to capture reuse-specific traces.
 
-**DuckDB config split:** root `env.env` drives live tests and dev tooling with file-backed DuckDB (`DUCKDB_PATH=scripts/duckdb/rental_shop.duckdb`). Corpus build forces `:memory:` DuckDB seeded from staged `rental_shop_seed.sql`. LLM credentials come from `env.env`.
+### Zero-LLM fixture fan-out
+
+After live recording commits owner-writer fixtures, `run_fixture_fan_out()` derives sibling surface keys without calling the LLM:
+
+1. **Canonical capture** — committed owner-writer rows per question are the source of truth.
+2. **Derive-key replay** — for each target surface (consumer reader on the question's home member, federation owner when eligible), re-key intent payloads by swapping pinned owner/consumer schema literal stubs, then copy or adapt outputs.
+3. **Scope refusals** — full-only questions (not owned by exactly one member space) get deterministic gatekeeper refusal rows for each member space so out-of-scope replay never falls through to a live call.
+4. **Validate** — `finalize_validate()` runs fan-out before `validate_staging_dir()`; derived rows must pass the same `question_ok` / faithfulness gates as live recordings.
+
+Fan-out is wired into `finalize_validate()` and does not require packing `data.zip`.
+
+**DuckDB config split:** root `env.env` drives live tests and dev tooling with file-backed DuckDB (`DUCKDB_PATH=scripts/duckdb/rental_shop.duckdb`). Corpus build forces `:memory:` DuckDB loaded from staged DDL + CSV row dirs. LLM credentials come from `env.env`.
 
 ### Reset generated artifacts (preserve source inputs)
 
@@ -217,7 +280,7 @@ From the repo root (PowerShell):
 Remove-Item -Recurse -Force scripts/sandbox_staging, scripts/sqlite/*.sqlite, .pytest_cache -ErrorAction SilentlyContinue
 Get-ChildItem -Recurse -Filter __pycache__ | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Force src/aetherdialect/sandbox/data.zip -ErrorAction SilentlyContinue
-Remove-Item -Force live_tests/results.txt, live_tests/evidence_*.txt -ErrorAction SilentlyContinue
+Remove-Item -Force scripts/logs/sandbox_results.txt, scripts/logs/sandbox_invoice.txt -ErrorAction SilentlyContinue
 $userData = python -c "from platformdirs import user_data_dir; print(user_data_dir('aetherdialect'))"
 Remove-Item -Recurse -Force $userData -ErrorAction SilentlyContinue
 ```
@@ -228,4 +291,4 @@ Keeps source inputs (`scripts/data/*`, staging SQL/notes, question lists, manife
 
 - ISBNs are hashed/synthetic; activity dates are synthetic (2022–2025 window).
 - Permanent quality gate: **FK integrity only** (`verify_csv_integrity()` in `source_rental_shop.py`).
-- `staff.ssn` is synthetic HR data (hidden tier in overrides), not real sensitive data.
+- `staff.ssn` is synthetic HR data (hidden tier in the corpus structure document), not real sensitive data.

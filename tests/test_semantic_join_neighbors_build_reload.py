@@ -12,7 +12,7 @@ from aetherdialect._schema_graph import (
     recompute_join_paths_multi,
     run_fk_inference_if_disconnected,
 )
-from aetherdialect._schema_overrides import _ensure_semantic_join_neighbors
+from aetherdialect._schema_reflect import ensure_semantic_join_neighbors
 from aetherdialect._sql_gen import join_hints_multi
 from aetherdialect._utils import stable_json
 
@@ -116,7 +116,7 @@ def _fresh_build_graph() -> SchemaGraph:
 
 def _reloaded_graph_from_cache(sg: SchemaGraph) -> SchemaGraph:
     cached = SchemaGraph.from_dict(sg.to_dict())
-    _ensure_semantic_join_neighbors(cached)
+    ensure_semantic_join_neighbors(cached)
     cached.join_paths_multi = recompute_join_paths_multi(cached.tables)
     return cached
 
@@ -148,5 +148,5 @@ def test_connected_fresh_build_and_cache_reload_agree_on_join_candidates() -> No
 def test_connected_schema_round_trip_preserves_semantic_neighbors() -> None:
     built = _fresh_build_graph()
     round_tripped = SchemaGraph.from_dict(copy.deepcopy(built.to_dict()))
-    _ensure_semantic_join_neighbors(round_tripped)
+    ensure_semantic_join_neighbors(round_tripped)
     assert _semantic_neighbors_snapshot(built) == _semantic_neighbors_snapshot(round_tripped)

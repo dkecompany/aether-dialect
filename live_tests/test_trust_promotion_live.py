@@ -5,11 +5,9 @@ from __future__ import annotations
 from aetherdialect._config import PolicyConfig
 from aetherdialect._contracts_core import FeedbackCounts, LiveTestRunner
 from aetherdialect._contracts_schema import TemplateStats
-from aetherdialect._templates import (
-    TemplateOps,
-)
+from aetherdialect._templates_ops import TemplateOps
 
-from ._seed_helpers import (
+from .live_support import (
     intent_customer_first_names,
     isolated_runner,
     seed_template,

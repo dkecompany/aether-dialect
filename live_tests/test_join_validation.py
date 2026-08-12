@@ -7,7 +7,7 @@ from aetherdialect._contracts_core import (
     RuntimeIntent,
     SelectCol,
 )
-from aetherdialect._pipeline import generate_join_candidates
+from aetherdialect._pipeline_generate import generate_join_candidates
 
 
 def _candidate_tables(candidates: list[dict]) -> set[str]:

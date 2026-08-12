@@ -1,4 +1,4 @@
-"""Regression guard against plan-only vocabulary in library, script, and test code."""
+"""Forbid plan-only vocabulary in library, script, and test comment or docstring surfaces."""
 
 from __future__ import annotations
 
@@ -36,6 +36,9 @@ _NOT_YET_IMPLEMENTED_RE = re.compile(r"\bnot yet implemented\b", re.IGNORECASE)
 _FUTURE_WORK_RE = re.compile(r"\bfuture work\b", re.IGNORECASE)
 _LATER_PHASE_RE = re.compile(r"\bin a later phase\b", re.IGNORECASE)
 _PART_REFERENCE_RE = re.compile(r"\bPart [A-Z]\b")
+_WORKSTREAM_RE = re.compile(r"\bWorkstream\b", re.IGNORECASE)
+_BUNDLE_I_RE = re.compile(r"\bBundle I\b")
+_PLAN_GAP_S_RE = re.compile(r"(?<![A-Za-z])S-\d+\b")
 
 _PATTERN_CHECKS: tuple[tuple[re.Pattern[str], str], ...] = (
     (_PLAN_ID_RE, "plan step id"),
@@ -50,6 +53,9 @@ _PATTERN_CHECKS: tuple[tuple[re.Pattern[str], str], ...] = (
     (_PLAN_LETTER_SECTION_RE, "plan letter section id"),
     (_PLAN_ITEMS_RE, "plan items/gaps"),
     (_AUDIT_GAP_RE, "audit gap"),
+    (_WORKSTREAM_RE, "workstream label"),
+    (_BUNDLE_I_RE, "bundle letter label"),
+    (_PLAN_GAP_S_RE, "plan gap S-id"),
 )
 
 _DOCS_ONLY_PATTERN_CHECKS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -294,7 +300,7 @@ def test_docs_part_reference_in_markdown_is_flagged(tmp_path: Path) -> None:
 
 @pytest.mark.fast
 def test_no_plan_metacommentary_in_docs() -> None:
-    """Published documentation must not embed plan vocabulary or roadmap phrasing."""
+    """Published documentation must not embed plan vocabulary or deferred-work phrasing."""
     hits: list[str] = []
     if not _DOCS_ROOT.is_dir():
         pytest.skip("docs directory not present")
@@ -333,3 +339,34 @@ def test_section_letter_identifier_in_data_literal_is_allowed(tmp_path: Path) ->
 def test_domain_phase_allowlist_still_passes_guard() -> None:
     text = "# uses ASK_PHASE_J for pipeline tracing"
     assert not _scan_text_surfaces(Path("sample.py"), [(1, text)])
+
+
+@pytest.mark.fast
+def test_workstream_label_in_docstring_is_flagged(tmp_path: Path) -> None:
+    path = tmp_path / "bad.py"
+    path.write_text('"""Workstream 3: scope enforcement."""\nx = 1\n', encoding="utf-8")
+    hits = _plan_metacommentary_hits(path)
+    assert hits
+
+
+@pytest.mark.fast
+def test_bundle_i_label_in_comment_is_flagged(tmp_path: Path) -> None:
+    path = tmp_path / "bad.py"
+    path.write_text("# Bundle I — sidecar persistence\nx = 1\n", encoding="utf-8")
+    hits = _plan_metacommentary_hits(path)
+    assert hits
+
+
+@pytest.mark.fast
+def test_plan_gap_s_id_in_docstring_is_flagged(tmp_path: Path) -> None:
+    path = tmp_path / "bad.py"
+    path.write_text('"""Covers S-1 through S-9."""\nx = 1\n', encoding="utf-8")
+    hits = _plan_metacommentary_hits(path)
+    assert hits
+
+
+@pytest.mark.fast
+def test_scenario_rs_id_in_docstring_is_allowed(tmp_path: Path) -> None:
+    path = tmp_path / "allowed.py"
+    path.write_text('"""Planner-only CTE aliases map to canonical cteN names (RS-004)."""\nx = 1\n', encoding="utf-8")
+    assert not _plan_metacommentary_hits(path)

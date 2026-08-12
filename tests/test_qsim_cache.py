@@ -6,8 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aetherdialect._contracts_base import ColumnRole
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaGraph, TableMetadata
 from aetherdialect._qsim import (
     clear_engine_skeleton_cache,
     drop_engine_skeleton_cache_owner,

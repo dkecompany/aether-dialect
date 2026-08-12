@@ -16,7 +16,7 @@ pre_fix_failure: dict[str, str | None] = {
 
 def _paths_equal(a: Path | str, b: Path | str) -> bool:
     try:
-        from aetherdialect._core_utils import paths_equal
+        from aetherdialect._utils import paths_equal
     except ImportError:
         return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
     return paths_equal(a, b)
@@ -39,7 +39,7 @@ def test_case_differing_paths_compare_equal_on_windows(tmp_path: Path) -> None:
 
     editor = tmp_path / "mappings.JSON"
     editor.write_text("{}", encoding="utf-8")
-    from aetherdialect._federation import archive_federation_mappings_file
+    from aetherdialect._federation_execute import archive_federation_mappings_file
 
     try:
         archive = archive_federation_mappings_file(str(editor))

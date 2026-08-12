@@ -70,11 +70,10 @@ def test_sandbox_guide_matches_closed_world_surface() -> None:
     lowered = text.lower()
     assert "preset=" not in text
     assert "restricted_consumer" not in text
-    assert "engine_context=scope" in text.replace(" ", "") or "offline_sandbox(engine_context=" in text
     assert "sandbox.engine(" in text
-    assert "with Sandbox() as" in text
+    assert "Sandbox.create_offline_sandbox" in text or "with Sandbox() as" in text
     assert "notes.txt" in text
-    assert "init_notices" in text
+    assert "init_notices" in text or "diagnostic_sink" in text
     assert "resolved to bundled fixture" in text
     assert "maintainer_access" in text
     assert "closed-world" in lowered or "closed world" in lowered
@@ -84,8 +83,9 @@ def test_sandbox_guide_matches_closed_world_surface() -> None:
 @pytest.mark.fast
 def test_api_reference_documents_federation_declaration_surface() -> None:
     text = (_DOCS / "API_REFERENCE.md").read_text(encoding="utf-8")
-    assert "export_federation_declaration" in text
-    assert "declaration_file" in text
+    assert "export_federation" in text
+    assert "apply_federation" in text
+    assert "declaration" in text
 
 
 @pytest.mark.fast
@@ -100,6 +100,17 @@ def test_how_it_works_mentions_federated_member_statements() -> None:
 def test_readme_lists_documentation_reading_order() -> None:
     text = (_REPO / "README.md").read_text(encoding="utf-8")
     assert "Reading order" in text
+
+
+@pytest.mark.fast
+def test_readme_heading_inlines_logo_with_ascii_hyphen() -> None:
+    text = (_REPO / "README.md").read_text(encoding="utf-8")
+    first_line = text.splitlines()[0]
+    assert first_line.startswith("# <img ")
+    assert "docs/aether-logo.svg" in first_line
+    assert "AetherDialect - The" in first_line
+    assert "—" not in first_line
+    assert "prefers-color-scheme" not in text
 
 
 @pytest.mark.fast
@@ -128,7 +139,7 @@ def test_sandbox_data_reference_exists_with_key_sections() -> None:
         "## Single-engine schema",
         "## Views",
         "## Bundled notes and named spaces",
-        "## Overrides and sensitivity fixtures",
+        "## Structure and sensitivity fixtures",
         "## Consumer scopes",
         "## Federation topology",
         "## Question corpus",
@@ -153,9 +164,9 @@ _FORBIDDEN_ARTIFACT_EDIT_PATTERNS = (
     re.compile(r"(?<!never )edit\s+.*sidecars?\s+under", re.IGNORECASE),
 )
 _EXPORT_APPLY_PAIRS = (
-    ("export_overrides", "apply_overrides"),
-    ("export_federation_declaration", "apply_federation_declaration"),
-    ("export_aetherspace", "apply_aetherspace"),
+    ("export_structure", "apply_structure"),
+    ("export_knowledge", "apply_knowledge"),
+    ("export_federation", "apply_federation"),
     ("preview_migration_map", "apply_migration_map"),
 )
 
@@ -167,6 +178,14 @@ _FORBIDDEN_INTERNAL_EXPORT_PATTERNS = (
     re.compile(r"export_federation_mappings\b"),
     re.compile(r"export_manifest\b"),
     re.compile(r"export_mappings\b"),
+)
+_FORBIDDEN_REMOVED_API_PATTERNS = (
+    re.compile(r"\bexport_space_knowledge\b"),
+    re.compile(r"\bapply_space_knowledge\b"),
+    re.compile(r"\bexport_aetherspace\b"),
+    re.compile(r"\bapply_aetherspace\b"),
+    re.compile(r"\bapply_schema_overrides\b"),
+    re.compile(r"\bclear_persisted_overrides\b"),
 )
 _FORBIDDEN_DERIVED_ROSTER_PATTERNS = (
     re.compile(r"derived roster", re.IGNORECASE),
@@ -187,6 +206,23 @@ def _assert_doc_has_no_internal_federation_exports(path: Path) -> None:
         assert match is None, (
             f"{path.name} documents derived federation roster material: {match.group(0)!r}" if match else None
         )
+
+
+@pytest.mark.fast
+def test_integrator_guide_documents_aetherspace_api() -> None:
+    text = _INTEGRATOR_GUIDE.read_text(encoding="utf-8")
+    assert "aetherspace(" in text
+    assert "export_knowledge" in text
+    assert "apply_knowledge" in text
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("doc_path", _DOCS_GUIDES)
+def test_docs_avoid_removed_knowledge_and_structure_api_names(doc_path: Path) -> None:
+    text = doc_path.read_text(encoding="utf-8")
+    for pattern in _FORBIDDEN_REMOVED_API_PATTERNS:
+        match = pattern.search(text)
+        assert match is None, f"{doc_path.name} documents removed API {match.group(0)!r}" if match else None
 
 
 @pytest.mark.fast
@@ -214,15 +250,13 @@ def test_integrator_guide_never_edit_artifacts_sidecars() -> None:
         assert apply_fn in text, f"INTEGRATOR_GUIDE.md must document {apply_fn}"
 
 
-# --- Shared vocabulary across documents ---
-
 _UPLOAD_GUIDES = (
     _DOCS / "INTEGRATOR_GUIDE.md",
     _DOCS / "SUPPORT_MATRIX.md",
     _DOCS / "USER_GUIDE.md",
 )
 _CANONICAL_UPLOAD_PHRASE = "inspect first, then construct"
-_SECURITY_UPLOAD_ANCHOR = "SECURITY.md#58-upload-inspection-csv-file-engine"
+_SECURITY_UPLOAD_ANCHOR = "SECURITY.md#57-upload-inspection-csv-file-engine"
 _ROLE_VOCABULARY_GUIDES = ("INTEGRATOR_GUIDE.md", "SANDBOX.md", "HOW_IT_WORKS.md")
 _FEDERATION_DECLARATION_GUIDES = (
     "GETTING_STARTED.md",
@@ -254,7 +288,7 @@ def test_security_upload_links_use_canonical_anchor() -> None:
     for name in ("USER_GUIDE.md", "INTEGRATOR_GUIDE.md"):
         text = (_DOCS / name).read_text(encoding="utf-8")
         assert _SECURITY_UPLOAD_ANCHOR in text, f"{name} must link to {_SECURITY_UPLOAD_ANCHOR}"
-        assert "#56-upload-inspection" not in text, f"{name} must not use stale security anchor"
+        assert "#56-upload-inspection" not in text, f"{name} must not use superseded security anchor"
 
 
 @pytest.mark.fast
@@ -270,7 +304,7 @@ def test_federation_declaration_canonical_filename() -> None:
     for name in _FEDERATION_DECLARATION_GUIDES:
         text = (_DOCS / name).read_text(encoding="utf-8")
         assert "federation_declaration.json" in text, f"{name} must name federation_declaration.json"
-        assert "declaration_file" in text, f"{name} must document declaration_file="
+        assert "declaration=" in text or "declaration`" in text, f"{name} must document declaration="
 
 
 @pytest.mark.fast
@@ -297,8 +331,8 @@ def test_sandbox_guide_no_internal_federation_exports() -> None:
     for pattern in _FORBIDDEN_INTERNAL_EXPORT_PATTERNS:
         match = pattern.search(text)
         assert match is None, f"SANDBOX.md documents internal federation export {match.group(0)!r}" if match else None
-    assert "export_federation_declaration" in text
-    assert "apply_federation_declaration" in text
+    assert "export_federation" in text
+    assert "apply_federation" in text
 
 
 @pytest.mark.fast
@@ -312,12 +346,12 @@ def test_integrator_guide_owner_vs_consumer_roles_anchor() -> None:
 def test_api_reference_refusal_codes_use_refusal_wording() -> None:
     from aetherdialect._constants import REFUSAL_DIAGNOSTIC_CODES
 
-    text = _API_REFERENCE.read_text(encoding="utf-8")
-    start = text.index("**Terminal refusals**")
-    section = text[start : text.index("**Federation diagnostics**", start)]
+    text = (_DOCS / "TROUBLESHOOTING.md").read_text(encoding="utf-8")
+    start = text.index("## REFUSAL_CATALOGUE")
+    section = text[start : text.index("## SessionStep kind values", start)]
     assert "refusal" in section.lower()
     missing = sorted(code for code in REFUSAL_DIAGNOSTIC_CODES if code not in section)
-    assert not missing, f"API_REFERENCE.md terminal refusals section missing codes: {missing}"
+    assert not missing, f"TROUBLESHOOTING.md REFUSAL_CATALOGUE missing codes: {missing}"
 
 
 @pytest.mark.fast
@@ -478,3 +512,61 @@ def test_docs_avoid_plan_meta_headings(doc_path: Path) -> None:
     if hits:
         rel = doc_path.relative_to(_REPO)
         pytest.fail(f"Plan meta heading(s) in {rel}:\n" + "\n".join(hits))
+
+
+def _markdown_table_pipe_count(line: str) -> int:
+    """Count ``|`` column delimiters, ignoring backslash-escaped pipes."""
+    count = 0
+    index = 0
+    while index < len(line):
+        if line[index] == "\\" and index + 1 < len(line) and line[index + 1] == "|":
+            index += 2
+            continue
+        if line[index] == "|":
+            count += 1
+        index += 1
+    return count
+
+
+def _markdown_table_pipe_mismatches(text: str) -> list[str]:
+    """Return mismatch descriptions for pipe-delimited markdown tables outside fences."""
+    mismatches: list[str] = []
+    in_fence = False
+    table_rows: list[tuple[int, str, int]] = []
+
+    def flush() -> None:
+        nonlocal table_rows
+        if len(table_rows) < 2:
+            table_rows = []
+            return
+        counts = {count for _, _, count in table_rows}
+        if len(counts) > 1:
+            start = table_rows[0][0]
+            detail = ", ".join(f"L{line_no}={count}" for line_no, _, count in table_rows)
+            mismatches.append(f"table starting line {start}: delimiter counts differ ({detail})")
+        table_rows = []
+
+    for line_no, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            flush()
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if line.lstrip().startswith("|"):
+            table_rows.append((line_no, line, _markdown_table_pipe_count(line)))
+        else:
+            flush()
+    flush()
+    return mismatches
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("doc_path", _DOCS_GUIDES)
+def test_docs_markdown_tables_have_consistent_columns(doc_path: Path) -> None:
+    """Every markdown table row must share the same unescaped ``|`` delimiter count. A cell may contain ``|`` only when escaped as ``\\|`` so it does not add a column."""
+    mismatches = _markdown_table_pipe_mismatches(doc_path.read_text(encoding="utf-8"))
+    if mismatches:
+        rel = doc_path.relative_to(_REPO)
+        pytest.fail(f"Inconsistent markdown table columns in {rel}:\n" + "\n".join(mismatches))

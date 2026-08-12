@@ -2,44 +2,44 @@
 
 Hands-on onboarding: install the PyPI extra for your engine, wire credentials, and run your first question. Each `AetherEngine` binds exactly one database. Operator day-to-day semantics live in the [User guide](USER_GUIDE.md); embedding patterns in the [Integrator guide](INTEGRATOR_GUIDE.md). Exact signatures and TOML key tables live in the [API reference](API_REFERENCE.md).
 
-**Reading order:** [README](../README.md) -> this document -> [User guide](USER_GUIDE.md) -> [Integrator guide](INTEGRATOR_GUIDE.md) -> [Sandbox guide](SANDBOX.md) -> [API reference](API_REFERENCE.md) -> [How it works](HOW_IT_WORKS.md) -> [Security](SECURITY.md) -> [Support matrix](SUPPORT_MATRIX.md).
+**Reading order:** [README](../README.md) → [Getting started](GETTING_STARTED.md) → [User guide](USER_GUIDE.md) → [Integrator guide](INTEGRATOR_GUIDE.md) → [Sandbox guide](SANDBOX.md) → [API reference](API_REFERENCE.md) → [Troubleshooting](TROUBLESHOOTING.md) → [How it works](HOW_IT_WORKS.md) → [Security](SECURITY.md) → [Support matrix](SUPPORT_MATRIX.md).
 
 ## Sections
 
 | Section | Contents |
 | --- | --- |
-| [Offline practice](#offline-practice) | One sandbox question |
+| [Try the sandbox](#try-the-sandbox) | One sandbox question |
 | [Connect your warehouse](#connect-your-warehouse) | TOML, notes, construction, first question |
+| [Federation](#federation) | Multiple databases |
 | [When things fail](#when-things-fail) | Common startup errors |
 
 ---
 
 Two onboarding paths:
 
-1. **Offline practice** - bundled rental shop in memory, no warehouse credentials.
-2. **Connect your warehouse** - the same session API against any supported engine.
+1. **Try the sandbox** — bundled rental shop in memory, no warehouse credentials.
+2. **Connect your warehouse** — the same session API against any supported engine.
 
 Install the PyPI extra and TOML block for the engine you use.
 
-**Multiple databases?** Build one `AetherEngine` per connection, author `federation_declaration.json`, then construct `AetherFederation(name, members=..., declaration_file=...)`. The session API is unchanged; federated turns decompose per member and combine in an in-process DuckDB coordinator. Declaration format: [Sandbox - Federation declaration format](SANDBOX.md#federation-declaration-format). Start with [Integrator guide - Embedding a federation](INTEGRATOR_GUIDE.md#embedding-a-federation) after your first single-engine question works.
-
-## Offline practice
+## Try the sandbox
 
 ```bash
 pip install aetherdialect
 ```
 
 ```python
-from aetherdialect import AetherEngine
+from aetherdialect import Sandbox
 
-with AetherEngine.offline_sandbox() as sb:
-    with sb.session() as session:
+with Sandbox() as sandbox:
+    engine = sandbox.engine()
+    with engine.session() as session:
         step = session.accept_until_done("How many films are there?")
     print(step.sql)
     print(step.data)
 ```
 
-Each `offline_sandbox()` call wipes any prior temp artifacts, unpacks the bundled seed, and rebuilds from scratch. When the `with` block ends (or you call `sb.close()`), temp extract directories and owned artifacts are deleted. Full offline exercises: [Sandbox guide](SANDBOX.md).
+Each `Sandbox()` handle is self-contained. When the `with` block ends, temp extract directories and owned artifacts are deleted. Full sandbox walkthrough: [Sandbox guide](SANDBOX.md).
 
 ---
 
@@ -47,14 +47,14 @@ Each `offline_sandbox()` call wipes any prior temp artifacts, unpacks the bundle
 
 ### What you will build
 
-1. `aetherdialect.toml` - LLM credentials plus one database block
-2. Optional `schema_notes.txt` - domain vocabulary (see [User guide - Notes file](USER_GUIDE.md#notes-file))
-3. `ask.py` - constructs `AetherEngine` and runs one question
-4. `./my_run/aetherdialect/<connection_slug>/` - versioned engine storage
+1. `aetherdialect.toml` — LLM credentials plus one database block
+2. Optional `schema_notes.txt` — domain vocabulary (see [User guide — Notes file](USER_GUIDE.md#notes-file))
+3. `ask.py` — constructs `AetherEngine` and runs one question
+4. `./my_run/aetherdialect/<connection_slug>/` — versioned engine storage
 
 ### Pick your engine
 
-Install the matching extra, set `[engine] selected` in TOML (or `AETHERDIALECT_ENGINE`), and fill one database section. Full key lists: [API reference - Configuration](API_REFERENCE.md#configuration) and [Database connection reference](API_REFERENCE.md#database-connection-reference).
+Install the matching extra, set `[engine] selected` in TOML (or `AETHERDIALECT_ENGINE`), and fill one database section. Full key lists: [API reference — Configuration](API_REFERENCE.md#configuration).
 
 There is no separate `excel` engine. CSV and Excel (`.xlsx`) uploads both use the registered `csv` engine.
 
@@ -66,19 +66,16 @@ There is no separate `excel` engine. CSV and Excel (`.xlsx`) uploads both use th
 | MySQL | `aetherdialect[mysql]` | `mysql` | `[mysql]` | - |
 | MariaDB | `aetherdialect[mariadb]` | `mariadb` | `[mariadb]` | - |
 | SQL Server | `aetherdialect[sqlserver]` | `sqlserver` | `[sqlserver]` | - |
+| Oracle | `aetherdialect[oracle]` | `oracle` | `[oracle]` | - |
 | PostgreSQL | `aetherdialect[postgresql]` | `postgresql` | `[postgresql]` | - |
 | Redshift | `aetherdialect[redshift]` | `redshift` | `[redshift]` | - |
 | Databricks | `aetherdialect[databricks]` | `databricks` | `[databricks]` | - |
 | Snowflake | `aetherdialect[snowflake]` | `snowflake` | `[snowflake]` | - |
 | BigQuery | `aetherdialect[bigquery]` | `bigquery` | `[bigquery]` | - |
 
-You also need an OpenAI API key (or Azure OpenAI - see [API reference](API_REFERENCE.md#configuration)).
+You also need an OpenAI API key (or Azure OpenAI — see [API reference](API_REFERENCE.md#configuration)).
 
-For Azure OpenAI, set `AZURE_OPENAI_DEPLOYMENT_LIGHT` and `AZURE_OPENAI_DEPLOYMENT_HEAVY` (or the matching `[azure_openai.deployments]` TOML keys). Azure calls always use reasoning effort (never `temperature`); profile effort `minimal` is remapped to `none` on `gpt-5.4*` logical models. Provider `prompt_cache_key` values are capped at 64 characters.
-
-Optional logical-model overrides (same names as `EngineConfig` ClassVars): `OPENAI_MODEL`, `OPENAI_MODEL_INTENT`, `OPENAI_MODEL_JOIN`, `OPENAI_MODEL_SCHEMA_BASE`, `OPENAI_MODEL_DDL`, `OPENAI_MODEL_SCHEMA`, `OPENAI_MODEL_SYNTH`, `OPENAI_MODEL_SYNTH_VARIETY`, `OPENAI_MODEL_INTENT_FORMAT`, `OPENAI_MODEL_INTENT_SCHEMA_REPAIR`, `OPENAI_MODEL_UPLOAD_SUMMARY`, `OPENAI_MODEL_UPLOAD_INTERPRET`.
-
-### Step 1 - Test the database connection
+### Step 1 — Test the database connection
 
 Confirm connectivity before constructing `AetherEngine`, using the same credentials you will put in TOML:
 
@@ -91,45 +88,11 @@ with engine.connect() as conn:
     print("connected:", row.ok)
 ```
 
-Examples:
-
-```python
-create_engine("sqlite:////absolute/path/to/your.db")
-create_engine("duckdb:////absolute/path/to/your.duckdb")
-create_engine("postgresql+psycopg://user:password@localhost:5432/your_database")
-```
-
 If `SELECT 1` fails, fix credentials or networking before involving the text-to-SQL pipeline.
 
-### Step 2 - Create `aetherdialect.toml`
+### Step 2 — Create `aetherdialect.toml`
 
 Every production setup needs `[engine] selected`, one database block, and LLM credentials.
-
-**SQLite:**
-
-```toml
-[engine]
-selected = "sqlite"
-
-[sqlite]
-path = "/absolute/path/to/your.db"
-
-[openai]
-api_key = "REPLACE_ME"
-```
-
-**DuckDB:**
-
-```toml
-[engine]
-selected = "duckdb"
-
-[duckdb]
-path = "/absolute/path/to/your.duckdb"
-
-[openai]
-api_key = "REPLACE_ME"
-```
 
 **PostgreSQL** (same pattern for MySQL, MariaDB, SQL Server, Redshift with their sections):
 
@@ -147,23 +110,17 @@ schema = "public"
 
 [openai]
 api_key = "REPLACE_ME"
-
-[execution]
-max_query_cost_rows = "10000"
-statement_timeout_ms = "30000"
 ```
 
-Snowflake, Databricks, and BigQuery use different auth shapes. Copy the matching section from the [API reference flattening table](API_REFERENCE.md#config_file-toml-flattening).
+Behavioural limits (timeouts, result caps, pools) are set with `limits=EngineLimits(...)` on the constructor, or `EngineLimits.from_config_file("./aetherdialect.toml")` reading a `[limits]` table.
 
-Environment variables can override mapped keys when the same name is set in the shell.
+When `config_file` is set, TOML values are authoritative for every flattened key the file claims — shell environment variables do not override them. When `config_file` is omitted, the process environment supplies connection identity. Merge order: [API reference — Merge order](API_REFERENCE.md#merge-order).
 
-### Step 3 - Domain notes (optional, recommended)
+### Step 3 — Domain notes (optional, recommended)
 
-Plain text beside your script, passed as `EngineContext.notes_file` (or inline `EngineContext.notes` — set at most one). Use one or two sentences per important table, join hints, and explicit sensitivity statements. The engine uses these to tag roles and tiers. See [User guide - Notes file](USER_GUIDE.md#notes-file) for the format.
+Plain text beside your script, passed as `EngineContext.notes_file` (or inline `EngineContext.notes` — set at most one). See [User guide — Notes file](USER_GUIDE.md#notes-file).
 
-### Step 4 - Wire `EngineContext` and construct the engine
-
-`EngineContext` is frozen scope: which relations enter the graph, optional notes and DDL paths, and allow/deny lists. Set `include="views"` when your warehouse exposes analytical views (default `"tables"`). To reflect both base tables and views, run separate engine constructions or scope passes - `include="both"` is rejected. Semantics: [User guide - EngineContext](USER_GUIDE.md#enginecontext).
+### Step 4 — Wire `EngineContext` and construct the engine
 
 ```python
 from aetherdialect import EngineContext, AetherEngine
@@ -180,50 +137,22 @@ engine = AetherEngine(
 )
 ```
 
-On large catalogs, narrow scope:
+On large catalogs, narrow scope with `allow_objects`.
 
-```python
-ctx = EngineContext(
-    include="tables",
-    notes_file="./schema_notes.txt",
-    allow_objects=frozenset({"orders", "customers", "products"}),
-)
-```
+### Step 5 — First construction
 
-### Step 5 - First construction
+The first construction reflects the catalog and builds a versioned snapshot. See [User guide — First run](USER_GUIDE.md#first-run).
 
-The first construction reflects the catalog and builds a versioned snapshot. Timing scales with table count. See [User guide - First run](USER_GUIDE.md#first-run) for progress detail and drift handling.
-
-### Step 6 - Choose your API
-
-A `SessionStep` is one observable point in a programmatic turn: it carries `kind`, `done`, `prompt`, and optional `sql` / `data` / `error`. Full contract: [Integrator guide - The session contract](INTEGRATOR_GUIDE.md#the-session-contract-suspend-and-terminal-steps).
+### Step 6 — Choose your API
 
 | | `run_interactive()` | `session()` |
 | --- | --- | --- |
 | Output | stdout prompts | `SessionStep` fields |
 | Loop | one question per call | `ask` / `step` until `done` |
-| AetherSpace | optional `space="name"` (default `"master"`) | same `space=` kwarg |
+| AetherSpace | optional `space=<uid>` | same `space=` kwarg |
 | Best for | terminal demos | services, notebooks, MCP |
-| Suspend handling | built-in `input()` | you render `step.prompt`, call `step()` |
 
-Embedded products should use `session()` and branch on `step.kind`.
-
-**Terminal demo:**
-
-```python
-from aetherdialect import EngineContext, AetherEngine
-
-engine = AetherEngine(
-    EngineContext(notes_file="./schema_notes.txt"),
-    artifacts_dir="./my_run",
-    config_file="./aetherdialect.toml",
-)
-engine.run_interactive()
-```
-
-**What you see on stdout:** construction prints profiling progress first. During a turn, `run_interactive()` emits diagnostic messages and shows a prompt before each `input()`. The sequence is the same on every engine. Branch embedded UIs on `SessionStep.kind`, not on parsing prompt text ([Integrator guide](INTEGRATOR_GUIDE.md#the-session-contract-suspend-and-terminal-steps)).
-
-**Programmatic loop** (detail in [Integrator guide - Minimal embedding](INTEGRATOR_GUIDE.md#minimal-embedding-sync)):
+Embedded products should use `session()` and branch on `step.kind`. Full contract: [Integrator guide — The session contract](INTEGRATOR_GUIDE.md#the-session-contract-suspend-and-terminal-steps).
 
 ```python
 with engine.session() as session:
@@ -234,15 +163,21 @@ with engine.session() as session:
     print(step.sql or step.error)
 ```
 
-Sessions default to the **`master`** [AetherSpace](USER_GUIDE.md#aetherspace) unless you pass `space="name"`.
+Omit `space` for the default space (`engine.default_space_uid`). Consumer deployments: [Integrator guide — Multi-user deployment](INTEGRATOR_GUIDE.md#multi-user-deployment).
 
-### Step 7 - Run your first question
+### Step 7 — Run your first question
 
 ```bash
 python ask.py
 ```
 
-Accept/reject behavior and template reuse: [User guide - Asking a question](USER_GUIDE.md#asking-a-question).
+Accept/reject behavior and template reuse: [User guide — Asking a question](USER_GUIDE.md#asking-a-question).
+
+---
+
+## Federation
+
+Build one `AetherEngine` per connection, author a federation declaration dict (suggested persistence name: `federation_declaration.json`), then construct `AetherFederation(name, members=[...], declaration=...)`. The session API is unchanged; federated turns decompose per member and combine in an in-process DuckDB coordinator. Worked example: [Sandbox — Federation walkthrough](SANDBOX.md#federation-walkthrough). Schema: [API reference — Federation documents](API_REFERENCE.md#federation-documents). Embedding guide: [Integrator guide — Embedding a federation](INTEGRATOR_GUIDE.md#embedding-a-federation).
 
 ---
 
@@ -254,10 +189,10 @@ Accept/reject behavior and template reuse: [User guide - Asking a question](USER
 | `ConfigError: ... engine ...` | Multiple engines configured | Set `[engine] selected` |
 | `DatabaseConnectionError` / `DatabasePingFailed` | Bad DB credentials or network | Re-run Step 1 |
 | Silence after `Profiling [1/N]` | Profiling in progress | Wait; narrow `allow_objects` |
-| `MigrationPendingError` | Catalog drift | Edit `schema_migration_map.json` - [User guide](USER_GUIDE.md#migration) |
+| `MigrationPendingError` | Catalog drift | Apply migration map — [User guide](USER_GUIDE.md#migration) |
 
-Full procedure: [User guide - Common pitfalls](USER_GUIDE.md#common-pitfalls).
+Full procedure: [User guide — Common pitfalls](USER_GUIDE.md#common-pitfalls).
 
 ---
 
-**See also:** [User guide](USER_GUIDE.md) | [Integrator guide](INTEGRATOR_GUIDE.md) | [Sandbox guide](SANDBOX.md) | [API reference](API_REFERENCE.md) | [How it works](HOW_IT_WORKS.md) | [Security](SECURITY.md) | [Support matrix](SUPPORT_MATRIX.md) | [README](../README.md)
+**See also:** [User guide](USER_GUIDE.md) | [Integrator guide](INTEGRATOR_GUIDE.md) | [Sandbox guide](SANDBOX.md) | [API reference](API_REFERENCE.md) | [Troubleshooting](TROUBLESHOOTING.md) | [How it works](HOW_IT_WORKS.md) | [Security](SECURITY.md) | [Support matrix](SUPPORT_MATRIX.md) | [README](../README.md)

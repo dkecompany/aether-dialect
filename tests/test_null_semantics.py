@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._constants import (
-    DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST,
-    REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE,
-)
+from aetherdialect._constants import DIAGNOSTIC_CODE_REFUSAL_NULL_IN_NEGATED_LIST
+from aetherdialect._constants_runtime import REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE
 from aetherdialect._contracts_base import (
     NormalizedExpr,
     PredicateGroup,
@@ -15,11 +13,11 @@ from aetherdialect._contracts_base import (
 )
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import refusal_diagnostic_code_for_intent_issue
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._intent_repair import decompose_in_not_in_where
+from aetherdialect._intent_normalize import decompose_in_not_in_where
 from aetherdialect._sql_gen import build_deterministic_sql, render_predicate_clause
-from aetherdialect._validation_execute import validate_semantics
+from aetherdialect._utils import refusal_diagnostic_code_for_intent_issue
+from aetherdialect._validation_sql import validate_semantics
 
 
 def _schema(*, nullable: bool = True) -> SchemaGraph:

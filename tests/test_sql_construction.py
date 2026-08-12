@@ -17,21 +17,21 @@ from aetherdialect._contracts_base import (
     WhereParam,
 )
 from aetherdialect._contracts_core import RuntimeIntent
-from aetherdialect._core_utils import reconcile_execute_bind_params
+from aetherdialect._contracts_schema import SchemaGraph
 from aetherdialect._dialect import Dialect, DialectRegistry
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_helper import SqlAlchemyResultBackend
-from aetherdialect._schema_graph import SchemaGraph
 from aetherdialect._sql_gen import (
     _join_clause_parts_with_bool_op,
     _quote_simple_qualified_mul_token,
     _render_predicate_group_sql,
     wrap_core_sql_with_distinct_on,
 )
+from aetherdialect._utils import reconcile_execute_bind_params
 
 
 class _MinimalDialect(Dialect):
-    """Dialect stub for finalize_render bind-preservation tests."""
+    """Minimal dialect for finalize_render bind-preservation tests."""
 
     name = "minimal"
     sqlglot_dialect = "postgres"
@@ -259,6 +259,7 @@ def test_sqlglot_quote_identifier_helper_exists_and_matches_generator() -> None:
         ("mysql", "mysql", True),
         ("redshift", "redshift", True),
         ("sqlserver", "tsql", True),
+        ("oracle", "oracle", True),
         ("bigquery", "bigquery", True),
         ("databricks", "databricks", True),
         ("sqlite", "sqlite", True),
@@ -271,9 +272,10 @@ def test_dialect_quote_identifier_routes_through_sqlglot(engine: str, sqlglot_na
 
     dialect = DialectRegistry.get_dialect_class(engine).__new__(DialectRegistry.get_dialect_class(engine))
     for ident in ("order", "reserved", 'x"y'):
-        expected = _expected_sqlglot_quote(ident, sqlglot_name, quoted=quoted)
+        fold = str(ident).upper() if engine == "oracle" else ident
+        expected = _expected_sqlglot_quote(fold, sqlglot_name, quoted=quoted)
         assert dialect.quote_identifier(ident) == expected
-        assert dialect.quote_identifier(ident) == Dialect.sqlglot_quote_identifier(ident, sqlglot_name, quoted=True)
+        assert dialect.quote_identifier(ident) == Dialect.sqlglot_quote_identifier(fold, sqlglot_name, quoted=True)
 
 
 @pytest.mark.fast
@@ -285,6 +287,7 @@ def test_dialect_quote_identifier_routes_through_sqlglot(engine: str, sqlglot_na
         ("mysql", "mysql", True),
         ("redshift", "redshift", True),
         ("sqlserver", "tsql", True),
+        ("oracle", "oracle", True),
         ("bigquery", "bigquery", True),
         ("databricks", "databricks", True),
         ("sqlite", "sqlite", True),
@@ -297,7 +300,13 @@ def test_dialect_quote_table_column_routes_through_sqlglot(engine: str, sqlglot_
 
     dialect = DialectRegistry.get_dialect_class(engine).__new__(DialectRegistry.get_dialect_class(engine))
     got = dialect.quote_table_column("orders", "status")
-    expected = Dialect.sqlglot_quote_table_column("orders", "status", sqlglot_name, quoted=quoted)
+    if engine == "oracle":
+        expected = (
+            f"{Dialect.sqlglot_quote_identifier('ORDERS', sqlglot_name, quoted=quoted)}"
+            f".{Dialect.sqlglot_quote_identifier('STATUS', sqlglot_name, quoted=quoted)}"
+        )
+    else:
+        expected = Dialect.sqlglot_quote_table_column("orders", "status", sqlglot_name, quoted=quoted)
     assert got == expected
 
 

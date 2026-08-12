@@ -8,11 +8,9 @@ import pytest
 
 from aetherdialect._config import DuckDBRuntimeConfig
 from aetherdialect._contracts_base import (
-    ColumnRole,
     EngineIdentity,
     NormalizedExpr,
     PredicateGroup,
-    TableRole,
     WhereParam,
 )
 from aetherdialect._contracts_core import (
@@ -23,13 +21,15 @@ from aetherdialect._contracts_core import (
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
+    ColumnRole,
     FKEdge,
     SchemaGraph,
     SQLShape,
     TableMetadata,
+    TableRole,
     TemplateStats,
 )
-from aetherdialect._schema_catalog import assign_column_ops
+from aetherdialect._schema_profile import assign_column_ops
 
 
 def duckdb_engine_identity() -> EngineIdentity:
@@ -41,17 +41,26 @@ def duckdb_engine_identity() -> EngineIdentity:
 def _default_engine_identity() -> Any:
     """Bind a default engine identity for tests that call pipeline helpers directly."""
     from aetherdialect._config import EngineConfig
-    from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
+    from aetherdialect._utils import pop_engine_identity, push_engine_identity
 
     token = push_engine_identity(EngineIdentity(EngineConfig.TYPE, EngineConfig.RUNTIME))
     yield
     pop_engine_identity(token)
 
 
+@pytest.fixture(autouse=True)
+def _clear_knowledge_extraction_memo() -> Any:
+    from aetherdialect._schema_profile import _EXTRACTION_MEMO
+
+    _EXTRACTION_MEMO.clear()
+    yield
+    _EXTRACTION_MEMO.clear()
+
+
 @pytest.fixture
 def unbound_engine_identity() -> Any:
     """Clear the autouse engine identity so unbound-path assertions can run."""
-    from aetherdialect._core_utils import _ACTIVE_ENGINE_IDENTITY
+    from aetherdialect._utils import _ACTIVE_ENGINE_IDENTITY
 
     token = _ACTIVE_ENGINE_IDENTITY.set(None)
     yield
@@ -59,7 +68,7 @@ def unbound_engine_identity() -> Any:
 
 
 def _term_str(term: Any) -> str:
-    """Render a multiply/divide leaf as the legacy display string ('*', 'COUNT(*)', 'tbl.col', etc.)."""
+    """Render a multiply/divide leaf as the display string ('*', 'COUNT(*)', 'tbl.col', etc.)."""
     if isinstance(term, str):
         return term
     if not isinstance(term, NormalizedExpr):
@@ -78,54 +87,11 @@ def _term_str(term: Any) -> str:
 
 
 def term_strs(terms: Any) -> list[str]:
-    """Map a sequence of multiply/divide leaves to legacy display strings."""
+    """Map a sequence of multiply/divide leaves to display strings."""
     return [_term_str(t) for t in (terms or [])]
 
 
-_SLOW_SANDBOX_TESTS = frozenset(
-    {
-        "test_tour_question",
-        "test_playground_question",
-        "test_paraphrase_question",
-        "test_catalog_paraphrase_hits_direct_reuse_after_accept",
-        "test_rental_shop_category_film_emits_non_empty_join_path",
-    }
-)
-
-_SLOW_SANDBOX_MODULES = frozenset(
-    {
-        "test_sandbox_scenarios.py",
-        "test_sandbox_recording_isolation.py",
-    }
-)
-
-_SLOW_SANDBOX_OFFLINE_TESTS = frozenset(
-    {
-        "test_sandbox_question",
-        "test_validation_failure_question",
-        "test_practice_questions_have_mock_fixture_coverage",
-        "test_fixture_corpus_covers_consumer_reader_practice",
-        "test_assert_sandbox_complete_with_corpus",
-        "test_feedback_samples_rejection_flow",
-        "test_rank_films_question",
-        "test_direct_reuse_2025_2026_pair",
-        "test_recipe_chat_basics_produces_sql",
-        "test_recipe_rejections_completes",
-        "test_template_reuse_second_question",
-        "test_reader_writer_queue",
-        "test_recipe_validation_failures",
-        "test_recipe_full_session_completes",
-        "test_aetherspace_demo",
-        "test_restricted_consumer_permission_denied",
-        "test_deny_columns_column_security",
-        "test_consumer_reader_preset_first_question",
-        "test_owner_bundled_overrides",
-        "test_consumer_override_proposal_only",
-        "test_session_active_error",
-    }
-)
-
-_FAST_TEST_MAX_SECS = 25.0
+_FAST_TEST_MAX_SECS = 10.0
 
 _SANDBOX_BUNDLE_MODULES = frozenset(
     {
@@ -159,19 +125,20 @@ _SANDBOX_AUTHORING_NO_CORPUS_TESTS = frozenset(
 )
 
 
-def _is_slow_sandbox_test(item: pytest.Item) -> bool:
-    nodeid = item.nodeid.replace("\\", "/")
-    for mod in _SLOW_SANDBOX_MODULES:
-        if mod in nodeid:
-            return True
-    base_name = item.name.split("[", 1)[0]
-    if base_name in _SLOW_SANDBOX_TESTS:
-        return True
-    fspath = getattr(item, "path", None) or getattr(item, "fspath", None)
-    mod = fspath.name if fspath is not None else ""
-    if mod == "test_sandbox_offline.py":
-        return base_name in _SLOW_SANDBOX_OFFLINE_TESTS
-    return False
+def _is_not_fast_test(item: pytest.Item) -> bool:
+    """Return True when the item opted out of the auto-applied ``fast`` marker."""
+    return item.get_closest_marker("not_fast") is not None
+
+
+def _strip_fast_markers(item: pytest.Item) -> None:
+    """Remove ``fast`` markers so ``pytest -m fast`` does not select ``not_fast`` items."""
+    markers = getattr(item, "own_markers", None)
+    if markers is None:
+        return
+    item.own_markers = [m for m in markers if getattr(m, "name", None) != "fast"]
+    keywords = getattr(item, "keywords", None)
+    if isinstance(keywords, dict):
+        keywords.pop("fast", None)
 
 
 def _is_live_test(item: pytest.Item) -> bool:
@@ -241,8 +208,8 @@ def stub_schema_llm_classifier(monkeypatch: pytest.MonkeyPatch) -> None:
     def _noop(schema: Any, notes_content: str | None = None, **kwargs: Any) -> None:
         return None
 
-    monkeypatch.setattr("aetherdialect._schema_overrides.apply_column_roles_llm", _noop)
-    monkeypatch.setattr("aetherdialect._schema_graph.apply_column_roles_llm", _noop)
+    monkeypatch.setattr("aetherdialect._schema_profile.apply_column_roles_llm", _noop)
+    monkeypatch.setattr("aetherdialect._schema_finalize.apply_column_roles_llm", _noop)
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -251,30 +218,37 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if _is_live_test(item):
             continue
+        if _is_not_fast_test(item):
+            _strip_fast_markers(item)
         if _requires_corpus_bundle(item):
             item.add_marker(pytest.mark.needs_corpus)
             if not sandbox_ready:
                 item.add_marker(skip_corpus)
-            elif not _is_slow_sandbox_test(item):
+            elif not _is_not_fast_test(item):
                 item.add_marker(pytest.mark.fast)
-        elif not _is_slow_sandbox_test(item):
+        elif not _is_not_fast_test(item):
             item.add_marker(pytest.mark.fast)
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
-    """Warn when a ``fast`` test exceeds the per-test fast budget (marker drift guard)."""
+    """Warn on marker/budget drift for ``fast`` and ``not_fast`` unit tests."""
     if report.when != "call" or not report.passed:
         return
     duration = getattr(report, "duration", None)
-    if duration is None or duration <= _FAST_TEST_MAX_SECS:
+    if duration is None:
         return
     keywords = getattr(report, "keywords", {})
-    if "fast" not in keywords:
+    if "fast" in keywords and duration > _FAST_TEST_MAX_SECS:
+        print(
+            f"\nNOT FAST ({duration:.1f}s > {_FAST_TEST_MAX_SECS}s): {report.nodeid}",
+            flush=True,
+        )
         return
-    print(
-        f"\nNOT FAST ({duration:.1f}s > {_FAST_TEST_MAX_SECS}s): {report.nodeid}",
-        flush=True,
-    )
+    if "not_fast" in keywords and duration < _FAST_TEST_MAX_SECS:
+        print(
+            f"\nUNEXPECTEDLY FAST ({duration:.1f}s < {_FAST_TEST_MAX_SECS}s): {report.nodeid}",
+            flush=True,
+        )
 
 
 @pytest.fixture(autouse=True)

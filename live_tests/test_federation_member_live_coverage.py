@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from ._federation_live import (
+from .live_support import (
     build_federation_live_engine,
     ensure_federation_partitions_loaded,
     federation_partitions_available,
 )
-from ._federation_member_assertions import (
+from .mydb_profile import (
     assert_delivery_rental_cross_source_linked_count,
     assert_median_payment_refused_for_mysql_family,
     assert_staff_email_from_storefront_authoritative,

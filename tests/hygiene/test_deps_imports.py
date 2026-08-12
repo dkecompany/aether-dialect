@@ -97,7 +97,8 @@ OPTIONAL_LAZY_FUNCTION_ROOTS = frozenset({"pyarrow", "google", "snowflake", "pys
 
 KNOWN_OPTIONAL_TOP_LEVEL: dict[str, frozenset[str]] = {
     "_main_execution.py": frozenset({"pyspark"}),
-    "_schema_overrides.py": frozenset({"pyspark"}),
+    "_main_init.py": frozenset({"pyspark"}),
+    "_schema_finalize.py": frozenset({"pyspark"}),
 }
 
 

@@ -4,25 +4,27 @@ from __future__ import annotations
 
 import pytest
 
+from aetherdialect import Sandbox
 from aetherdialect._config import PolicyConfig
 from aetherdialect._constants import (
     DIAGNOSTIC_CODE_JOIN_CANDIDATE_CAP,
     DIAGNOSTIC_CODE_JOIN_PATH_TIE_CEILING_EXCEEDED,
     JOIN_PATH_TIE_REFUSAL_CEILING,
 )
-from aetherdialect._contracts_base import JoinPathTieCapExceededError
+from aetherdialect._contracts_base import StructuralKnowledgeFact, StructuralKnowledgeKind
+from aetherdialect._contracts_core import JoinCandidateCapExceededError, JoinPathTieCapExceededError
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
-    drain_diagnostic_collector,
-    reset_diagnostic_collector,
-    set_diagnostic_collector,
-)
 from aetherdialect._schema_graph import join_path_pair_tie_count, recompute_join_paths_multi
 from aetherdialect._sql_gen import (
-    JoinCandidateCapExceededError,
     _candidate_join_paths_for_tables,
     _join_path_signature_for_path,
     join_hints_multi,
+    pin_join_paths_multi,
+)
+from aetherdialect._utils import (
+    drain_diagnostic_collector,
+    reset_diagnostic_collector,
+    set_diagnostic_collector,
 )
 
 
@@ -91,6 +93,38 @@ def test_pair_within_tie_cap_survives_query_time_enumeration() -> None:
     assert paths
 
 
+@pytest.mark.fast
+def test_declared_pinning_prunes_before_tie_cap_refusal() -> None:
+    """A multi-tie pair above the tie cap serves once a declared path is pinned."""
+    tables = _parallel_mid_tables(5)
+    join_paths_multi = recompute_join_paths_multi(tables)
+    assert len(join_paths_multi["src"]["dst"]) > PolicyConfig.JOIN_SHORTEST_PATH_TIE_CAP
+    schema = SchemaGraph(
+        tables=tables,
+        join_paths_multi=join_paths_multi,
+        effective_structural_hash="tie_pin",
+    )
+    pinned_path = join_paths_multi["src"]["dst"][0]
+    declared_sig = _join_path_signature_for_path(pinned_path, schema)
+    referenced: set[str] = set()
+    for segment in declared_sig:
+        left, right = segment.split("->", 1)
+        referenced.add(left.strip())
+        referenced.add(right.strip())
+    fact = StructuralKnowledgeFact.normalize(
+        StructuralKnowledgeFact(
+            kind=StructuralKnowledgeKind.JOIN.value,
+            text="prefer one bridge",
+            referenced_entities=frozenset(referenced),
+            payload={"path_signature": declared_sig},
+        )
+    )
+    pin_join_paths_multi(schema, (fact,))
+    paths = _candidate_join_paths_for_tables(schema, ["src", "dst"])
+    assert len(paths) == 1
+    assert _join_path_signature_for_path(paths[0], schema) == declared_sig
+
+
 def _cross_product_ambiguity_schema(variants_per_leg: int) -> SchemaGraph:
     tables: dict[str, TableMetadata] = {
         "root": TableMetadata(name="root", columns={"id": _col("id")}, primary_key=["id"], foreign_keys=[]),
@@ -154,7 +188,7 @@ def test_rental_game_supported_language_staff_emits_sixteen_candidates() -> None
     pytest.importorskip("duckdb")
     from aetherdialect import AetherEngine
 
-    with AetherEngine.offline_sandbox() as sb:
+    with Sandbox.create_offline_sandbox(AetherEngine) as sb:
         schema = sb.engine._schema_graph
     hints = join_hints_multi(schema, ["game_supported_language", "staff"])
     substantive = [candidate for candidate in hints.get("candidates", []) if candidate.get("join_path_signature")]

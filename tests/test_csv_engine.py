@@ -35,7 +35,7 @@ def _reset_csv_runtime_config() -> None:
         CsvRuntimeConfig.DIRECTORY = None
         CsvRuntimeConfig.FILES = ()
         CsvRuntimeConfig.set_source_selections({})
-        CsvRuntimeConfig.clear_attached_connection()
+        CsvRuntimeConfig.NATIVE_CONNECTION = None
         yield
     finally:
         CsvRuntimeConfig.DIRECTORY = orig_directory
@@ -268,8 +268,8 @@ api_key = "test-key"
 def _patch_csv_schema_llm() -> ExitStack:
     stack = ExitStack()
     stack.enter_context(patch("aetherdialect._data_quality.LLMProvider.json", side_effect=_mock_upload_llm_json))
-    stack.enter_context(patch("aetherdialect._schema_overrides._profile_subset"))
-    stack.enter_context(patch("aetherdialect._schema_overrides.apply_column_roles_llm"))
+    stack.enter_context(patch("aetherdialect._schema_finalize._profile_subset"))
+    stack.enter_context(patch("aetherdialect._schema_finalize.apply_column_roles_llm"))
     return stack
 
 

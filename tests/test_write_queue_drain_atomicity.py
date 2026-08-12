@@ -9,11 +9,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._constants import WRITE_QUEUE_FILENAME
-from aetherdialect._contracts_base import WriteQueueEvent
-from aetherdialect._contracts_core import FeedbackKind, QuestionFeedbackEntry, RejectionBucket
-from aetherdialect._core_utils import emit_write_queue_event
+from aetherdialect._contracts_core import FeedbackKind, QuestionFeedbackEntry, RejectionBucket, WriteQueueEvent
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import emit_write_queue_event
 
 
 @pytest.mark.fast
@@ -46,14 +45,14 @@ def test_crash_after_apply_before_save_keeps_queue(monkeypatch: pytest.MonkeyPat
         produced_at=ts,
         payload=(("q_norm", "q1"), ("entry_json", json.dumps(entry.to_dict()))),
     )
-    emit_write_queue_event(str(tmp_path), ev)
+    emit_write_queue_event(str(tmp_path), ev, space_name="master")
     queue_path = tmp_path / WRITE_QUEUE_FILENAME
     original_bytes = queue_path.read_bytes()
 
     def _save_raises(_store: object) -> None:
         raise OSError("simulated crash before persist")
 
-    monkeypatch.setattr("aetherdialect._templates.TemplateOps.save_template_store", _save_raises)
+    monkeypatch.setattr("aetherdialect._templates_ops.TemplateOps.save_template_store", _save_raises)
 
     applied = MainExecutionOps.drain_write_queue(owner, str(tmp_path))
     assert applied == 0

@@ -14,8 +14,7 @@ _SRC = _ROOT / "src" / "aetherdialect"
 _PARENTS_ESCAPE_RE = re.compile(
     r"\.parents\[(?:[2-9]|\d{2,})\]",
 )
-# Concatenated raw strings (not triple-quotes) keep docformatter from
-# treating pattern bodies as docstrings and oscillating with ruff-format.
+# Concatenated raw strings avoid treating the pattern body as a docstring.
 _REPO_DIR_LITERAL_RE = re.compile(
     (
         r"Scripts[\\/]data | scripts[\\/]logs | dev_workspace[\\/] |"
@@ -205,7 +204,7 @@ _DEV_WORKSPACE_PATH_RE = re.compile(
 _DEV_WORKSPACE_MENTION_ALLOWLIST = frozenset(
     {
         "tests/hygiene/test_repo_layout.py",
-        "tests/test_sync_to_public.py",
+        "tests/hygiene/test_tree_boundaries.py",
     }
 )
 
@@ -245,7 +244,7 @@ def test_shipped_trees_do_not_reference_dev_workspace() -> None:
 
 @pytest.mark.fast
 def test_package_root_escape_scanner_catches_violations() -> None:
-    """Guardrail: extended scanner must fail on representative escape patterns."""
+    """Extended scanner must fail on representative escape patterns."""
     samples = [
         'ROOT = Path(__file__).resolve().parents[2] / "scripts"\n',
         "p = Path(__file__).resolve().parents[3]\n",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import SessionStep
+from aetherdialect._contracts_core import SessionStep
 
 
 @pytest.mark.fast

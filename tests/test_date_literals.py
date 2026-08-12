@@ -28,7 +28,7 @@ def _pg_render():
 
 @pytest.mark.fast
 def test_ambiguous_date_refused() -> None:
-    from aetherdialect._contracts_base import AmbiguousDateLiteralError
+    from aetherdialect._contracts_core import AmbiguousDateLiteralError
 
     pred = WhereParam(
         left_expr=NormalizedExpr(add_groups=[MulGroup(multiply=["t.d"])], sub_groups=[]),

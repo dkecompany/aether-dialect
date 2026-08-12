@@ -24,7 +24,7 @@ def test_warmup_writes_hold_the_artifact_lock(
     cells = {"k1": ["alpha"]}
 
     lock_calls: list[str] = []
-    real_lock = __import__("aetherdialect._core_utils", fromlist=["artifact_lock"]).artifact_lock
+    real_lock = __import__("aetherdialect._utils_artifacts", fromlist=["artifact_lock"]).artifact_lock
 
     def tracking_lock(artifacts_dir_arg: str, *args: object, **kwargs: object) -> object:
         lock_calls.append(os.path.abspath(str(artifacts_dir_arg)))

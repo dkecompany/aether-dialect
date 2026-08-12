@@ -12,16 +12,16 @@ from aetherdialect._constants import (
     FEDERATION_JOIN_FEEDBACK_PREFIX,
     FEDERATION_TEMPLATES_SEGMENT,
 )
-from aetherdialect._contracts_base import FederationPlanTemplate
-from aetherdialect._core_utils import normalize_question
-from aetherdialect._federation import (
-    federation_artifact_paths,
+from aetherdialect._contracts_schema import FederationPlanTemplate
+from aetherdialect._federation_execute import (
     load_federation_plan_templates,
     lookup_federation_join_feedback,
     record_federation_join_feedback,
     save_federation_plan_template,
 )
+from aetherdialect._federation_manifest import federation_artifact_paths
 from aetherdialect._templates import TemplateStoreView
+from aetherdialect._utils import normalize_question
 
 
 def _plan_template(plan_id: str = "plan_1", question: str = "join left and right") -> FederationPlanTemplate:

@@ -4,32 +4,39 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import FederationInvariantError, FederationMappings
+from aetherdialect._contracts_base import FederationInvariantError, NormalizedExpr
 from aetherdialect._contracts_core import (
     FederatedPlan,
     FederatedStage,
     JoinSpec,
     RuntimeCteStep,
     RuntimeIntent,
+    SelectCol,
     SourceStep,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata, WindowRegistryStep, WindowSpec
-from aetherdialect._federation import (
-    _build_combine_join_tree,
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FederationMappings,
+    SchemaGraph,
+    TableMetadata,
+    WindowRegistryStep,
+    WindowSpec,
+)
+from aetherdialect._federation_execute import order_federation_execution_steps
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import (
     _collect_member_reducing_edges,
     _member_window_rows_are_final,
     _render_coordinator_spanning_cte_sql,
     _render_federation_combine_sql,
     _window_requires_coordinator,
     apply_projected_keys_to_intent,
+    build_combine_join_tree,
     derive_execution_order_from_stages,
     derive_federation_stages_in_order,
     federation_plan_is_degenerate,
-    order_federation_execution_steps,
-    parse_federation_manifest,
     plan_federated_stages,
 )
-from aetherdialect._intent_expr import NormalizedExpr, SelectCol
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -39,7 +46,7 @@ def test_build_combine_join_tree_star_topology() -> None:
         JoinSpec("a", "d", "id", "id", "id", "inner"),
         JoinSpec("b", "d", "id", "id", "id", "inner"),
     )
-    tree = _build_combine_join_tree(join_specs, {"a", "b", "d"})
+    tree = build_combine_join_tree(join_specs, {"a", "b", "d"})
     assert tree.source_id == "d"
     assert len(tree.children) == 2
 
@@ -117,7 +124,7 @@ def test_plan_stages_include_reducing_edges_and_spanning_cte() -> None:
         manifest=manifest,
     )
     reducing = _collect_member_reducing_edges(
-        manifest, FederationMappings(version="0.2.1"), sources, intent, source_by_table
+        manifest, FederationMappings(version="0.2.3"), sources, intent, source_by_table
     )
     assert reducing
     member_stages = [stage for stage in stages if stage.kind == "member"]
@@ -586,7 +593,10 @@ def test_order_steps_uses_schema_selectivity() -> None:
 
 @pytest.mark.fast
 def test_federation_stage_execution_waves_respect_dependencies() -> None:
-    from aetherdialect._federation import federation_execution_wave_member_steps, federation_stage_execution_waves
+    from aetherdialect._federation_execute import (
+        federation_execution_wave_member_steps,
+        federation_stage_execution_waves,
+    )
 
     plan = FederatedPlan(
         steps=(
@@ -642,7 +652,10 @@ def test_federation_stage_execution_waves_respect_dependencies() -> None:
 
 @pytest.mark.fast
 def test_execution_waves_cover_spanning_cte_and_coordinator_stages() -> None:
-    from aetherdialect._federation import federation_execution_wave_member_steps, federation_stage_execution_waves
+    from aetherdialect._federation_execute import (
+        federation_execution_wave_member_steps,
+        federation_stage_execution_waves,
+    )
 
     plan = FederatedPlan(
         steps=(
@@ -701,7 +714,7 @@ def test_execution_waves_cover_spanning_cte_and_coordinator_stages() -> None:
 
 @pytest.mark.fast
 def test_execution_waves_cycle_raises_invariant_error() -> None:
-    from aetherdialect._federation import federation_stage_execution_waves
+    from aetherdialect._federation_execute import federation_stage_execution_waves
 
     plan = FederatedPlan(
         steps=(),

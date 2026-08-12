@@ -4,21 +4,22 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import DescriptionOwner
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import ColumnMetadata, DescriptionOwner, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import (
     _merge_column_metadata_strictest,
     compose_composite_graph,
-    parse_federation_manifest,
-    parse_federation_mappings,
     reconcile_composite_classifications,
 )
-from aetherdialect._schema_build import tables_meta_to_schema_graph
-from aetherdialect._schema_catalog import (
+from aetherdialect._federation_manifest import (
+    parse_federation_manifest,
+    parse_federation_mappings,
+)
+from aetherdialect._schema_profile import (
     apply_catalog_descriptions_from_tables_meta,
     apply_column_roles_llm,
     parse_sql_file,
 )
+from aetherdialect._schema_reflect import tables_meta_to_schema_graph
 from tests.federation_helpers import stamp_union_disjointness_profiling
 
 
@@ -77,7 +78,7 @@ def _payment_union_fixtures(
     members["b"].tables["payment"].row_count = 1
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -188,7 +189,7 @@ def test_apply_column_roles_llm_with_notes_writes_notes_owner(monkeypatch: pytes
             )
         }
 
-    monkeypatch.setattr("aetherdialect._schema_catalog.llm_classify_schema", _fake_classify)
+    monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", _fake_classify)
     apply_column_roles_llm(sg, notes_content="Domain notes about orders.")
     assert sg.tables["orders"].description_owner == DescriptionOwner.NOTES
     assert sg.tables["orders"].columns["id"].description_owner == DescriptionOwner.NOTES
@@ -235,7 +236,7 @@ def test_reconcile_composite_llm_conflict_uses_notes_owner(monkeypatch: pytest.M
         _ = notes
         return {"payment": (None, "Unified payments", {})}
 
-    monkeypatch.setattr("aetherdialect._federation.llm_classify_schema", _fake_classify)
+    monkeypatch.setattr("aetherdialect._schema_profile.llm_classify_schema", _fake_classify)
     composite = compose_composite_graph(
         members,
         manifest,

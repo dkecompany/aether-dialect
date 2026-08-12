@@ -6,17 +6,11 @@ import json
 
 import pytest
 
-from aetherdialect._constants import INTERPRET_FIELDS
-from aetherdialect._contracts_base import (
-    DescriptionOwner,
-    FederationMemberUnprofilableError,
-)
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    _member_graph_is_profiled,
-    _merge_column_metadata_union_statistics,
-    assert_federation_member_graph_profiled,
-)
+from aetherdialect._constants_runtime import INTERPRET_FIELDS
+from aetherdialect._contracts_base import FederationMemberUnprofilableError
+from aetherdialect._contracts_schema import ColumnMetadata, DescriptionOwner, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import _merge_column_metadata_union_statistics
+from aetherdialect._federation_manifest import _member_graph_is_profiled, assert_federation_member_graph_profiled
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 

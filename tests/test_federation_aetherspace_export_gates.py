@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import ConfigError
 from tests.test_aether_federation_public_surface import _fed
 
 
 @pytest.mark.fast
-def test_federation_export_aetherspace_requires_master_context() -> None:
+def test_federation_export_structure_callable_outside_master_label() -> None:
     fed = _fed()
     fed._context_name = "team_scope"
-    with pytest.raises(ConfigError, match="requires the master engine context"):
-        fed.export_aetherspace("master")
+    doc = fed.export_structure()
+    assert isinstance(doc, dict)
+    assert "tables" in doc
 
 
 @pytest.mark.fast
-def test_federation_list_aetherspaces_requires_master_context() -> None:
+def test_federation_list_aetherspaces_callable_outside_master_label() -> None:
     fed = _fed()
     fed._context_name = "team_scope"
-    with pytest.raises(ConfigError, match="requires the master engine context"):
-        fed.list_aetherspaces()
+    spaces = fed.list_aetherspaces()
+    assert isinstance(spaces, (list, tuple))

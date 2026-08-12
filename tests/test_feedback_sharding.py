@@ -15,8 +15,10 @@ from aetherdialect._constants import (
 )
 from aetherdialect._contracts_base import ConfigError
 from aetherdialect._contracts_core import FeedbackKind, QuestionFeedbackEntry, RejectionBucket
-from aetherdialect._core_utils import normalize_question, write_gzip_json_atomic
-from aetherdialect._templates import TemplateOps, TemplateStoreView
+from aetherdialect._templates import TemplateStoreView
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import normalize_question
+from aetherdialect._utils_artifacts import write_gzip_json_atomic
 
 
 def _store_dir(tmp_path) -> str:
@@ -66,7 +68,7 @@ def _loaded_feedback_partition_count(view: TemplateStoreView) -> int:
     return len(view._feedback_partition_cache)
 
 
-@pytest.mark.fast
+@pytest.mark.not_fast
 def test_header_size_independent_of_question_count(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(PolicyConfig, "REGENERATE_TEMPLATE_STORE", False)
     monkeypatch.setattr(EngineConfig, "TEMPLATE_STORE_DIR", str(tmp_path / "intent_templates"))

@@ -12,10 +12,11 @@ import pytest
 from aetherdialect._config import EngineConfig, PolicyConfig
 from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import read_gzip_json
 from aetherdialect._dialect import Dialect
+from aetherdialect._schema_finalize import build_schema_graph
 from aetherdialect._schema_graph import assign_schema_graph_hashes, compute_dialect_probe, recompute_join_paths_multi
-from aetherdialect._schema_overrides import build_schema_graph, save_schema_to_cache
+from aetherdialect._schema_reflect import save_schema_to_cache
+from aetherdialect._utils_artifacts import read_gzip_json
 
 
 class _ProbeStubDialect(Dialect):
@@ -107,7 +108,7 @@ def test_cached_join_paths_multi_stale_enumeration_version_recomputes(cache_path
     raw = read_gzip_json(cache_path)
     assert len(raw["join_paths_multi"]["src"]["dst"]) == PolicyConfig.JOIN_SHORTEST_PATH_TIE_CAP
     raw.pop("join_path_enumeration_version", None)
-    from aetherdialect._core_utils import write_gzip_json_atomic
+    from aetherdialect._utils_artifacts import write_gzip_json_atomic
 
     write_gzip_json_atomic(cache_path, raw, sort_keys=True)
 

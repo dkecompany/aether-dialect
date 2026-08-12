@@ -8,28 +8,27 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect import AetherFederation, _main_execution
-from aetherdialect._constants import FEDERATION_MIGRATION_MAP_FILENAME, MIGRATION_MAP_ACTION_REMAP
+from aetherdialect import AetherFederation, _main_execution, _main_init
+from aetherdialect._constants import MIGRATION_MAP_ACTION_REMAP
 from aetherdialect._contracts_base import (
     EngineContext,
     FederationContext,
-    LLMConfig,
     MigrationPendingError,
-    RuntimeConfig,
     SchemaMigrationMap,
     SchemaMigrationMapEntry,
 )
+from aetherdialect._contracts_core import LLMConfig, RuntimeConfig
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import load_runtime_config, write_artifact_manifest
-from aetherdialect._federation import (
+from aetherdialect._federation_execute import (
     compute_federation_storage_dir,
-    federation_artifact_paths,
     load_federation_composite_graph,
 )
+from aetherdialect._federation_manifest import federation_artifact_paths
 from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._schema_overrides import save_schema_to_cache
-from aetherdialect._templates import TemplateOps
+from aetherdialect._schema_reflect import save_schema_to_cache
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import load_runtime_config, write_artifact_manifest
 from tests.federation_helpers import write_federation_declaration_file
 
 
@@ -122,7 +121,7 @@ def _bootstrap_federation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tu
     AetherFederation(
         "fed_gate",
         members=mock_members,
-        declaration_file=str(declaration_path),
+        declaration=str(declaration_path),
         artifacts_dir=str(tmp_path),
     )
     return mock_members, declaration_path
@@ -211,13 +210,13 @@ def test_post_map_rebuild_bypasses_schema_cache(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
 
     with (
-        patch("aetherdialect._main_execution.MainExecutionOps.compute_engine_storage_dir", return_value=artifacts_dir),
-        patch("aetherdialect._main_execution.DialectRegistry.get", return_value=MagicMock()),
-        patch("aetherdialect._main_execution.build_schema_graph_with_diff", side_effect=_build_graph),
-        patch("aetherdialect._templates.TemplateOps.load_template_store", return_value=MagicMock()),
-        patch("aetherdialect._templates.TemplateOps.store_to_templates", return_value={}),
+        patch("aetherdialect._main_init.MainInitOps.compute_engine_storage_dir", return_value=artifacts_dir),
+        patch("aetherdialect._dialect.DialectRegistry.get", return_value=MagicMock()),
+        patch("aetherdialect._main_init.build_schema_graph_with_diff", side_effect=_build_graph),
+        patch("aetherdialect._templates_ops.TemplateOps.load_template_store", return_value=MagicMock()),
+        patch("aetherdialect._templates_ops.TemplateOps.store_to_templates", return_value={}),
         patch(
-            "aetherdialect._templates.TemplateOps.apply_schema_migration_map",
+            "aetherdialect._templates_ops.TemplateOps.apply_schema_migration_map",
             wraps=TemplateOps.apply_schema_migration_map,
         ),
     ):
@@ -260,25 +259,24 @@ def test_federation_composite_remap_drift_raises_before_persist(
     manifest_path.write_text(json.dumps(stored), encoding="utf-8")
 
     persist_calls: list[str] = []
-    real_persist = _main_execution.persist_federation_tree
+    real_persist = _main_init.persist_federation_tree
 
     def _spy_persist(federation_dir: str, **kwargs) -> None:
         persist_calls.append(federation_dir)
         real_persist(federation_dir, **kwargs)
 
-    with patch("aetherdialect._main_execution.persist_federation_tree", side_effect=_spy_persist):
-        with pytest.raises(MigrationPendingError, match="Federation migration required"):
+    with patch("aetherdialect._main_init.persist_federation_tree", side_effect=_spy_persist):
+        with pytest.raises(MigrationPendingError, match="Federation migration required") as pending:
             AetherFederation(
                 "fed_gate",
                 members=mock_members,
-                declaration_file=str(declaration_path),
+                declaration=str(declaration_path),
                 artifacts_dir=str(tmp_path),
             )
 
     assert persist_calls == []
     assert Path(paths["composite_schema"]).read_bytes() == composite_before
-    skeleton_path = Path(fed_dir) / FEDERATION_MIGRATION_MAP_FILENAME
-    assert skeleton_path.is_file()
+    assert isinstance(pending.value.skeleton_document, dict)
 
 
 @pytest.mark.fast
@@ -299,7 +297,7 @@ def test_federation_notes_change_soft_refreshes_when_member_replay_matches(
     AetherFederation(
         "fed_gate",
         members=mock_members,
-        declaration_file=str(declaration_path),
+        declaration=str(declaration_path),
         artifacts_dir=str(tmp_path),
         context=context,
     )
@@ -313,7 +311,7 @@ def test_federation_notes_change_soft_refreshes_when_member_replay_matches(
     AetherFederation(
         "fed_gate",
         members=mock_members,
-        declaration_file=str(declaration_path),
+        declaration=str(declaration_path),
         artifacts_dir=str(tmp_path),
         context=context,
     )

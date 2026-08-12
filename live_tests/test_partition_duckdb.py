@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ._engine_live import build_engine_t2s, skip_unless_configured
+from .live_support import build_engine_t2s, skip_unless_configured
 
 _ENGINE = "duckdb"
 _SKIP_REASON = skip_unless_configured(_ENGINE)

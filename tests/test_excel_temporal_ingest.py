@@ -8,15 +8,15 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._constants import DATA_QUALITY_ISSUE_MIXED_TYPES
-from aetherdialect._contracts_schema import ColumnMetadata
-from aetherdialect._core_utils import data_type_to_value_type
+from aetherdialect._constants_runtime import DATA_QUALITY_ISSUE_MIXED_TYPES
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole
 from aetherdialect._data_quality import (
     prepare_relations_for_paths,
     validate_upload_sources,
 )
 from aetherdialect._dialect_sqlglot_engines import CsvDialect
-from aetherdialect._schema_catalog import ColumnRole, _infer_column_role
+from aetherdialect._schema_profile import _infer_column_role
+from aetherdialect._utils import data_type_to_value_type
 
 
 def _mock_llm_json(system: str, user: str, retries: int = 1, task: str = "default") -> dict[str, object]:

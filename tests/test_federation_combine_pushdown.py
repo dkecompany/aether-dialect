@@ -15,12 +15,11 @@ from aetherdialect._contracts_base import (
     WhereParam,
 )
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    FederationMappings,
+from aetherdialect._contracts_schema import ColumnMetadata, FederationMappings, SchemaGraph, TableMetadata
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import (
     _collect_member_reducing_edges,
     member_stage_for_source,
-    parse_federation_manifest,
     plan_federated_intent,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
@@ -87,7 +86,7 @@ def test_left_combine_does_not_reduce_preserved_member() -> None:
     )
     reducing = _collect_member_reducing_edges(
         manifest,
-        FederationMappings(version="0.2.1"),
+        FederationMappings(version="0.2.3"),
         sources,
         intent,
         source_by_table,
@@ -165,17 +164,17 @@ def test_left_combine_semijoin_fallback_skips_preserved_member(monkeypatch: pyte
         assert intent is not None
         return [(row["id"],) for row in _member_rows_for_intent(intent)]
 
-    monkeypatch.setattr("aetherdialect._pipeline.generate_and_validate_sql", _fake_generate_and_validate_sql)
-    monkeypatch.setattr("aetherdialect._pipeline.execute_guarded_sql", _fake_execute_guarded_sql)
-    monkeypatch.setattr("aetherdialect._pipeline.validate_federated_sub_intent", lambda *_a, **_k: None)
+    monkeypatch.setattr("aetherdialect._pipeline_execute.generate_and_validate_sql", _fake_generate_and_validate_sql)
+    monkeypatch.setattr("aetherdialect._pipeline_execute.execute_guarded_sql", _fake_execute_guarded_sql)
+    monkeypatch.setattr("aetherdialect._federation_execute.validate_federated_sub_intent", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        "aetherdialect._validation_execute.validate_sql",
+        "aetherdialect._federation_execute.validate_sql",
         lambda *a, **k: (True, None, None, None),
     )
     mock_dialect = MagicMock()
     mock_dialect.finalize_render.return_value = "SELECT id FROM ta"
 
-    from aetherdialect._pipeline import _execute_federation_source_step
+    from aetherdialect._pipeline_execute import _execute_federation_source_step
 
     frame = _execute_federation_source_step(
         preserved_step,

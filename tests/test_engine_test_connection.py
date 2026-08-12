@@ -17,6 +17,7 @@ _ENGINES = [
     "duckdb",
     "mariadb",
     "mysql",
+    "oracle",
     "postgresql",
     "redshift",
     "snowflake",

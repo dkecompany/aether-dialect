@@ -9,7 +9,7 @@ import pytest
 from aetherdialect._constants import MIGRATION_MAP_ACTION_DESTRUCTIVE, MIGRATION_MAP_ACTION_REMAP
 from aetherdialect._contracts_base import MigrationTier
 from aetherdialect._contracts_schema import SchemaDiff, TableDiff
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 @pytest.mark.fast

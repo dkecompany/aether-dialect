@@ -21,12 +21,13 @@ from aetherdialect._dialect_sqlglot_engines import (
     DuckDBDialect,
     MariaDBDialect,
     MySQLDialect,
+    OracleDialect,
     RedshiftDialect,
     SnowflakeDialect,
     SQLServerDialect,
 )
 from aetherdialect._dialect_sqlglot_helper import PartitionSqlAdapter
-from aetherdialect._schema_build import (
+from aetherdialect._schema_reflect import (
     enrich_postgresql_partition_columns,
     merge_ddl_partition_columns_into_schema_graph,
     parse_mysql_partition_columns,
@@ -113,6 +114,7 @@ PRUNING_DIALECTS: list[tuple[str, type, Callable[[], Any], str]] = [
     ("mysql", MySQLDialect, lambda: _dialect_shell(MySQLDialect), "`events`.`dt` = :p1"),
     ("mariadb", MariaDBDialect, lambda: _dialect_shell(MariaDBDialect), "`events`.`dt` = :p1"),
     ("sqlserver", SQLServerDialect, lambda: _dialect_shell(SQLServerDialect), "[events].[dt] = :p1"),
+    ("oracle", OracleDialect, lambda: _dialect_shell(OracleDialect), '"EVENTS"."DT" = :p1'),
     ("bigquery", BigQueryDialect, lambda: _dialect_shell(BigQueryDialect), "`events`.`dt` = :p1"),
 ]
 

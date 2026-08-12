@@ -23,6 +23,7 @@ _ISO_WEEK_MARKERS: dict[str, tuple[str, ...]] = {
     "mariadb": ("WEEKDAY",),
     "bigquery": ("MONDAY",),
     "sqlserver": ("% 7",),
+    "oracle": ("IW",),
     "sqlite": ("strftime", "%w"),
     "databricks": ("DATE_TRUNC", "WEEK"),
     "snowflake": ("DATE_TRUNC",),

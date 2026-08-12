@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import FederationConfigError
-from aetherdialect._contracts_base import FederationPlanTemplate
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     FederatedPlan,
@@ -17,12 +17,21 @@ from aetherdialect._contracts_core import (
     SourceStep,
     SqlGenerationOutcome,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._pipeline import execute_reuse_with_params, replay_federated_prepare_from_plan_template
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FederationPlanTemplate,
+    FKEdge,
+    SchemaGraph,
+    SQLShape,
+    TableMetadata,
+    TemplateStats,
+)
+from aetherdialect._pipeline_execute import (
+    execute_reuse_with_params,
+    replay_federated_prepare_from_plan_template,
+)
 
 _JOIN_SEG = "child.parent_id->parent.id"
 
@@ -126,16 +135,14 @@ def _fed_member_schema(*, with_fk: bool = True) -> SchemaGraph:
     )
 
 
-@patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
-@patch("aetherdialect._templates.TemplateOps.save_template_store")
-@patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
-@patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
-@patch("aetherdialect._pipeline.save_result_csv_for_store")
-@patch("aetherdialect._pipeline.print_query_result")
-@patch("aetherdialect._templates.TemplateOps.promote_trust")
-@patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
+@patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}')
+@patch("aetherdialect._templates_ops.TemplateOps.save_template_store")
+@patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+@patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question")
+@patch("aetherdialect._pipeline_execute.save_result_csv_for_store")
+@patch("aetherdialect._pipeline_execute.print_query_result")
+@patch("aetherdialect._templates_ops.TemplateOps.promote_trust")
 def test_stale_join_path_skips_direct_reuse(
-    _mock_val,
     _mock_promote,
     _mock_print,
     _mock_csv,
@@ -149,6 +156,8 @@ def test_stale_join_path_skips_direct_reuse(
     dialect.finalize_render.return_value = "EXEC"
     dialect.explain_validation_sql = lambda sql, _pv: sql
     dialect.execute.return_value = [("row",)]
+    dialect.ast_validate_full.return_value = []
+    dialect.can_explain.return_value = False
     store: dict = {"templates": {"T1": tmpl}}
 
     live = execute_reuse_with_params(
@@ -183,16 +192,14 @@ def test_stale_join_path_skips_direct_reuse(
     dialect.execute.assert_not_called()
 
 
-@patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
-@patch("aetherdialect._templates.TemplateOps.save_template_store")
-@patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
-@patch("aetherdialect._templates.TemplateOps.delete_rejected_templates_matching_question")
-@patch("aetherdialect._pipeline.save_result_csv_for_store")
-@patch("aetherdialect._pipeline.print_query_result")
-@patch("aetherdialect._templates.TemplateOps.promote_trust")
-@patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
+@patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}')
+@patch("aetherdialect._templates_ops.TemplateOps.save_template_store")
+@patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+@patch("aetherdialect._templates_ops.TemplateOps.delete_rejected_templates_matching_question")
+@patch("aetherdialect._pipeline_execute.save_result_csv_for_store")
+@patch("aetherdialect._pipeline_execute.print_query_result")
+@patch("aetherdialect._templates_ops.TemplateOps.promote_trust")
 def test_restored_join_path_allows_direct_reuse_again(
-    _mock_val,
     _mock_promote,
     _mock_print,
     _mock_csv,
@@ -206,6 +213,8 @@ def test_restored_join_path_allows_direct_reuse_again(
     dialect.finalize_render.return_value = "EXEC"
     dialect.explain_validation_sql = lambda sql, _pv: sql
     dialect.execute.return_value = [("row",)]
+    dialect.ast_validate_full.return_value = []
+    dialect.can_explain.return_value = False
     store: dict = {"templates": {"T1": tmpl}}
 
     assert (
@@ -274,7 +283,7 @@ def test_federated_member_schema_change_refuses_plan_replay() -> None:
     dialect = MagicMock()
     sql = "SELECT child.id FROM child JOIN parent ON child.parent_id = parent.id"
     gen_out = SqlGenerationOutcome(sql, True, None, tmpl)
-    with patch("aetherdialect._pipeline.generate_and_validate_sql", return_value=gen_out):
+    with patch("aetherdialect._pipeline_execute.generate_and_validate_sql", return_value=gen_out):
         replay = replay_federated_prepare_from_plan_template(
             plan,
             cached,

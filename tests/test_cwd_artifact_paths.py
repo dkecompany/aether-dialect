@@ -8,9 +8,9 @@ from unittest.mock import MagicMock
 import pandas
 import pytest
 
-import aetherdialect._pipeline
-from aetherdialect._core_utils import pipeline_capture
+import aetherdialect._pipeline_execute
 from aetherdialect._seed_warmup import SeedWarmupCacheSession
+from aetherdialect._utils import pipeline_capture
 
 run_seed_warmup_execution = SeedWarmupCacheSession.run_seed_warmup_execution
 
@@ -19,12 +19,12 @@ def test_save_result_csv_rejects_missing_output_path(tmp_path, monkeypatch):
     """save_result_csv must not fall back to process cwd."""
     monkeypatch.chdir(tmp_path)
     with pytest.raises(ValueError, match="output_path"):
-        aetherdialect._pipeline.save_result_csv(pandas.DataFrame({"col": [1]}))
+        aetherdialect._pipeline_execute.save_result_csv(pandas.DataFrame({"col": [1]}))
 
 
 def test_results_csv_output_path_rejects_cwd_fallback():
     with pytest.raises(ValueError, match="artifacts_dir"):
-        aetherdialect._pipeline.results_csv_output_path()
+        aetherdialect._pipeline_execute.results_csv_output_path()
 
 
 def test_save_result_csv_writes_to_explicit_path_not_cwd(tmp_path, monkeypatch):
@@ -37,7 +37,7 @@ def test_save_result_csv_writes_to_explicit_path_not_cwd(tmp_path, monkeypatch):
 
     df = pandas.DataFrame({"col": [1, 2]})
     dest = explicit_dir / "results.csv"
-    aetherdialect._pipeline.save_result_csv(df, output_path=dest)
+    aetherdialect._pipeline_execute.save_result_csv(df, output_path=dest)
 
     assert dest.exists()
     assert not (wrong_dir / "results.csv").exists()
@@ -61,7 +61,7 @@ def test_pipeline_capture_does_not_chdir(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "chdir", tracking_chdir)
 
     with pipeline_capture(["y"], csv_dir=str(csv_dir)):
-        aetherdialect._pipeline.save_result_csv(pandas.DataFrame({"a": [1]}))
+        aetherdialect._pipeline_execute.save_result_csv(pandas.DataFrame({"a": [1]}))
 
     assert chdir_calls == []
     assert (csv_dir / "results.csv").exists()

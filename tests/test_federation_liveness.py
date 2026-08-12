@@ -6,10 +6,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from aetherdialect._constants import SESSION_KIND_ERROR
+from aetherdialect._contracts_core import SessionOutcome
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._main_execution import SESSION_KIND_ERROR, PipelineSession
+from aetherdialect._main_session import PipelineSession
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _member_table(name: str, source_id: str) -> TableMetadata:
@@ -58,8 +60,8 @@ def test_federation_turn_start_probes_member_connections() -> None:
     owner = _federation_owner(members=members)
     session = PipelineSession(owner)
 
-    with patch("aetherdialect._main_execution.probe_federation_member_liveness") as probe_mock:
-        with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once"):
+    with patch("aetherdialect._main_session.probe_federation_member_liveness") as probe_mock:
+        with patch("aetherdialect._main_init.MainInitOps.interactive_run_once"):
             session.ask("how many t")
 
     probe_mock.assert_called_once_with(members)
@@ -72,14 +74,14 @@ def test_stale_connection_surfaces_as_probe_error_not_partial_failure() -> None:
     owner = _federation_owner(members={"west": member})
     session = PipelineSession(owner)
 
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once"):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once"):
         step = session.ask("how many t")
 
     assert step.done is True
     assert step.kind == SESSION_KIND_ERROR
-    assert step.federation_source_id == "west"
-    assert step.federation_phase == "prepare"
-    assert step.federation_succeeded == ()
     assert step.error is not None
-    assert "connection reset" not in step.error
-    assert step.status != "federation_partial_failure"
+    assert step.error.source_id == "west"
+    assert step.error.phase == "prepare"
+    assert "connection reset" not in str(step.error)
+    assert step.error.code != SessionOutcome.EXECUTION_FAILED
+    assert not any(d.code == "FEDERATION_PARTIAL_FAILURE" for d in step.diagnostics)

@@ -14,8 +14,10 @@ from aetherdialect._contracts_core import (
     RuntimeIntent,
     SourceStep,
 )
-from aetherdialect._federation import compose_composite_graph, federation_plan_is_degenerate, parse_federation_manifest
-from aetherdialect._pipeline import execute_federated_prepare
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import federation_plan_is_degenerate
+from aetherdialect._pipeline_execute import execute_federated_prepare
 
 
 def _degenerate_prepared() -> tuple[FederatedPrepareOutcome, object]:
@@ -82,8 +84,8 @@ def test_degenerate_execution_emits_member_executed_diagnostic() -> None:
             diagnostics.append((str(code), str(kwargs.get("source_id", ""))))
 
     with (
-        patch("aetherdialect._pipeline.execute_guarded_sql", return_value=[(1,), (2,)]),
-        patch("aetherdialect._pipeline.notify", side_effect=_capture_notify),
+        patch("aetherdialect._pipeline_execute.execute_guarded_sql", return_value=[(1,), (2,)]),
+        patch("aetherdialect._pipeline_execute.notify", side_effect=_capture_notify),
     ):
         execute_federated_prepare(
             prepared,
@@ -100,7 +102,7 @@ def test_degenerate_execution_sets_statement_duration_ms() -> None:
     prepared, composite = _degenerate_prepared()
     dialect = MagicMock()
     dialect.finalize_render.return_value = "SELECT id FROM left_t"
-    with patch("aetherdialect._pipeline.execute_guarded_sql", return_value=[(1,), (2,)]):
+    with patch("aetherdialect._pipeline_execute.execute_guarded_sql", return_value=[(1,), (2,)]):
         outcome = execute_federated_prepare(
             prepared,
             composite,

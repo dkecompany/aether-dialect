@@ -24,7 +24,7 @@ def _matching_schema() -> SchemaGraph:
 
 
 @pytest.mark.fast
-def test_matching_hashes_still_destructive_when_format_stale() -> None:
+def test_matching_hashes_destructive_when_format_stale() -> None:
     schema = _matching_schema()
     manifest = ArtifactManifest(
         artifact_format_version="0.0.0",

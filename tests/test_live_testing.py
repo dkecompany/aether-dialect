@@ -7,11 +7,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import FeedbackMode, NormalizedExpr, QuestionRoute, QuestionValidationResult
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     Expected,
+    FeedbackMode,
     GenerationPath,
+    QuestionRoute,
+    QuestionValidationResult,
     RuntimeCteStep,
     RuntimeIntent,
     Scenario,
@@ -20,11 +23,11 @@ from aetherdialect._contracts_core import (
     SoftAssert,
     SoftFailure,
     SqlGenerationOutcome,
+    StepResult,
     Template,
     ValueHistory,
 )
 from aetherdialect._contracts_schema import SQLShape, TemplateStats
-from aetherdialect._core_utils import StepResult, _make_input_responder, _make_prompt_responders
 from aetherdialect._live_testing import (
     _assert_scenario,
     _assertion_table_names,
@@ -33,6 +36,7 @@ from aetherdialect._live_testing import (
     run_and_assert,
     run_sequence_and_assert,
 )
+from aetherdialect._utils import _make_input_responder, _make_prompt_responders
 
 
 class TestSoftAssert:
@@ -1019,7 +1023,7 @@ class TestAssertionTableNames:
                     select_cols=[SelectCol(expr=NormalizedExpr.from_column("cte1.id"))],
                 ),
             ],
-            planner_cte_names=["cte1", "cte2"],
+            interpret_cte_names=["cte1", "cte2"],
         )
         sql = (
             'WITH cte1 AS (SELECT "tbl_a"."id" FROM "tbl_a" INNER JOIN "tbl_b" ON "tbl_a"."id" = "tbl_b"."id") '
@@ -1046,7 +1050,7 @@ class TestAssertionTableNames:
 def test_run_pipeline_core_refuses_federated_composite_schema() -> None:
     from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
     from aetherdialect._schema_graph import recompute_join_paths_multi
-    from aetherdialect._templates import TemplateOps
+    from aetherdialect._templates_ops import TemplateOps
 
     composite = SchemaGraph(
         tables={

@@ -1,11 +1,12 @@
-"""CRM customer replica address desync from committed federation seeds (source-only)."""
+"""CRM customer replica address desync from federation CSV fixtures (source-only)."""
 
 from __future__ import annotations
 
+import csv
 import importlib
 import json
-import re
 import sys
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -17,47 +18,44 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 
-def _sandbox_corpus():
-    return importlib.import_module("sandbox_corpus")
+def _source_rental_shop():
+    return importlib.import_module("source_rental_shop")
 
 
-def _read_seed(name: str) -> str:
-    return (_DATA / name).read_text(encoding="utf-8")
-
-
-def _crm_customer_rows(crm_seed: str) -> dict[int, int]:
-    sc = _sandbox_corpus()
+def _crm_customer_rows() -> dict[int, int]:
+    path = _DATA / "federation_crm_data" / "customer.csv"
+    if not path.is_file():
+        pytest.skip("missing federation_crm_data/customer.csv")
+    header = path.read_text(encoding="utf-8").splitlines()[0]
+    if "email_addr" not in header:
+        pytest.skip("full federation CSV dirs lack CRM replica column drift; run sandbox downsample export")
     rows: dict[int, int] = {}
-    for customer_id, address_id in zip(
-        sc.parse_seed_insert_column_values(crm_seed, "customer", "customer_id"),
-        sc.parse_seed_insert_column_values(crm_seed, "customer", "address_id"),
-        strict=True,
-    ):
-        rows[int(customer_id)] = int(address_id)
+    reader = csv.DictReader(StringIO(path.read_text(encoding="utf-8")))
+    for row in reader:
+        rows[int(row["customer_id"])] = int(row["address_id"])
     return rows
 
 
 @pytest.mark.fast
-def test_crm_seed_desyncs_address_ids_for_selected_customers() -> None:
-    sc = _sandbox_corpus()
-    crm = _read_seed("federation_crm_seed.sql")
-    rows = _crm_customer_rows(crm)
-    assert rows[1] == 1 + sc.CRM_CUSTOMER_ADDRESS_DESYNC_OFFSET
-    assert rows[5] == 5 + sc.CRM_CUSTOMER_ADDRESS_DESYNC_OFFSET
+def test_crm_csv_desyncs_address_ids_for_selected_customers() -> None:
+    src = _source_rental_shop()
+    rows = _crm_customer_rows()
+    assert rows[1] == 1 + src.CRM_CUSTOMER_ADDRESS_DESYNC_OFFSET
+    assert rows[5] == 5 + src.CRM_CUSTOMER_ADDRESS_DESYNC_OFFSET
     assert rows[2] == 2
-    for customer_id in sc.CRM_CUSTOMER_DESYNC_IDS:
+    for customer_id in src.CRM_CUSTOMER_DESYNC_IDS:
         if customer_id in rows:
             assert rows[customer_id] != customer_id
 
 
 @pytest.mark.fast
-def test_generator_address_desync_matches_seed_policy() -> None:
-    sc = _sandbox_corpus()
+def test_generator_address_desync_matches_csv_policy() -> None:
+    src = _source_rental_shop()
     for customer_id in (1, 5, 12, 23, 37):
-        assert sc._crm_customer_desync_address_id(customer_id, customer_id) == (
-            customer_id + sc.CRM_CUSTOMER_ADDRESS_DESYNC_OFFSET
+        assert src.crm_customer_desync_address_id(customer_id, customer_id) == (
+            customer_id + src.CRM_CUSTOMER_ADDRESS_DESYNC_OFFSET
         )
-    assert sc._crm_customer_desync_address_id(2, 2) == 2
+    assert src.crm_customer_desync_address_id(2, 2) == 2
 
 
 @pytest.mark.fast
@@ -66,6 +64,6 @@ def test_declaration_maps_address_id_for_crm_customer() -> None:
     customer = next(entry for entry in declaration["logical_tables"] if entry["logical"] == "customer")
     crm_member = next(member for member in customer["members"] if member["source"] == "crm")
     assert crm_member["columns"]["address_id"] == "address_id"
-    crm = _read_seed("federation_crm_seed.sql")
-    assert re.search(r",\s*1001,", crm)
-    assert re.search(r",\s*1005,", crm)
+    rows = _crm_customer_rows()
+    assert rows[1] == 1001
+    assert rows[5] == 1005

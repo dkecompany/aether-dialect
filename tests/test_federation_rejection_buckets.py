@@ -8,25 +8,25 @@ import pytest
 from aetherdialect._contracts_base import (
     FederationJoinFanOutError,
     FederationMalformedMemberAnswerError,
+    NormalizedExpr,
 )
 from aetherdialect._contracts_core import (
     FederatedPlan,
     JoinSpec,
-    NormalizedExpr,
     RejectionBucket,
     RuntimeIntent,
     SelectCol,
     SourceStep,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    compose_composite_graph,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import (
     execute_federation_coordinator,
-    parse_federation_manifest,
-    plan_federated_intent,
     validate_coordinator_join_fan_out,
     validate_member_frame_projection,
 )
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 

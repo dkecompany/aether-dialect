@@ -11,7 +11,7 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
 )
 from aetherdialect._schema_graph import consumer_graph_is_permission_subset
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _table(name: str) -> TableMetadata:

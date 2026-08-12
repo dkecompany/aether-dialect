@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import EngineLimits, FederationLimits
-from aetherdialect._core_utils import (
+from aetherdialect._utils import (
     sqlalchemy_pool_kwargs_from_limits,
     validate_federation_pool_capacity,
 )
@@ -32,7 +32,7 @@ def test_pool_arguments_reach_create_engine() -> None:
 
     with (
         patch("aetherdialect._dialect_postgres.create_engine", side_effect=_record_create),
-        patch("aetherdialect._dialect_postgres.PostgresDialect._require_pglast"),
+        patch("aetherdialect._dialect_postgres.PostgresDialect.require_pglast"),
         patch(
             "aetherdialect._dialect_postgres.PostgresRuntimeConfig.db_url",
             return_value="postgresql+psycopg://user:pass@localhost/db",
@@ -54,6 +54,6 @@ def test_undersized_pool_reports() -> None:
         "b": MagicMock(limits=EngineLimits(pool_size=1, pool_max_overflow=0)),
     }
     fed_limits = FederationLimits(max_parallel_members=4)
-    with patch("aetherdialect._core_utils.notify") as notify_mock:
+    with patch("aetherdialect._utils.notify") as notify_mock:
         validate_federation_pool_capacity(members, fed_limits)
     notify_mock.assert_called()

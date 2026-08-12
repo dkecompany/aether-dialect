@@ -3,7 +3,6 @@
 import pytest
 
 from aetherdialect._contracts_base import (
-    ColumnRole,
     HavingParam,
     MulGroup,
     NormalizedExpr,
@@ -23,23 +22,39 @@ from aetherdialect._contracts_schema import (
     CaseWhenBranch,
     CaseWhenExpr,
     ColumnMetadata,
+    ColumnRole,
     FKEdge,
     SchemaGraph,
     TableMetadata,
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._intent_expr import parse_expr_string
-from aetherdialect._intent_repair import (
+from aetherdialect._intent_bind import (
+    _is_pk_column,
+    _match_enum_value,
+    _qualify_term,
+    _resolve_where_list_cascade,
+    align_where_value_type_to_exprs,
+    infer_cte_output_columns,
+    normalize_boolean_where_values,
+    normalize_pk_distinct,
+    qualify_cte_output_columns,
+    repair_window_partition_group_by_alignment,
+    resolve_where_value_case,
+)
+from aetherdialect._intent_expr import parse_expr_string, strip_leading_distinct_from_column_ref
+from aetherdialect._intent_loop import (
+    intent_text_has_leakable_placeholder,
+    repair_intent_placeholder_tokens,
+    runtime_intent_has_instructional_placeholders,
+)
+from aetherdialect._intent_normalize import (
     DIAGNOSTIC_REPAIR_DISPATCH,
     _dedup_contradictory_where_list,
     _dedup_value_vs_right_expr_where,
     _is_impossible_having,
     _is_null_value,
-    _is_pk_column,
-    _strip_distinct_prefix,
     _tables_from_columns,
-    align_where_value_type_to_exprs,
     apply_diagnostic_repairs,
     auto_repair_where_having,
     best_descriptive_column,
@@ -52,32 +67,18 @@ from aetherdialect._intent_repair import (
     drop_invalid_case_registry_entries,
     enforce_sensitivity_policy_intent,
     expand_fk_select_to_descriptive,
-    intent_text_has_leakable_placeholder,
-    normalize_boolean_where_values,
     normalize_in_where_types,
     normalize_null_where_values,
-    normalize_pk_distinct,
     promote_temporal_keyword_rhs,
     reconcile_tables,
     repair_array_where_intent,
     repair_case_when_intent,
     repair_fk_where_type_mismatch,
-    repair_intent_placeholder_tokens,
     repair_null_equality_where,
-    runtime_intent_has_instructional_placeholders,
     sanitize_table_names,
     strip_impossible_having,
     strip_join_conditions,
     strip_spurious_group_by,
-)
-from aetherdialect._intent_resolve import (
-    _match_enum_value,
-    _qualify_term,
-    _resolve_where_list_cascade,
-    infer_cte_output_columns,
-    qualify_cte_output_columns,
-    repair_window_partition_group_by_alignment,
-    resolve_where_value_case,
 )
 
 
@@ -283,19 +284,19 @@ class TestEnforceSensitivityPolicyIntent:
 
 
 class TestStripDistinctPrefix:
-    """Tests for _strip_distinct_prefix."""
+    """Tests for strip_leading_distinct_from_column_ref."""
 
     def test_strips_distinct(self):
-        """_strip_distinct_prefix removes DISTINCT prefix."""
-        assert _strip_distinct_prefix("DISTINCT t.id") == "t.id"
+        """strip_leading_distinct_from_column_ref removes DISTINCT prefix."""
+        assert strip_leading_distinct_from_column_ref("DISTINCT t.id") == "t.id"
 
     def test_leaves_non_distinct(self):
-        """_strip_distinct_prefix leaves non-DISTINCT unchanged."""
-        assert _strip_distinct_prefix("t.id") == "t.id"
+        """strip_leading_distinct_from_column_ref leaves non-DISTINCT unchanged."""
+        assert strip_leading_distinct_from_column_ref("t.id") == "t.id"
 
     def test_case_insensitive(self):
-        """_strip_distinct_prefix is case-insensitive."""
-        assert _strip_distinct_prefix("distinct t.id") == "t.id"
+        """strip_leading_distinct_from_column_ref is case- insensitive."""
+        assert strip_leading_distinct_from_column_ref("distinct t.id") == "t.id"
 
 
 class TestNormalizePkDistinct:
@@ -519,7 +520,7 @@ class TestStripJoinConditionsFromIntent:
 
 
 class TestIntentTextHasLeakablePlaceholder:
-    """Regression tests for instructional placeholder scans."""
+    """Instructional placeholder scan behavior."""
 
     def test_none_text_returns_false(self):
         """Absent scan strings must not reach the angle-bracket regex."""
@@ -2743,7 +2744,7 @@ class TestPruneUnreferencedTablesWithSchemaGraph:
         )
 
     def test_cosmetic_table_kept_when_descriptive_but_no_fk_filter(self, prune_schema):
-        """After removing cosmetic prune logic, a table with descriptive select columns is kept even without FK filter."""
+        """Table with descriptive select columns is kept without an FK filter; pruning is reference-based."""
         intent = RuntimeIntent(
             tables=["orders", "customer"],
             grain="row_level",
@@ -2768,7 +2769,7 @@ class TestPruneUnreferencedTablesWithSchemaGraph:
         assert "orders" in result.tables
 
     def test_cosmetic_table_kept_when_only_pk(self, prune_schema):
-        """After removing cosmetic prune logic, a table contributing only PK columns is kept (pruning is purely reference-based)."""
+        """Table contributing only PK columns is kept; pruning is purely reference-based."""
         intent = RuntimeIntent(
             tables=["orders", "customer"],
             grain="row_level",
@@ -2974,7 +2975,7 @@ class TestPruneWithFkFilterTarget:
         assert "orders" in result.tables
 
     def test_kept_when_no_fk_filter_targets_table(self, fk_prune_schema):
-        """After removing cosmetic prune logic, table is kept even without FK filter targeting its PK."""
+        """Table is kept even without an FK filter targeting its PK; pruning is reference-based."""
         intent = RuntimeIntent(
             tables=["orders", "customer"],
             grain="row_level",
@@ -3462,11 +3463,11 @@ class TestRepairNullEqualityFiltersContinued:
 
 
 class TestPruneKeepsAggregationTables:
-    """Tests for Fix X: reconcile_tables keeps tables that contribute aggregated SelectCols."""
+    """reconcile_tables keeps tables that contribute aggregated SelectCols."""
 
     @pytest.fixture
     def revenue_schema(self):
-        """Schema with country and payment tables for AJ-006 scenario."""
+        """Schema with country and payment tables."""
         return SchemaGraph(
             tables={
                 "country": TableMetadata(
@@ -3530,7 +3531,7 @@ class TestPruneKeepsAggregationTables:
 
 
 class TestPruneColumnComponentSuppression:
-    """Tests for Fix Y1: column-component suppression in pruning."""
+    """Column-component suppression in pruning."""
 
     @pytest.fixture
     def rental_schema(self):
@@ -3606,7 +3607,7 @@ class TestPruneColumnComponentSuppression:
         )
 
     def test_rental_table_kept_when_referenced_in_select(self, rental_schema):
-        """Rental is kept because COUNT(rental.rental_id) references it; inventory pruned as genuinely unreferenced. The old cosmetic column-component prune was removed (Fix 1)."""
+        """Rental is kept because COUNT(rental.rental_id) references it; inventory is pruned as unreferenced."""
         intent = RuntimeIntent(
             tables=["film", "inventory", "rental"],
             grain="grouped",
@@ -4666,17 +4667,17 @@ class TestFlipComparisonOp:
     """Tests for _flip_comparison_op."""
 
     def test_gt_flipped_to_lt(self):
-        from aetherdialect._intent_repair import _flip_comparison_op
+        from aetherdialect._intent_normalize import _flip_comparison_op
 
         assert _flip_comparison_op(">") == "<"
 
     def test_le_flipped_to_ge(self):
-        from aetherdialect._intent_repair import _flip_comparison_op
+        from aetherdialect._intent_normalize import _flip_comparison_op
 
         assert _flip_comparison_op("<=") == ">="
 
     def test_unmapped_op_returned_unchanged(self):
-        from aetherdialect._intent_repair import _flip_comparison_op
+        from aetherdialect._intent_normalize import _flip_comparison_op
 
         assert _flip_comparison_op("like") == "like"
 
@@ -4815,7 +4816,7 @@ class TestCaseBranchRepairCoverage:
         assert isinstance(rv, list) and rv == [10, 20] or rv == ["10", "20"]
 
     def test_apply_where_to_main_and_ctes_walks_registry_case_filter_branch(self):
-        from aetherdialect._intent_repair import apply_where_to_main_and_ctes
+        from aetherdialect._intent_normalize import apply_where_to_main_and_ctes
 
         intent = self._make_intent_with_registry_case_between()
         intent.case_registry[0].case_when.branches[0].condition.raw_value = " HELLO "
@@ -4837,7 +4838,7 @@ class TestCaseBranchRepairCoverage:
         assert out.case_registry[0].case_when.branches[0].condition.raw_value == "hello"
 
     def test_apply_having_to_main_and_ctes_walks_having_scope_branch_only(self):
-        from aetherdialect._intent_repair import apply_having_to_main_and_ctes
+        from aetherdialect._intent_normalize import apply_having_to_main_and_ctes
 
         cond = WhereParam(
             left_expr=NormalizedExpr.from_agg("count", "t.id"),

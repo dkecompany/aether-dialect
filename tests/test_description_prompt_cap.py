@@ -1,22 +1,18 @@
-"""Tests for bounded schema description prompts and description-aware cache keys."""
+"""Tests for full schema description prompts and description-aware cache keys."""
 
 from __future__ import annotations
 
 import json
 
-from aetherdialect._constants import (
-    SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP,
-    SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS,
-)
 from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._llm_provider import LLMProvider
+from aetherdialect._schema_graph import assign_schema_graph_hashes, tables_descriptions_payload
+from aetherdialect._utils import (
     descriptions_hash_fp,
     prompt_cache_schema_scope,
     schema_prompt_cache_id,
 )
-from aetherdialect._llm_provider import LLMProvider
-from aetherdialect._schema_graph import assign_schema_graph_hashes, tables_descriptions_payload
 
 
 def _count_descriptions(payload: dict) -> int:
@@ -60,22 +56,22 @@ def _make_graph_with_descriptions(
     )
 
 
-def test_long_description_truncated_in_payload() -> None:
-    long_desc = "w" * (SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS + 50)
+def test_long_description_preserved_in_payload() -> None:
+    long_desc = "w" * 400
     graph = _make_graph_with_descriptions(description=long_desc)
     payload = json.loads(graph.schema_payload_interpret(owner_master_scope=True))
     emitted = payload["tbl"]["columns"]["col_0"]["description"]
-    assert len(emitted) <= SCHEMA_DESCRIPTION_PROMPT_MAX_CHARS
-    assert emitted.endswith("...")
+    assert emitted == long_desc
 
 
-def test_description_count_cap_in_payload() -> None:
+def test_description_count_not_capped_in_payload() -> None:
+    column_count = 160
     graph = _make_graph_with_descriptions(
-        column_count=SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP + 20,
+        column_count=column_count,
         description="column meaning",
     )
     payload = json.loads(graph.schema_payload_interpret(owner_master_scope=True))
-    assert _count_descriptions(payload) <= SCHEMA_DESCRIPTION_PROMPT_COUNT_CAP
+    assert _count_descriptions(payload) == column_count + 1
 
 
 def _stamp_graph_hashes(graph: SchemaGraph) -> None:
@@ -98,21 +94,24 @@ def test_description_edit_rotates_prompt_cache_id() -> None:
 
 
 def test_resolve_prompt_cache_key_uses_description_fingerprint() -> None:
-    graph = _make_graph_with_descriptions(description="cache probe text")
-    _stamp_graph_hashes(graph)
-    cache_id = schema_prompt_cache_id(graph)
-    assert cache_id is not None
-    with prompt_cache_schema_scope(cache_id):
-        key = LLMProvider.resolve_prompt_cache_key("intent")
-    assert key is not None
-    assert len(key) <= 64
-    raw = f"intent:{cache_id}"
-    if len(raw) <= 64:
-        assert key == raw
-    else:
-        import hashlib
-
-        assert key == f"intent:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]}"
+    graph_a = _make_graph_with_descriptions(description="cache probe text alpha")
+    graph_b = _make_graph_with_descriptions(description="cache probe text beta")
+    _stamp_graph_hashes(graph_a)
+    _stamp_graph_hashes(graph_b)
+    cache_id_a = schema_prompt_cache_id(graph_a)
+    cache_id_b = schema_prompt_cache_id(graph_b)
+    assert cache_id_a is not None
+    assert cache_id_b is not None
+    assert cache_id_a != cache_id_b
+    with prompt_cache_schema_scope(cache_id_a):
+        key_a = LLMProvider.resolve_prompt_cache_key("intent")
+    with prompt_cache_schema_scope(cache_id_b):
+        key_b = LLMProvider.resolve_prompt_cache_key("intent")
+    assert key_a is not None
+    assert key_b is not None
+    assert len(key_a) <= 64
+    assert len(key_b) <= 64
+    assert key_a != key_b
 
 
 def test_descriptions_hash_fp_stable_for_same_content() -> None:

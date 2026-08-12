@@ -35,12 +35,12 @@ def test_mutation_script_help_and_baseline_schema() -> None:
     targets = doc["targets"]
     assert isinstance(targets, dict)
     expected = {
-        "_validation_execute.py",
-        "_validation_schema.py",
-        "_validation_semantic.py",
-        "_intent_resolve.py",
-        "_intent_repair.py",
-        "_core_utils.py",
+        "_validation_sql.py",
+        "_validation_shape.py",
+        "_validation_rules.py",
+        "_intent_bind.py",
+        "_intent_normalize.py",
+        "_utils.py",
     }
     assert set(targets) == expected
     for key in expected:

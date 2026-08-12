@@ -7,12 +7,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._core_utils import (
+from aetherdialect._dialect import Dialect
+from aetherdialect._utils_artifacts import (
     assert_connection_usable_after_fork,
     register_dialect_live_handles,
     register_live_connection,
 )
-from aetherdialect._dialect import Dialect
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="platform has no fork")

@@ -1,4 +1,4 @@
-"""SECURITY.md hygiene: provider inventory honesty and scoped determinism claims."""
+"""SECURITY.md hygiene: provider inventory coverage and scoped determinism claims."""
 
 from __future__ import annotations
 
@@ -36,9 +36,9 @@ def test_security_section_57_not_federation_mapping_no_llm_contradiction() -> No
 
 
 @pytest.mark.fast
-def test_security_section_57_join_selection_provider_assist_pattern() -> None:
-    """Section 5.7 documents deterministic candidate selection then provider disambiguation."""
-    section = _section_between(_security_text(), "### 5.7", "### 5.8")
+def test_security_section_55_join_selection_provider_assist_pattern() -> None:
+    """Section 5.5 documents deterministic candidate selection then provider disambiguation."""
+    section = _section_between(_security_text(), "### 5.5", "### 5.6")
     lowered = section.lower()
     assert "join" in lowered
     assert "candidate" in lowered
@@ -71,7 +71,7 @@ def test_security_federation_mapping_suggester_outside_llm_inventory() -> None:
 @pytest.mark.fast
 def test_security_provider_call_site_inventory_complete() -> None:
     """Every questioning-surface provider call site appears in the inventory."""
-    inventory = _section_between(_security_text(), "### 5.9", "## 6.")
+    inventory = _section_between(_security_text(), "### 5.8", "### 5.9")
     lowered = inventory.lower()
     required_phrases = (
         "validate_question",
@@ -86,13 +86,13 @@ def test_security_provider_call_site_inventory_complete() -> None:
         "apply_column_roles_llm",
     )
     missing = [phrase for phrase in required_phrases if phrase.lower() not in lowered]
-    assert not missing, f"missing provider call sites in 5.9 inventory: {missing}"
+    assert not missing, f"missing provider call sites in 5.8 inventory: {missing}"
 
 
 @pytest.mark.fast
 def test_security_upload_inspection_identifier_call_site() -> None:
     """Upload inspection documents the identifier-naming provider call."""
-    upload_section = _section_between(_security_text(), "### 5.8", "### 5.9")
+    upload_section = _section_between(_security_text(), "### 5.7", "### 5.8")
     lowered = upload_section.lower()
     assert "identifier naming" in lowered
     assert "validate_upload_sources" in lowered or "inspect_tabular_upload" in lowered

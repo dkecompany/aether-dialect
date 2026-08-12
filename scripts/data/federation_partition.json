@@ -1,4 +1,15 @@
 {
+  "storefront": [
+    "address",
+    "city",
+    "country",
+    "customer",
+    "payment",
+    "rental",
+    "reservation",
+    "staff",
+    "store"
+  ],
   "catalog": [
     "actor",
     "author",
@@ -18,12 +29,6 @@
     "payment",
     "publisher"
   ],
-  "crm": [
-    "customer",
-    "promotion",
-    "promotion_redemption",
-    "staff"
-  ],
   "logistics": [
     "courier",
     "damage_report",
@@ -36,15 +41,10 @@
     "supplier",
     "warehouse"
   ],
-  "storefront": [
-    "address",
-    "city",
-    "country",
+  "crm": [
     "customer",
-    "payment",
-    "rental",
-    "reservation",
-    "staff",
-    "store"
+    "promotion",
+    "promotion_redemption",
+    "staff"
   ]
 }

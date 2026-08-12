@@ -6,8 +6,8 @@ import pytest
 
 from aetherdialect._constants import SOFT_DIAGNOSTIC_CODES
 from aetherdialect._contracts_base import SqlDiagnostic, SqlDiagnosticCode
-from aetherdialect._core_utils import drain_diagnostic_collector, reset_diagnostic_collector, set_diagnostic_collector
-from aetherdialect._pipeline import emit_explain_soft_diagnostics
+from aetherdialect._pipeline_generate import emit_explain_soft_diagnostics
+from aetherdialect._utils import drain_diagnostic_collector, reset_diagnostic_collector, set_diagnostic_collector
 
 
 @pytest.mark.fast

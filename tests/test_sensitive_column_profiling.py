@@ -10,8 +10,12 @@ import pytest
 from aetherdialect._contracts_base import SensitivityClassification
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
-from aetherdialect._schema_catalog import _profile_column, _profile_table, profile_schema
-from aetherdialect._schema_graph import _profile_table_clone
+from aetherdialect._schema_profile import (
+    _profile_column,
+    _profile_table,
+    profile_schema,
+    profile_table_clone,
+)
 
 
 def _recording_engine() -> tuple[MagicMock, list[str]]:
@@ -115,12 +119,15 @@ def test_profile_table_clone_skips_sensitive_columns(monkeypatch: pytest.MonkeyP
     engine, executed = _recording_engine()
     dialect = DuckDBDialect.__new__(DuckDBDialect)
     dialect.engine = engine
-    monkeypatch.setattr("aetherdialect._schema_graph.apply_column_roles_llm", lambda *_a, **_k: None)
-    monkeypatch.setattr("aetherdialect._schema_graph.apply_boolean_coercion_pass", lambda *_a, **_k: None)
-    monkeypatch.setattr("aetherdialect._schema_graph.assign_column_ops", lambda *_a, **_k: None)
+    monkeypatch.setattr("aetherdialect._schema_profile.apply_column_roles_llm", lambda *_a, **_k: None)
+    monkeypatch.setattr("aetherdialect._schema_profile.apply_boolean_coercion_pass", lambda *_a, **_k: None)
+    monkeypatch.setattr("aetherdialect._schema_profile.assign_column_ops", lambda *_a, **_k: None)
+    monkeypatch.setattr("aetherdialect._schema_profile.apply_column_roles_llm", lambda *_a, **_k: None)
+    monkeypatch.setattr("aetherdialect._schema_profile.apply_boolean_coercion_pass", lambda *_a, **_k: None)
+    monkeypatch.setattr("aetherdialect._schema_profile.assign_column_ops", lambda *_a, **_k: None)
 
     with patch.object(DuckDBDialect, "profile_schema_dispatch", wraps=dialect.profile_schema_dispatch):
-        clone = _profile_table_clone(dialect, table, notes_content=None)
+        clone = profile_table_clone(dialect, table, notes_content=None)
 
     assert clone is not None
     assert _sql_references_column(executed, "email", dialect) == []

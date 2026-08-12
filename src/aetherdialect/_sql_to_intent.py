@@ -16,12 +16,12 @@ from ._constants import (
     PG_LAST_WINDOW_FRAME_OPTIONS_RANGE_UNBOUNDED_CURRENT,
     PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_OFFSET_CURRENT,
     PG_LAST_WINDOW_FRAME_OPTIONS_ROWS_UNBOUNDED_PAIR,
-    PG_SIMPLE_AGG_NAMES,
     SELF_JOIN_CTE_NAME_PREFIX,
     SQL_TO_INTENT_LIMIT_OFFSET_PARAM_KEY,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_NUM,
     SQL_TO_INTENT_LITERAL_PLACEHOLDER_STR,
     SQL_TO_INTENT_PARAM_KEY_PREFIX,
+    VALID_AGGREGATION_FUNCTIONS,
     WARMUP_ROUND_TRIP_CARDINALITY_TOLERANCE,
     WARMUP_ROUND_TRIP_LIMIT,
     WINDOW_DEFAULT_FRAME_END_WITH_ORDER,
@@ -38,7 +38,6 @@ from ._contracts_base import (
     OrderByCol,
     OrderByNullPlacement,
     PredicateGroup,
-    QueryLogSource,
     WhereParam,
     WindowFrameKind,
 )
@@ -56,15 +55,15 @@ from ._contracts_schema import (
     WindowRegistryStep,
     WindowSpec,
 )
-from ._core_utils import parse_sql_numeric_literal, sha256, stable_json
 from ._dialect import DialectRegistry
 from ._dialect_postgres import PostgresDialect
-from ._intent_process import apply_deterministic_repairs, cte_structural_signature, union_runtime_concrete_compatibility
-from ._intent_resolve import check_qualified_refs_exist
+from ._intent_bind import check_qualified_refs_exist
+from ._intent_loop import apply_deterministic_repairs, cte_structural_signature, union_runtime_concrete_compatibility
 from ._sql_gen import build_deterministic_sql
 from ._sql_to_intent_sqlglot import convert_sql_via_sqlglot
-from ._utils import body_similarity_key, sql_shape
-from ._validation_execute import curated_warmup_semantic_issues
+from ._utils import parse_sql_numeric_literal, sha256, stable_json
+from ._utils_intent import body_similarity_key, sql_shape
+from ._validation_sql import curated_warmup_semantic_issues
 
 pglast: Any = None
 SubLinkType: Any = None
@@ -1823,7 +1822,7 @@ def _pg_aggregate_funcall_to_expr(
         return None
     raw = (PostgresDialect.pg_funcname(fn) or "").strip().lower()
     fn_name = raw.split(".")[-1] if raw else ""
-    if fn_name not in PG_SIMPLE_AGG_NAMES:
+    if fn_name not in VALID_AGGREGATION_FUNCTIONS:
         return None
     if getattr(fn, "agg_star", False):
         return NormalizedExpr.from_agg(fn_name, "*")
@@ -2469,7 +2468,7 @@ def _check_round_trip_intent_parity(
 def _check_round_trip_execute(
     original_sql: str, intent: RuntimeIntent, schema: SchemaGraph, dialect: Any, *, limit: int = WARMUP_ROUND_TRIP_LIMIT
 ) -> bool:
-    """Layer 3: compare planner cardinality estimates between original and regenerated SQL."""
+    """Layer 3: compare dialect cardinality estimates between original and regenerated SQL."""
     del limit
     tol = float(WARMUP_ROUND_TRIP_CARDINALITY_TOLERANCE)
     estimate = getattr(dialect, "explain_row_estimate", None)
@@ -2670,9 +2669,6 @@ def seed_warmup_intent_from_runtime_intent(rt: RuntimeIntent, *, intent_id: str,
         window_registry=list(rt.window_registry),
         case_registry=list(rt.case_registry),
     )
-
-
-_QueryLogSource = QueryLogSource
 
 
 def fetch_query_log(

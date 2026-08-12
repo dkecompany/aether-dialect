@@ -9,12 +9,12 @@ import pytest
 
 from aetherdialect._config import EngineConfig
 from aetherdialect._constants import DIAGNOSTIC_CODE_TEMPLATE_REMAP_DIVERGED
-from aetherdialect._contracts_core import ConcreteIntent, SelectCol, Template, TemplateStats, ValueHistory
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._core_utils import reset_diagnostic_collector, set_diagnostic_collector
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import ConcreteIntent, SelectCol, Template, ValueHistory
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import reset_diagnostic_collector, set_diagnostic_collector
 
 
 def _col(name: str) -> ColumnMetadata:

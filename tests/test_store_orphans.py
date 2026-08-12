@@ -14,12 +14,9 @@ from aetherdialect._constants import (
     TEMPLATE_STORE_ORPHANED_SEGMENT,
     TEMPLATE_STORE_PARTITION_PREFIX,
 )
-from aetherdialect._core_utils import (
-    reset_diagnostic_collector,
-    set_diagnostic_collector,
-    write_artifact_manifest,
-)
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import reset_diagnostic_collector, set_diagnostic_collector
+from aetherdialect._utils_artifacts import write_artifact_manifest
 from tests.test_templates import _minimal_template
 
 

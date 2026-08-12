@@ -7,7 +7,6 @@ import contextvars
 import functools
 import json
 import os
-import shutil
 import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -27,41 +26,32 @@ from ._config import (
 from ._constants import (
     DIAGNOSTIC_CODE_ENGINE_INFO,
     FEDERATION_DECLARATION_FILENAME,
+    FEDERATION_DECLARATION_VERSION,
     FEDERATION_MAPPINGS_VERSION,
-    FEDERATION_METHOD_SEMANTICS,
     FEDERATION_MIGRATION_MAP_FILENAME,
-    FEDERATION_WARMUP_UNSUPPORTED_MESSAGE,
     MASTER_AETHERSPACE_NAME,
+    MASTER_AETHERSPACE_UID,
     MIGRATION_MAP_FILENAME,
-    NAMED_SCHEMA_CONTEXT_ARTIFACT_VERSION,
-    SCHEMA_OVERRIDES_APPLIED_SUFFIX,
-    SCHEMA_OVERRIDES_APPLIED_TIMESTAMP_FORMAT,
-    SCHEMA_OVERRIDES_DEFAULT_FILENAME,
-    TABLE_PREVIEW_DEFAULT_LIMIT,
     WRITE_QUEUE_FILENAME,
     YES_NO_SESSION_KINDS,
 )
+from ._constants_runtime import (
+    FEDERATION_METHOD_SEMANTICS,
+    FEDERATION_WARMUP_UNSUPPORTED_MESSAGE,
+)
 from ._contracts_base import (
-    AccessError,
-    AetherEngineInitResult,
     AetherError,
-    AetherFederationInitResult,
     AetherSpace,
-    AggregateJoinFanOutError,
-    AmbiguousDateLiteralError,
+    AetherspaceDeleteResult,
     ArtifactLockTimeoutError,
-    AuditEvent,
-    BusinessKnowledgeEntry,
-    BusinessKnowledgeHolder,
-    ClauseWidenedRowsetError,
-    ComparisonJoinScopeExceededError,
     ConfigError,
-    ConfigSnapshot,
     DatabaseConnectionError,
     DatabaseExecutionError,
     DatabasePingFailed,
     DataQualityReport,
     Diagnostic,
+    DomainKnowledgeEntry,
+    DomainKnowledgeHolder,
     EngineContext,
     EngineIdentity,
     FederationCapExceededError,
@@ -72,9 +62,7 @@ from ._contracts_base import (
     FederationInvariantError,
     FederationJoinFanOutError,
     FederationMalformedMemberAnswerError,
-    FederationMappings,
     FederationMappingsAppliedSidecarError,
-    FederationMappingSuggestion,
     FederationMemberEngine,
     FederationMemberExecutionError,
     FederationMemberProbeError,
@@ -83,6 +71,37 @@ from ._contracts_base import (
     FederationPartialFailureError,
     FederationRuntimeError,
     FederationTurnCancelledError,
+    LlmTransientFailure,
+    MigrationPendingError,
+    MigrationTier,
+    MockFixtureMissingError,
+    OwnerOnlyOperationError,
+    RefreshReport,
+    ResultCapExceededError,
+    RetryableDatabaseExecutionError,
+    RetryableError,
+    RetryableFederationPartialFailureError,
+    SchemaAccessError,
+    SchemaInvariantError,
+    SchemaRole,
+    SessionActiveError,
+    SessionTurnCancelledError,
+    SpaceContext,
+    StatementTimeoutError,
+    StructureReport,
+    SuspendedSessionExpiredError,
+)
+from ._contracts_core import (
+    AccessError,
+    AetherEngineInitResult,
+    AetherFederationInitResult,
+    AggregateJoinFanOutError,
+    AmbiguousDateLiteralError,
+    AuditEvent,
+    ClauseWidenedRowsetError,
+    ComparisonJoinScopeExceededError,
+    ConfigSnapshot,
+    FederatedPrepareOutcome,
     JoinCandidateCapExceededError,
     JoinColumnCountMismatchError,
     JoinInjectionAlignmentError,
@@ -91,131 +110,122 @@ from ._contracts_base import (
     JoinPathTieCapExceededError,
     JoinProbeEdgeKindMismatchError,
     LlmJsonExhausted,
-    LlmTransientFailure,
-    MigrationPendingError,
     MigrationPreview,
-    MigrationTier,
-    MockFixtureMissingError,
     NoJoinPathError,
     NullInNegatedListError,
-    OverrideReport,
-    OverrideSkip,
-    OwnerOnlyOperationError,
-    PersistedFederationInspection,
     PhaseProgressEvent,
     PipelineSuspended,
-    PlanPreviewResult,
     ProbeCtePlacementError,
     QSimSummarySnapshot,
-    RefreshReport,
+    RefinementRetry,
     RegistryRenderError,
-    ResultCapExceededError,
-    RetryableDatabaseExecutionError,
-    RetryableError,
-    RetryableFederationPartialFailureError,
-    SchemaAccessError,
-    SchemaInclude,
-    SchemaInvariantError,
-    SchemaRole,
     SchemaStatsSnapshot,
     SeedWarmupSummarySnapshot,
-    SessionActiveError,
+    SessionError,
+    SessionOutcome,
     SessionStep,
-    SessionTurnCancelledError,
-    SpaceContext,
-    StatementTimeoutError,
     StoredTemplateDetail,
     StoredTemplateSummary,
     SubdayDateWindowOnDateColumnError,
-    SuspendedSessionExpiredError,
-    TablePreviewResult,
+    Template,
     TemplateExecutionResult,
-    WriteQueueEvent,
 )
-from ._contracts_core import FederatedPrepareOutcome, Template
-from ._contracts_schema import CsvSourceSelection, UploadIngestResult
-from ._core_utils import (
+from ._contracts_schema import (
+    CsvSourceSelection,
+    FederationManifest,
+    FederationMappings,
+    FederationMappingSuggestion,
+    PersistedFederationInspection,
+    UploadIngestResult,
+)
+from ._data_quality import inspect_tabular_upload
+from ._dialect_sqlglot_engines import CsvDialect
+from ._expansion_ops import clear_expansion_subtree_pool
+from ._federation_compose import collapsed_member_physical_table_names, validate_federation_context_against_mappings
+from ._federation_execute import (
+    federation_member_artifacts_dir_for_purge,
+    finalize_federation_composite_overrides,
+    inspect_persisted_federation,
+    parse_federation_migration_map,
+    prune_federation_plan_templates_for_sources,
+    prune_federation_plan_templates_on_drift,
+    purge_federation_member_artifacts,
+    reconcile_authored_declaration_for_members,
+)
+from ._federation_manifest import (
+    binding_from_member_engine,
+    export_federation_declaration,
+    federation_declaration_document,
+    federation_members_mapping,
+    load_federation_declaration_from_path,
+    member_connection_name_from_engine,
+    parse_federation_declaration,
+)
+from ._knowledge_staleness import knowledge_artifact_save_stamps
+from ._llm_provider import LLMProvider
+from ._main_execution import MainExecutionOps
+from ._main_session import PipelineSession
+from ._pipeline_execute import execute_stored_template_by_ref
+from ._qsim import (
+    clear_engine_skeleton_cache,
+    drop_engine_skeleton_cache_owner,
+    pop_qsim_engine_owner,
+    pop_simulation_artifact_partition,
+    push_qsim_engine_owner,
+    push_simulation_artifact_scope_from_owner,
+    register_engine_skeleton_cache_owner,
+)
+from ._sandbox import (
+    Sandbox,
+)
+from ._schema_finalize import (
+    apply_structure_document,
+    build_public_structure_document,
+    delete_persisted_structure_artifacts,
+    dump_structure_edits,
+)
+from ._schema_graph import load_schema_graph_snapshot
+from ._schema_profile import extract_domain_knowledge_from_notes, filter_schema_anchored_domain_knowledge
+from ._templates import LazyTemplateMapping
+from ._templates_ops import TemplateOps
+from ._utils import (
+    apply_federation_member_defaults,
     dataframe_to_row_tuples,
+    delete_domain_knowledge_artifact,
     diagnostic_print_listener,
     echo_user_text,
     echo_yes_no_answer,
-    emit_write_queue_event,
     error,
+    load_domain_knowledge_artifact,
+    notes_content_from_context,
     notify,
+    owner_limits_scope,
     pop_construction_phase_callback,
+    pop_diagnostic_sink,
     pop_engine_identity,
-    pop_engine_limits,
     print_query_result,
     progress_enabled,
     push_construction_phase_callback,
+    push_diagnostic_sink,
     push_engine_identity,
-    push_engine_limits,
-    register_dialect_live_handles,
-    release_close_resources,
     require_driver,
     stable_json,
     terminated,
     validate_federation_pool_capacity,
 )
-from ._data_quality import inspect_tabular_upload
-from ._dialect_sqlglot_engines import CsvDialect
-from ._expansion_ops import clear_expansion_subtree_pool
-from ._federation import (
-    apply_federation_composite_overrides,
-    archive_federation_editor_file,
-    binding_from_member_engine,
-    collapsed_member_physical_table_names,
-    export_federation_composite_overrides,
-    export_federation_declaration,
-    federation_member_artifacts_dir_for_purge,
-    finalize_federation_composite_overrides,
-    inspect_persisted_federation,
-    load_federation_declaration_from_path,
-    parse_federation_declaration,
-    prune_federation_plan_templates_for_sources,
-    prune_federation_plan_templates_on_drift,
-    purge_federation_member_artifacts,
-    reconcile_authored_declaration_for_members,
-    validate_federation_context_against_mappings,
-)
-from ._llm_provider import LLMProvider
-from ._main_execution import (
-    MainExecutionOps,
-    PipelineSession,
-)
-from ._pipeline import (
-    execute_stored_template_by_ref,
-    preview_plan_on_engine,
-    preview_plan_on_federation,
-)
-from ._qsim import (
-    clear_engine_skeleton_cache,
-    drop_engine_skeleton_cache_owner,
-    pop_qsim_engine_owner,
-    push_qsim_engine_owner,
-    register_engine_skeleton_cache_owner,
-)
-from ._sandbox import (
-    Sandbox,
-    SandboxHandle,
-)
-from ._schema_catalog import extract_business_knowledge_from_notes
-from ._schema_overrides import (
-    apply_overrides_and_persist,
-    clear_persisted_overrides,
-    dump_schema_overrides_to_path,
-)
-from ._templates import (
-    LazyTemplateMapping,
-    TemplateOps,
+from ._utils_artifacts import (
+    register_dialect_live_handles,
+    release_close_resources,
+    save_domain_knowledge_artifact,
 )
 
 aetherspace_descriptor_from_snapshot = MainExecutionOps.aetherspace_descriptor_from_snapshot
-apply_aetherspace_json = MainExecutionOps.apply_aetherspace_json
+allocate_aetherspace_uid = MainExecutionOps.allocate_aetherspace_uid
 build_master_space_descriptor = MainExecutionOps.build_master_space_descriptor
 clear_federation_template_stores = MainExecutionOps.clear_federation_template_stores
 clear_simulation_caches_only = MainExecutionOps.clear_simulation_caches_only
 clear_template_store_only = MainExecutionOps.clear_template_store_only
+delete_aetherspace = MainExecutionOps.delete_aetherspace
 delete_aetherspace_snapshot = MainExecutionOps.delete_aetherspace_snapshot
 describe_federation_config = MainExecutionOps.describe_federation_config
 describe_runtime_config = MainExecutionOps.describe_runtime_config
@@ -225,8 +235,9 @@ drain_write_queue = MainExecutionOps.drain_write_queue
 enrich_space_snapshot_with_notes = MainExecutionOps.enrich_space_snapshot_with_notes
 engine_schema_json_path = MainExecutionOps.engine_schema_json_path
 engine_template_store_dir = MainExecutionOps.engine_template_store_dir
-export_aetherspace_json = MainExecutionOps.export_aetherspace_json
-export_named_schema_context_json = MainExecutionOps.export_named_schema_context_json
+consumer_safe_scope_context_fields = MainExecutionOps.consumer_safe_scope_context_fields
+engine_context_references_out_of_scope = MainExecutionOps.engine_context_references_out_of_scope
+build_named_schema_context_export = MainExecutionOps.build_named_schema_context_export
 federation_stores_by_source = MainExecutionOps.federation_stores_by_source
 find_latest_seed_warmup_summary = MainExecutionOps.find_latest_seed_warmup_summary
 format_qsim_summary_line = MainExecutionOps.format_qsim_summary_line
@@ -235,16 +246,16 @@ initialize_aether_engine = MainExecutionOps.initialize_aether_engine
 initialize_aether_federation = MainExecutionOps.initialize_aether_federation
 intersect_space_scope = MainExecutionOps.intersect_space_scope
 list_named_schema_context_names = MainExecutionOps.list_named_schema_context_names
+list_saved_aetherspace_entries = MainExecutionOps.list_saved_aetherspace_entries
 list_saved_aetherspace_names = MainExecutionOps.list_saved_aetherspace_names
 load_aetherspace_snapshot = MainExecutionOps.load_aetherspace_snapshot
 load_named_schema_context = MainExecutionOps.load_named_schema_context
 load_qsim_summaries = MainExecutionOps.load_qsim_summaries
 preview_schema_migration = MainExecutionOps.preview_schema_migration
-preview_table_on_engine = MainExecutionOps.preview_table_on_engine
-preview_table_on_federation = MainExecutionOps.preview_table_on_federation
 print_questions_bundle = MainExecutionOps.print_questions_bundle
 qsim_run_once = MainExecutionOps.qsim_run_once
 refresh_engine_connection = MainExecutionOps.refresh_engine_connection
+resolve_aetherspace_identity = MainExecutionOps.resolve_aetherspace_identity
 resolve_qsim_path = MainExecutionOps.resolve_qsim_path
 run_seed_warmup_from_history_execution = MainExecutionOps.run_seed_warmup_from_history_execution
 run_seed_warmup_from_query_log_execution = MainExecutionOps.run_seed_warmup_from_query_log_execution
@@ -254,7 +265,11 @@ space_allowed_sets_from_snapshot = MainExecutionOps.space_allowed_sets_from_snap
 space_deny_sets_from_snapshot = MainExecutionOps.space_deny_sets_from_snapshot
 subset_graph_for_space = MainExecutionOps.subset_graph_for_space
 validate_space_context_against_graph = MainExecutionOps.validate_space_context_against_graph
-validate_space_subset_of_execution_context = MainExecutionOps.validate_space_subset_of_execution_context
+filter_space_snapshot_sensitive_columns = MainExecutionOps.filter_space_snapshot_sensitive_columns
+aetherspace_within_effective_visibility = MainExecutionOps.aetherspace_within_effective_visibility
+validate_aetherspace_define_within_visibility = MainExecutionOps.validate_aetherspace_define_within_visibility
+effective_visible_tables = MainExecutionOps.effective_visible_tables
+effective_visible_columns = MainExecutionOps.effective_visible_columns
 
 build_stored_template_detail = TemplateOps.build_stored_template_detail
 list_stored_template_summaries = TemplateOps.list_stored_template_summaries
@@ -274,20 +289,17 @@ __all__ = [
 
 MUTATING_ENGINE_METHODS: tuple[str, ...] = (
     "aetherspace",
-    "apply_aetherspace",
-    "apply_overrides",
+    "apply_knowledge",
+    "apply_migration_map",
+    "apply_structure",
     "clear_all_learning",
-    "clear_persisted_overrides",
     "clear_simulation_caches",
     "clear_template_store",
     "close",
     "delete_aetherspace",
     "execute_template",
-    "export_aetherspace",
-    "export_context",
-    "export_overrides",
     "ingest_upload_sources",
-    "refresh_connection",
+    "refresh",
     "run_interactive",
     "run_qsim",
     "run_seed_warmup",
@@ -298,19 +310,16 @@ MUTATING_ENGINE_METHODS: tuple[str, ...] = (
 MUTATING_FEDERATION_METHODS: tuple[str, ...] = (
     "add_engine",
     "aetherspace",
-    "apply_aetherspace",
-    "apply_federation_declaration",
+    "apply_federation",
+    "apply_knowledge",
     "apply_migration_map",
-    "apply_overrides",
+    "apply_structure",
     "clear_all_learning",
-    "clear_persisted_overrides",
     "clear_simulation_caches",
     "clear_template_store",
     "close",
     "delete_aetherspace",
     "execute_template",
-    "export_aetherspace",
-    "export_federation_declaration",
     "remove_engine",
     "run_interactive",
     "run_qsim",
@@ -423,10 +432,6 @@ class AsyncPipelineSession:
         """Cancel an in-flight turn on the underlying session."""
         return cast(bool, await self._to_thread(self._inner.cancel))
 
-    async def cancel_active_federation_turn(self) -> bool:
-        """Cancel an in-flight federated turn on the underlying session."""
-        return cast(bool, await self._to_thread(self._inner.cancel_active_federation_turn))
-
     async def __aenter__(self) -> AsyncPipelineSession:
         """Enter the underlying synchronous session context on a worker thread."""
         await self._to_thread(self._inner.__enter__)
@@ -443,8 +448,8 @@ class AsyncPipelineSession:
 
 def _render_interactive_suspend_step(step: SessionStep) -> None:
     """Emit suspend-phase notification and optional SQL preview via :func:`print_query_result`."""
-    if step.message:
-        notify(step.message, stage="interactive", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+    if step.prompt:
+        notify(step.prompt, stage="interactive", code=DIAGNOSTIC_CODE_ENGINE_INFO)
     if step.sql is not None:
         hdr = list(step.data.columns) if step.data is not None else None
         rows = dataframe_to_row_tuples(step.data)
@@ -452,12 +457,12 @@ def _render_interactive_suspend_step(step: SessionStep) -> None:
 
 
 def _render_interactive_terminal_step(step: SessionStep) -> None:
-    """Emit terminal errors, messages, and optional final SQL preview."""
-    if step.error:
-        error(step.error)
+    """Emit terminal errors, answers, and optional final SQL preview."""
+    if step.error is not None:
+        error(f"{step.error.code.value}" + (f" ({step.error.detail_code})" if step.error.detail_code else ""))
         return
-    if step.message:
-        notify(step.message, stage="interactive", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+    if step.answer:
+        notify(step.answer, stage="interactive", code=DIAGNOSTIC_CODE_ENGINE_INFO)
     if step.sql is not None:
         hdr = list(step.data.columns) if step.data is not None else None
         rows = dataframe_to_row_tuples(step.data)
@@ -487,32 +492,36 @@ class AetherEngine:
         "_connection",
         "_data_quality_report",
         "_audit_sink",
-        "_construction_phase_callback",
-        "_ask_phase_callback",
+        "_phase_callback",
+        "_diagnostic_sink",
+        "_diagnostic_sink_token",
         "_pipeline_writer_lock",
         "_config_file",
         "_schema_role",
         "_consumer_visible_objects",
+        "_credential_default_space_uid",
         "_context_name",
         "_sandbox_mode",
+        "_sandbox_runtime",
+        "_sandbox_extract_path",
         "_sandbox_closed",
-        "_trust_bundled_baseline",
-        "_init_notices",
+        "_session_timezone",
         "_token_provider",
-        "_business_knowledge",
+        "_domain_knowledge",
         "_schema_json_path",
         "_template_store_dir",
-        "_tenant_slug",
         "_limits",
+        "_limits_explicit",
         "_closed",
         "_engine_identity",
+        "_store_by_space",
+        "_templates_by_space",
     )
 
     def __dir__(self) -> list[str]:
         """Return names intended for interactive discovery."""
         return sorted(
             (
-                "show_config",
                 "close",
                 "session",
                 "asession",
@@ -524,37 +533,23 @@ class AetherEngine:
                 "get_qsim_summary",
                 "get_questions_only",
                 "get_seed_warmup_summary",
-                "export_overrides",
-                "apply_overrides",
-                "export_schema_overrides",
-                "apply_schema_overrides",
+                "export_structure",
+                "apply_structure",
+                "export_knowledge",
+                "apply_knowledge",
                 "aetherspace",
-                "apply_aetherspace",
                 "delete_aetherspace",
-                "export_aetherspace",
                 "export_context",
-                "export_engine_context",
                 "list_aetherspaces",
                 "list_contexts",
-                "list_engine_contexts",
-                "clear_persisted_overrides",
                 "clear_template_store",
                 "clear_simulation_caches",
                 "clear_all_learning",
                 "list_templates",
                 "fetch_template",
                 "execute_template",
-                "preview_table",
-                "preview_plan",
                 "apply_migration_map",
-                "refresh_connection",
                 "refresh",
-                "offline_sandbox",
-                "sandbox_questions",
-                "sandbox_catalog",
-                "sandbox_paraphrase_pairs",
-                "sandbox_validation_failure_demo",
-                "sandbox_feedback_demo",
             ),
         )
 
@@ -563,20 +558,19 @@ class AetherEngine:
         engine_context: EngineContext | str | None = None,
         *,
         artifacts_dir: str | None = None,
-        tenant_slug: str | None = None,
         config_file: str | os.PathLike[str] | None = None,
         connection: str | Mapping[str, Any] | None = None,
         execution_engine: Any = None,
         native_connection: Any = None,
         source_selections: Mapping[str, Mapping[str, Any]] | None = None,
         audit_sink: Callable[[AuditEvent], None] | None = None,
-        construction_phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
-        ask_phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
+        phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
+        diagnostic_sink: Callable[[Diagnostic], None] | None = None,
         role: SchemaRole = SchemaRole.OWNER,
-        trust_bundled_baseline: bool = False,
-        init_notices: tuple[str, ...] = (),
         token_provider: Callable[[], str | Mapping[str, str]] | None = None,
         limits: EngineLimits | None = None,
+        _trust_bundled_baseline: bool = False,
+        _storage_dir: str | None = None,
     ) -> None:
         """
         Initialise engine configuration from the environment, build the schema graph, and load templates.
@@ -590,17 +584,18 @@ class AetherEngine:
             When omitted, a persisted master ``EngineContext`` is loaded from ``artifacts_dir``;
             if no cached context exists, a ``ConfigError`` is raised.
             artifacts_dir: Optional directory root; engine files are stored under ``<root>/aetherdialect/<connection_slug>``.
-            tenant_slug: Optional tenant segment inserted before the connection slug to isolate artifact trees.
             config_file: Path to a TOML file. When set, every mapped field that appears in the file is authoritative for the corresponding process environment key (empty TOML values clear any inherited environment value for that key); fields omitted from the file are still read from ``os.environ``. When omitted, settings are read from ``os.environ`` only.
             connection: Named TOML connection sub-block when multiple databases of the same engine type share one config file, or a mapping of connection environment keys for this instance only (never written to ``os.environ``). String form selects credentials and the artifact slug; it is unrelated to any federation ``source_id``.
             execution_engine: Optional SQLAlchemy engine for query execution (caller-owned pool / read replica).
             native_connection: Optional native duckdb or sqlite3 connection for embedded engines.
-            For DuckDB and SQLite, ``native_connection`` or ``DuckDBRuntimeConfig.attach_connection`` ensures reflection and execution share one in-memory or file-backed database.
+            For DuckDB and SQLite, ``native_connection`` ensures reflection and execution share one in-memory or file-backed database.
             ``execution_engine`` is honored when it wraps the same ``StaticPool`` connection.
             source_selections: CSV file engine only: per-filename interpretation accepted after :func:`inspect_tabular_upload` (``header_row``, ``table_range``, ``append_regions``, etc.).
             audit_sink: Optional callback receiving :class:`AuditEvent` records at lifecycle boundaries.
+            phase_callback: Optional callback receiving :class:`PhaseProgressEvent` during construction and ask turns.
+            diagnostic_sink: Optional callback receiving :class:`Diagnostic` records from the diagnostic channel.
             role: Schema identity role; ``owner`` may mutate shared artifacts, ``consumer`` pins the owner snapshot id.
-            token_provider: Optional callable returning a fresh secret string or credential field mapping consulted when opening the database connection (initial construction and :meth:`refresh_connection`).
+            token_provider: Optional callable returning a fresh secret string or credential field mapping consulted when opening the database connection (initial construction and :meth:`refresh`).
 
         Raises:
 
@@ -620,24 +615,26 @@ class AetherEngine:
         self._connection = None
         self._data_quality_report: DataQualityReport | None = None
         self._audit_sink = audit_sink
-        self._construction_phase_callback = construction_phase_callback
-        self._ask_phase_callback = ask_phase_callback
+        self._phase_callback = phase_callback
+        self._diagnostic_sink = diagnostic_sink
+        self._diagnostic_sink_token = push_diagnostic_sink(diagnostic_sink)
         self._pipeline_writer_lock = threading.Lock()
         self._schema_role = role
         self._consumer_visible_objects: frozenset[str] | None = None
+        self._credential_default_space_uid: str | None = None
         self._context_name = MASTER_AETHERSPACE_NAME
         self._sandbox_mode = False
+        self._sandbox_runtime = None
+        self._sandbox_extract_path = None
         self._sandbox_closed = False
-        self._trust_bundled_baseline = bool(trust_bundled_baseline)
-        self._init_notices = tuple(init_notices)
+        self._session_timezone = None
         self._token_provider = token_provider
+        self._limits_explicit = limits is not None
         self._limits = limits if limits is not None else EngineLimits()
         self._closed = False
-        self._tenant_slug = str(tenant_slug).strip() if tenant_slug is not None and str(tenant_slug).strip() else None
         bundle = self._initialize_engine_bundle(
             engine_context,
             artifacts_dir=artifacts_dir,
-            tenant_slug=self._tenant_slug,
             config_file=config_file,
             connection=connection,
             log_sink=_init_log_sink,
@@ -645,12 +642,15 @@ class AetherEngine:
             native_connection=self._native_connection,
             schema_role=role,
             source_selections=source_selections,
-            trust_bundled_baseline=self._trust_bundled_baseline,
+            trust_bundled_baseline=_trust_bundled_baseline,
             token_provider=token_provider,
+            limits=self._limits,
+            storage_dir=_storage_dir,
         )
         self._apply_init_bundle(bundle)
-        self._business_knowledge = BusinessKnowledgeHolder()
-        self._ingest_notes_business_knowledge()
+        self._domain_knowledge = DomainKnowledgeHolder()
+        if not self._load_persisted_domain_knowledge():
+            self._ingest_notes_domain_knowledge()
         self._audit_emit(
             "init",
             question=None,
@@ -672,13 +672,13 @@ class AetherEngine:
         """Keyword arguments for :func:`initialize_aether_engine` when reloading state."""
         return {
             "artifacts_dir": str(self._artifacts_dir),
-            "tenant_slug": self._tenant_slug,
             "log_sink": _init_log_sink,
             "execution_engine": self._execution_engine,
             "native_connection": getattr(self, "_native_connection", None),
             "config_file": self._config_file,
             "schema_role": self._schema_role,
-            "trust_bundled_baseline": getattr(self, "_trust_bundled_baseline", False),
+            "limits": self._limits,
+            "storage_dir": str(self._artifacts_dir),
         }
 
     def _initialize_engine_bundle(
@@ -687,16 +687,11 @@ class AetherEngine:
         **kwargs: Any,
     ) -> AetherEngineInitResult:
         """Run :func:`initialize_aether_engine` with construction-phase progress wired."""
-        token = push_construction_phase_callback(self._construction_phase_callback)
+        token = push_construction_phase_callback(self._phase_callback)
         try:
             return initialize_aether_engine(engine_context, **kwargs)
         finally:
             pop_construction_phase_callback(token)
-
-    @property
-    def init_notices(self) -> tuple[str, ...]:
-        """Fixture-resolution notices emitted during engine construction."""
-        return getattr(self, "_init_notices", ())
 
     def _single_engine_context(self) -> EngineContext:
         ctx = self._runtime_config.engine_context
@@ -708,32 +703,100 @@ class AetherEngine:
         if self._schema_role != SchemaRole.OWNER:
             raise OwnerOnlyOperationError(operation)
 
-    def _require_master_context(self, operation: str) -> None:
-        if getattr(self, "_context_name", MASTER_AETHERSPACE_NAME) != MASTER_AETHERSPACE_NAME:
-            raise ConfigError(
-                f"Operation {operation!r} requires the master engine context; "
-                "this instance is bound to a non-master context.",
-            )
+    def _caller_visibility(self) -> tuple[EngineContext | FederationContext, frozenset[str] | None]:
+        """Return scope context and caller-visible objects; consumers fail closed to an empty set when visibility is unset."""
+        scope_ctx = MainExecutionOps.resolve_preview_scope_context(self)
+        visible = getattr(self, "_consumer_visible_objects", None)
+        if self._schema_role == SchemaRole.CONSUMER and visible is None:
+            visible = frozenset()
+        if visible is not None and not isinstance(visible, frozenset):
+            visible = frozenset(visible)
+        return scope_ctx, visible
+
+    def _resolve_session_space(self, space: str | None) -> str:
+        if space is None:
+            return self.default_space_uid
+        return str(space)
 
     def _resolve_aetherspace(
-        self, name: str
+        self, token: str
     ) -> tuple[AetherSpace, frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
-        norm = str(name).strip().lower()
-        if not norm:
-            raise ConfigError("aetherspace name must be non-empty")
-        if norm == MASTER_AETHERSPACE_NAME:
+        raw = str(token).strip()
+        if not raw:
+            raise ConfigError("aetherspace identity must be non-empty")
+        lower = raw.lower()
+        if lower == MASTER_AETHERSPACE_NAME:
             desc = build_master_space_descriptor(self._schema_graph)
             return desc, frozenset(), frozenset(), frozenset(), frozenset()
-        snap = load_aetherspace_snapshot(str(self._artifacts_dir), norm)
+        uid: str | None = None
+        snap: dict[str, Any] | None = None
+        try:
+            candidate = MainExecutionOps.validate_space_uid(raw)
+        except ValueError:
+            candidate = None
+        if candidate is not None and candidate != MASTER_AETHERSPACE_UID:
+            snap = load_aetherspace_snapshot(str(self._artifacts_dir), candidate)
+            if snap is not None:
+                uid = candidate
+        if uid is None:
+            uid = resolve_aetherspace_identity(str(self._artifacts_dir), lower)
+            if uid == MASTER_AETHERSPACE_UID:
+                desc = build_master_space_descriptor(self._schema_graph)
+                return desc, frozenset(), frozenset(), frozenset(), frozenset()
+            snap = load_aetherspace_snapshot(str(self._artifacts_dir), uid)
         if snap is None:
-            raise ConfigError(f"unknown aetherspace {name!r}")
+            raise ConfigError(f"unknown aetherspace {token!r}")
+        desc = aetherspace_descriptor_from_snapshot(uid, snap)
+        tables, columns = space_allowed_sets_from_snapshot(snap)
+        deny_objects, deny_columns = space_deny_sets_from_snapshot(snap)
+        scope_ctx, visible = self._caller_visibility()
+        if not aetherspace_within_effective_visibility(
+            tables,
+            columns,
+            self._schema_graph,
+            scope_ctx,
+            visible,
+        ):
+            raise ConfigError(f"unknown aetherspace {token!r}")
         tables_raw = snap.get("tables")
         if isinstance(tables_raw, (list, tuple)) and len(tables_raw) == 0:
             raise ConfigError("space empty after schema migration; redefine")
-        desc = aetherspace_descriptor_from_snapshot(norm, snap)
-        tables, columns = space_allowed_sets_from_snapshot(snap)
-        deny_objects, deny_columns = space_deny_sets_from_snapshot(snap)
+        if getattr(self, "_sandbox_mode", False):
+            Sandbox.require_sandbox_space_lock(desc.name, tables)
         return desc, tables, columns, deny_objects, deny_columns
+
+    def _resolve_aetherspace_visible_by_name(self, name: str) -> AetherSpace:
+        """Resolve display *name* among spaces visible to the caller (unique match required)."""
+        try:
+            norm = TemplateOps.validate_space_name(str(name).strip().lower())
+        except ValueError as exc:
+            raise ConfigError(f"invalid aetherspace name: {name!r}") from exc
+        if norm == MASTER_AETHERSPACE_NAME:
+            return build_master_space_descriptor(self._schema_graph)
+        scope_ctx, visible = self._caller_visibility()
+        matches: list[AetherSpace] = []
+        for uid, label in list_saved_aetherspace_entries(str(self._artifacts_dir)):
+            if label != norm:
+                continue
+            snap = load_aetherspace_snapshot(str(self._artifacts_dir), uid)
+            if snap is None:
+                continue
+            tables, columns = space_allowed_sets_from_snapshot(snap)
+            if not aetherspace_within_effective_visibility(
+                tables,
+                columns,
+                self._schema_graph,
+                scope_ctx,
+                visible,
+            ):
+                continue
+            matches.append(aetherspace_descriptor_from_snapshot(uid, snap))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            uids = ", ".join(m.uid for m in matches)
+            raise ConfigError(f"ambiguous aetherspace name {norm!r}; matches uids {uids}")
+        raise ConfigError(f"unknown aetherspace {name!r}")
 
     def _require_production_api(self, operation: str) -> None:
         if getattr(self, "_sandbox_mode", False):
@@ -749,8 +812,9 @@ class AetherEngine:
         question: str | None = None,
         schema_hash: str | None = None,
         details: tuple[tuple[str, str], ...] = (),
+        turn_id: str | None = None,
     ) -> None:
-        sink = self._audit_sink
+        sink = getattr(self, "_audit_sink", None)
         if sink is None:
             return
         ev = AuditEvent(
@@ -760,6 +824,7 @@ class AetherEngine:
             schema_hash=schema_hash,
             provider=self._llm_config.provider,
             details=details,
+            turn_id=turn_id,
         )
         sink(ev)
 
@@ -785,6 +850,27 @@ class AetherEngine:
         register_dialect_live_handles(self._dialect, owner=self)
         register_engine_skeleton_cache_owner(self)
         clear_engine_skeleton_cache(self)
+        self._credential_default_space_uid = None
+        if self._schema_role == SchemaRole.CONSUMER:
+            dk = None
+            holder = getattr(self, "_domain_knowledge", None)
+            if holder is not None:
+                try:
+                    dk = holder.entries()
+                except Exception:
+                    dk = None
+            self._credential_default_space_uid = MainExecutionOps.ensure_credential_default_aetherspace(
+                str(self._artifacts_dir),
+                self._schema_graph,
+                self._consumer_visible_objects,
+                engine_domain_knowledge=dk,
+            )
+        MainExecutionOps.bind_owner_default_template_store(
+            self,
+            self._schema_graph,
+            str(self._artifacts_dir),
+            schema_role=self._schema_role,
+        )
 
     @property
     def data_quality_report(self) -> DataQualityReport | None:
@@ -802,7 +888,7 @@ class AetherEngine:
     ) -> UploadIngestResult:
         """Validate uploads and materialise accepted relations into this embedded member."""
         if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
+            raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
         self._require_owner("ingest_upload_sources")
         return CsvDialect.ingest_upload_sources_into_engine(
             self,
@@ -816,95 +902,285 @@ class AetherEngine:
         """Return a read-only preview of schema migration impact against stored artifacts."""
         return preview_schema_migration(artifacts_dir=self._artifacts_dir, schema_graph=self._schema_graph)
 
-    def set_business_knowledge(self, entries: Sequence[BusinessKnowledgeEntry]) -> int:
-        """Replace prompt-time business knowledge and return the new monotonic version."""
-        holder = getattr(self, "_business_knowledge", None)
+    def _replace_domain_knowledge(self, entries: Sequence[DomainKnowledgeEntry]) -> None:
+        """Replace prompt-time domain knowledge (internal; public path is apply_knowledge)."""
+        holder = getattr(self, "_domain_knowledge", None)
         if holder is None:
-            self._business_knowledge = BusinessKnowledgeHolder()
-            holder = self._business_knowledge
-        return holder.set(entries, self._schema_graph)
+            self._domain_knowledge = DomainKnowledgeHolder()
+            holder = self._domain_knowledge
+        holder.set(entries, self._schema_graph)
+        self._persist_domain_knowledge()
 
-    def _ingest_notes_business_knowledge(self) -> None:
-        """Pass B: extract business knowledge from construction notes when present."""
+    def _refresh_aetherspace_snapshots_after_master_knowledge_change(self) -> None:
+        """Re-derive prose on note-bearing space snapshots when master DK or descriptions change."""
+        holder = getattr(self, "_domain_knowledge", None)
+        dk = holder.entries() if isinstance(holder, DomainKnowledgeHolder) else ()
+        try:
+            MainExecutionOps.reenrich_aetherspace_snapshots_with_notes(
+                str(self._artifacts_dir),
+                self._schema_graph,
+                engine_domain_knowledge=dk,
+            )
+        except OSError:
+            pass
+
+    def _persist_domain_knowledge(self) -> None:
+        """Write master domain knowledge beside the schema cache for reopen / prompt reload."""
+        holder = getattr(self, "_domain_knowledge", None)
+        if not isinstance(holder, DomainKnowledgeHolder):
+            return
+        try:
+            stamps = knowledge_artifact_save_stamps(self._schema_graph)
+            save_domain_knowledge_artifact(self._artifacts_dir, holder.entries(), **stamps)
+            refresh = getattr(self, "_refresh_aetherspace_snapshots_after_master_knowledge_change", None)
+            if callable(refresh):
+                refresh()
+        except OSError:
+            pass
+
+    def _clear_notes_domain_knowledge(self) -> None:
+        """Drop in-memory and on-disk notes-derived domain knowledge when notes are absent."""
+        holder = getattr(self, "_domain_knowledge", None)
+        if holder is None:
+            self._domain_knowledge = DomainKnowledgeHolder()
+            holder = self._domain_knowledge
+        holder.set((), self._schema_graph)
+        try:
+            delete_domain_knowledge_artifact(self._artifacts_dir)
+        except OSError:
+            pass
+
+    def _load_persisted_domain_knowledge(self) -> bool:
+        """Load master domain knowledge from artifacts when present. Returns True when applied."""
+        loaded = load_domain_knowledge_artifact(self._artifacts_dir, self._schema_graph)
+        if loaded is None:
+            return False
+        holder = getattr(self, "_domain_knowledge", None)
+        if holder is None:
+            self._domain_knowledge = DomainKnowledgeHolder()
+            holder = self._domain_knowledge
+        holder.set(loaded, self._schema_graph)
+        self._audit_emit(
+            "domain_knowledge_ingest",
+            details=(
+                ("status", "loaded_artifact"),
+                ("kept", str(len(loaded))),
+                ("dropped", "0"),
+                ("keys", ",".join(e.key for e in loaded)),
+            ),
+        )
+        return True
+
+    def _ingest_notes_domain_knowledge(self) -> None:
+        """Extract domain knowledge from construction notes when present. Persists an empty artifact only when extract intentionally returned nothing with notes present (no filter drops)."""
         ctx = getattr(getattr(self, "_runtime_config", None), "engine_context", None)
-        notes_path = getattr(ctx, "notes_file", None) if ctx is not None else None
-        notes_inline = getattr(ctx, "notes", None) if ctx is not None else None
-        notes_content: str | None = None
-        if notes_inline is not None and str(notes_inline).strip():
-            notes_content = str(notes_inline)
-        elif notes_path is not None and str(notes_path).strip():
-            path = os.path.expanduser(str(notes_path).strip())
-            if os.path.isfile(path):
-                with open(path, encoding="utf-8") as fh:
-                    notes_content = fh.read()
-        entries = extract_business_knowledge_from_notes(notes_content, self._schema_graph)
-        if entries:
-            self.set_business_knowledge(entries)
+        notes_content = notes_content_from_context(ctx) if ctx is not None else None
+        if notes_content is None or not str(notes_content).strip():
+            self._clear_notes_domain_knowledge()
+            self._audit_emit(
+                "domain_knowledge_ingest",
+                details=(("status", "skipped_no_notes"), ("kept", "0")),
+            )
+            return
+        try:
+            entries = extract_domain_knowledge_from_notes(notes_content, self._schema_graph)
+        except MockFixtureMissingError:
+            if EngineConfig.is_sandbox_llm_provider(EngineConfig.LLM_PROVIDER):
+                self._audit_emit(
+                    "domain_knowledge_ingest",
+                    details=(("status", "skipped_sandbox_fixture"), ("kept", "0")),
+                )
+                return
+            raise
+        safe = filter_schema_anchored_domain_knowledge(entries, self._schema_graph) if entries else ()
+        dropped = len(entries) - len(safe)
+        if safe:
+            self._replace_domain_knowledge(safe)
+        elif not safe and not dropped:
+            self._persist_domain_knowledge()
+        self._audit_emit(
+            "domain_knowledge_ingest",
+            details=(
+                (
+                    "status",
+                    "ok" if safe else ("empty_after_filter" if dropped else "empty"),
+                ),
+                ("kept", str(len(safe))),
+                ("dropped", str(dropped)),
+                ("notes_chars", str(len(notes_content))),
+                ("keys", ",".join(e.key for e in safe)),
+            ),
+        )
 
-    def business_knowledge(self) -> tuple[BusinessKnowledgeEntry, ...]:
-        """Return the active business knowledge entries."""
-        holder = getattr(self, "_business_knowledge", None)
-        if not isinstance(holder, BusinessKnowledgeHolder):
+    def _domain_knowledge_entries(self) -> tuple[DomainKnowledgeEntry, ...]:
+        """Return active domain knowledge entries (internal; public path is export_knowledge)."""
+        holder = getattr(self, "_domain_knowledge", None)
+        if not isinstance(holder, DomainKnowledgeHolder):
             return ()
         return holder.entries()
 
-    def business_knowledge_digest(self) -> str:
-        """Return a stable digest of the active business knowledge."""
-        holder = getattr(self, "_business_knowledge", None)
-        if not isinstance(holder, BusinessKnowledgeHolder):
-            return ""
-        return holder.digest()
+    def _resolve_space_knowledge_export_target(self, space: str | None) -> tuple[str | None, dict[str, Any] | None]:
+        """Resolve export target for one space; ``None`` selects :attr:`default_space_uid`."""
+        resolved = self._resolve_session_space(space)
+        norm = str(resolved).strip().lower()
+        if not norm:
+            raise ConfigError("space identity must be non-empty")
+        if norm in (MASTER_AETHERSPACE_NAME, MASTER_AETHERSPACE_UID):
+            self._require_owner("export_knowledge")
+            return MASTER_AETHERSPACE_UID, None
+        desc = self._resolve_aetherspace(norm)[0]
+        space_snapshot = load_aetherspace_snapshot(str(self._artifacts_dir), desc.uid)
+        if space_snapshot is None:
+            raise ConfigError(f"unknown aetherspace {resolved!r}")
+        return desc.uid, space_snapshot
 
-    def business_knowledge_version(self) -> int:
-        """Return the monotonic version counter for business knowledge updates."""
-        holder = getattr(self, "_business_knowledge", None)
-        if not isinstance(holder, BusinessKnowledgeHolder):
-            return 0
-        return holder.version()
-
-    def export_space_knowledge(self, space: str | None = None) -> dict[str, Any]:
-        """Return business knowledge for master or one named space (key/kind/text only)."""
-        space_snapshot = None
-        if space is not None:
-            norm = str(space).strip().lower()
-            if norm and norm != MASTER_AETHERSPACE_NAME:
-                space_snapshot = load_aetherspace_snapshot(str(self._artifacts_dir), norm)
-                if space_snapshot is None:
-                    raise ConfigError(f"unknown aetherspace {space!r}")
-        return MainExecutionOps.build_space_knowledge_export(
-            engine_entries=self.business_knowledge(),
-            business_knowledge_version=self.business_knowledge_version(),
-            space=space,
+    def export_knowledge(self, space: str | None = None) -> dict[str, Any]:
+        """Return space domain knowledge and description overlays for the default or one named space."""
+        space_token, space_snapshot = self._resolve_space_knowledge_export_target(space)
+        scope_ctx, visible = self._caller_visibility()
+        payload = MainExecutionOps.build_space_knowledge_export(
+            engine_entries=self._domain_knowledge_entries(),
+            space=space_token,
             space_snapshot=space_snapshot,
-        )
-
-    def export_knowledge(self) -> dict[str, Any]:
-        """Return engine plus per-space business knowledge wrapper for agents and metadata review."""
-        snapshots: dict[str, Any] = {}
-        for name in list_saved_aetherspace_names(str(self._artifacts_dir)):
-            snap = load_aetherspace_snapshot(str(self._artifacts_dir), name)
-            if snap is not None:
-                snapshots[name] = snap
-        return MainExecutionOps.build_knowledge_export(
-            engine_entries=self.business_knowledge(),
-            business_knowledge_version=self.business_knowledge_version(),
-            space_snapshots=snapshots,
-        )
-
-    def export_metadata(self, space: str | None = None) -> dict[str, Any]:
-        """Return deterministic table/column inventory for master or one named space."""
-        space_snapshot = None
-        if space is not None:
-            norm = str(space).strip().lower()
-            if norm and norm != MASTER_AETHERSPACE_NAME:
-                space_snapshot = load_aetherspace_snapshot(str(self._artifacts_dir), norm)
-                if space_snapshot is None:
-                    raise ConfigError(f"unknown aetherspace {space!r}")
-        return MainExecutionOps.build_metadata_export(
             schema_graph=self._schema_graph,
-            space=space,
-            space_snapshot=space_snapshot,
+            scope_ctx=scope_ctx,
+            visible_objects=visible,
         )
+        self._audit_emit(
+            "export_knowledge",
+            schema_hash=self._effective_structural_hash or None,
+            details=(("space", str(space_token or "default")),),
+        )
+        payload.pop("format_version", None)
+        return payload
+
+    def export_structure(self, space: str | None = None) -> dict[str, Any]:
+        """Return structural inventory merged with editable overrides for the default or one named space."""
+        resolved_space = self._resolve_session_space(space)
+        space_snapshot = None
+        space_token = resolved_space
+        norm = str(resolved_space).strip().lower()
+        if norm and norm not in (MASTER_AETHERSPACE_NAME, MASTER_AETHERSPACE_UID):
+            desc = self._resolve_aetherspace(norm)[0]
+            space_token = desc.uid
+            space_snapshot = load_aetherspace_snapshot(str(self._artifacts_dir), desc.uid)
+            if space_snapshot is None:
+                raise ConfigError(f"unknown aetherspace {resolved_space!r}")
+        scope_ctx, visible = self._caller_visibility()
+        inventory = MainExecutionOps.build_structure_export(
+            schema_graph=self._schema_graph,
+            space=space_token,
+            space_snapshot=space_snapshot,
+            scope_ctx=scope_ctx,
+            visible_objects=visible,
+        )
+        overrides_raw = dump_structure_edits(self._schema_graph)
+        payload = build_public_structure_document(
+            inventory=inventory,
+            overrides={
+                "tables": overrides_raw.get("tables") or {},
+                "foreign_keys_add": overrides_raw.get("foreign_keys_add") or [],
+                "foreign_keys_remove": overrides_raw.get("foreign_keys_remove") or [],
+                "primary_keys_add": overrides_raw.get("primary_keys_add") or [],
+                "primary_keys_remove": overrides_raw.get("primary_keys_remove") or [],
+            },
+        )
+        self._audit_emit(
+            "export_structure",
+            schema_hash=self._effective_structural_hash or None,
+            details=(("space", str(space_token if space_token is not None else "default")),),
+        )
+        return payload
+
+    @_writer_lock_guard
+    def apply_knowledge(self, space: str, document: Mapping[str, Any]) -> None:
+        """Replace space domain knowledge and description overlays from one exported document."""
+        fields = MainExecutionOps.knowledge_document_apply_fields(document)
+        self._apply_knowledge_impl(
+            space,
+            domain_knowledge=fields.get("domain_knowledge"),
+            table_descriptions=fields.get("table_descriptions"),
+            column_descriptions=fields.get("column_descriptions"),
+        )
+
+    @_writer_lock_guard
+    def apply_structure(self, document: Mapping[str, Any]) -> None:
+        """Apply a structural document declaratively; the document becomes the truth."""
+        self._require_owner("apply_structure")
+        schema_json_path = str(self._artifacts_dir / "schema_graph.json.gz")
+        report = apply_structure_document(
+            self._schema_graph,
+            document,
+            schema_json_path=schema_json_path,
+            dialect=self._dialect,
+            domain_knowledge=self._domain_knowledge_entries(),
+        )
+        if report.domain_knowledge_entries is not None:
+            self._replace_domain_knowledge(report.domain_knowledge_entries)
+        if (
+            report.table_edits
+            or report.column_edits
+            or report.fks_added
+            or report.fks_removed
+            or report.pks_added
+            or report.pks_endorsed
+            or report.pks_blocked
+            or report.coerced_columns
+            or report.collapsed_inferences
+        ):
+            self._schema_stats = self._schema_graph.refresh_schema_stats()
+        sh = getattr(self._schema_graph, "effective_structural_hash", None)
+        self._audit_emit(
+            "apply_structure",
+            schema_hash=str(sh) if sh is not None else None,
+            details=(
+                ("table_edits", str(report.table_edits)),
+                ("column_edits", str(report.column_edits)),
+            ),
+        )
+
+    def _apply_knowledge_impl(
+        self,
+        space: str,
+        *,
+        domain_knowledge: Sequence[DomainKnowledgeEntry | Mapping[str, Any]] | None = None,
+        table_descriptions: Mapping[str, str] | None = None,
+        column_descriptions: Mapping[str, str] | None = None,
+    ) -> None:
+        """Internal apply path for space knowledge overlays."""
+        self._require_owner("apply_knowledge")
+        norm = str(space).strip().lower()
+        if not norm:
+            raise ConfigError("space identity must be non-empty")
+        if norm in (MASTER_AETHERSPACE_NAME, MASTER_AETHERSPACE_UID):
+            if domain_knowledge is None and table_descriptions is None and column_descriptions is None:
+                raise ConfigError(
+                    "apply_knowledge requires domain_knowledge and/or table_descriptions and/or column_descriptions"
+                )
+            if domain_knowledge is not None:
+                self._replace_domain_knowledge(MainExecutionOps.normalize_domain_knowledge_entries(domain_knowledge))
+            if table_descriptions is not None or column_descriptions is not None:
+                MainExecutionOps.apply_master_space_knowledge_to_graph(
+                    self._schema_graph,
+                    schema_json_path=str(self._artifacts_dir / "schema_graph.json.gz"),
+                    table_descriptions=table_descriptions,
+                    column_descriptions=column_descriptions,
+                )
+                self._refresh_aetherspace_snapshots_after_master_knowledge_change()
+            return
+        desc = self._resolve_aetherspace(norm)[0]
+        snap = load_aetherspace_snapshot(str(self._artifacts_dir), desc.uid)
+        if snap is None:
+            raise ConfigError(f"unknown aetherspace {space!r}")
+        updated = MainExecutionOps.apply_knowledge_to_snapshot(
+            snap,
+            domain_knowledge=domain_knowledge,
+            table_descriptions=table_descriptions,
+            column_descriptions=column_descriptions,
+            schema_graph=self._schema_graph,
+        )
+        updated = filter_space_snapshot_sensitive_columns(updated, self._schema_graph)
+        save_aetherspace_snapshot(str(self._artifacts_dir), desc.uid, updated)
 
     @property
     def _schema_graph_id(self) -> str:
@@ -920,19 +1196,6 @@ class AetherEngine:
     def limits(self) -> EngineLimits:
         """Read-only behavioural limits for this engine instance."""
         return self._limits
-
-    @property
-    def live_connection_handle(self) -> Any:
-        """Return the SQLAlchemy engine or native connection used for execution."""
-        if self._execution_engine is not None:
-            return self._execution_engine
-        native = getattr(self, "_native_connection", None)
-        if native is not None:
-            return native
-        sa_engine = getattr(self._dialect, "engine", None)
-        if sa_engine is not None:
-            return sa_engine
-        return getattr(self._dialect, "connection", None)
 
     def _require_open(self, operation: str) -> None:
         if getattr(self, "_closed", False):
@@ -953,6 +1216,10 @@ class AetherEngine:
         LLMProvider.clear_llm_clients()
         drop_engine_skeleton_cache_owner(self)
         clear_expansion_subtree_pool(str(self._artifacts_dir))
+        sink_token = getattr(self, "_diagnostic_sink_token", None)
+        if sink_token is not None:
+            pop_diagnostic_sink(sink_token)
+            self._diagnostic_sink_token = cast(Any, None)
         self._closed = True
         self._audit_emit("close", schema_hash=self._effective_structural_hash or None)
 
@@ -969,13 +1236,17 @@ class AetherEngine:
         return False
 
     @_writer_lock_guard
-    def refresh_connection(
+    def refresh(
         self,
+        *,
+        reflect: bool = True,
         credentials: str | Mapping[str, str] | None = None,
-    ) -> None:
-        """Replace database credentials and reopen the live connection without rebuilding schema artifacts."""
+    ) -> RefreshReport:
+        """Re-resolve credentials, reopen the connection, and reconcile artifacts against the live schema."""
+        self._require_owner("refresh")
+        self._require_open("refresh")
         if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
+            raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
         engine_type = self.dialect
         self._dialect = refresh_engine_connection(
             engine_type=engine_type,
@@ -984,19 +1255,8 @@ class AetherEngine:
             token_provider=getattr(self, "_token_provider", None),
             execution_engine=self._execution_engine,
             native_connection=getattr(self, "_native_connection", None),
+            runtime=cast(Any, self._runtime_config),
         )
-        self._audit_emit(
-            "connection_refresh",
-            schema_hash=self._effective_structural_hash or None,
-            details=(("engine", engine_type),),
-        )
-
-    @_writer_lock_guard
-    def refresh(self, *, reflect: bool = True) -> RefreshReport:
-        """Reconcile artifacts against the live or cached schema graph without reconstructing the engine."""
-        self._require_open("refresh")
-        if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
         report = MainExecutionOps.refresh_aether_engine(self, reflect=reflect)
         self._audit_emit(
             "refresh",
@@ -1014,11 +1274,6 @@ class AetherEngine:
     def _write_queue_path(self) -> Path:
         """Internal path to ``write_queue.jsonl`` under the engine storage directory."""
         return self._artifacts_dir / WRITE_QUEUE_FILENAME
-
-    @property
-    def last_overrides_skipped(self) -> tuple[OverrideSkip, ...]:
-        """Per-entry skips recorded by the most recent overrides replay (empty before any sidecar applies)."""
-        return tuple(getattr(self._schema_graph, "_last_overrides_skipped", ()) or ())
 
     @property
     def _effective_structural_hash(self) -> str:
@@ -1051,18 +1306,35 @@ class AetherEngine:
         self,
         *,
         mode: Literal["reader", "writer"] = "writer",
-        space: str = "master",
+        space: str | None = None,
         ephemeral_scope: SpaceContext | None = None,
         data_row_cap: int | None = None,
     ) -> PipelineSession:
         """Return a programmatic session sharing this instance's schema graph and template store. ``writer`` mode may mutate artifacts and takes ``_pipeline_writer_lock`` only around store and write-queue mutations; ``reader`` mode is read-only and never takes that lock."""
         self._require_open("session")
         if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
+            raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
         Sandbox.require_sandbox_adoption(self)
         if self._schema_role == SchemaRole.CONSUMER and mode == "writer":
             raise OwnerOnlyOperationError("PipelineSession(mode='writer')")
-        _, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(space)
+        desc, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(
+            self._resolve_session_space(space)
+        )
+        if ephemeral_scope is not None and (
+            ephemeral_scope.tables
+            or ephemeral_scope.columns
+            or ephemeral_scope.deny_objects
+            or ephemeral_scope.deny_columns
+        ):
+            ephemeral_scope = validate_space_context_against_graph(ephemeral_scope, self._schema_graph)
+            scope_ctx, visible = self._caller_visibility()
+            validate_aetherspace_define_within_visibility(
+                ephemeral_scope.tables,
+                ephemeral_scope.columns,
+                self._schema_graph,
+                scope_ctx,
+                visible,
+            )
         space_tables, space_columns, space_deny_objects, space_deny_columns = intersect_space_scope(
             space_tables,
             space_columns,
@@ -1071,9 +1343,9 @@ class AetherEngine:
             ephemeral_scope,
         )
         space_description_overlay: dict[str, Any] | None = None
-        norm = str(space).strip().lower()
-        if norm != MASTER_AETHERSPACE_NAME:
-            snap = load_aetherspace_snapshot(str(self._artifacts_dir), norm)
+        space_uid = desc.uid
+        if space_uid != MASTER_AETHERSPACE_UID:
+            snap = load_aetherspace_snapshot(str(self._artifacts_dir), space_uid)
             if isinstance(snap, dict):
                 table_descriptions = snap.get("table_descriptions")
                 column_meta = snap.get("column_meta")
@@ -1082,22 +1354,14 @@ class AetherEngine:
                         "table_descriptions": dict(table_descriptions or {}),
                         "column_meta": dict(column_meta or {}),
                     }
-        exec_ctx = getattr(self._runtime_config, "execution_context", None)
-        if exec_ctx is None:
-            exec_ctx = self._runtime_config.engine_context
-        validate_space_subset_of_execution_context(
-            space_tables,
-            space_columns,
-            exec_ctx,
-            self._schema_graph,
-        )
         payload_visible = space_tables if space_tables else None
+        MainExecutionOps.bind_template_store_for_space(self, space_uid)
         return PipelineSession(
             self,
             mode=mode,
             visible_objects=payload_visible,
             execution_visible_objects=self._consumer_visible_objects,
-            space_name=str(space).strip().lower(),
+            space_name=space_uid,
             space_tables=space_tables,
             space_columns=space_columns,
             space_deny_objects=space_deny_objects,
@@ -1106,158 +1370,202 @@ class AetherEngine:
             data_row_cap=data_row_cap,
         )
 
-    def preview_table(self, table_name: str, *, limit: int = TABLE_PREVIEW_DEFAULT_LIMIT) -> TablePreviewResult:
-        """Return the first rows of *table_name* through scope and sensitivity gates."""
-        if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
-        return preview_table_on_engine(self, table_name, limit=limit)
-
-    def preview_plan(self, question: str) -> PlanPreviewResult:
-        """Return what a turn would run for *question* without generating or executing SQL."""
-        if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
-        return preview_plan_on_engine(
-            self,
-            question,
-            visible_objects=self._consumer_visible_objects,
-            execution_visible_objects=self._consumer_visible_objects,
-        )
-
     def asession(
         self,
         *,
         mode: Literal["reader", "writer"] = "writer",
-        space: str = "master",
+        space: str | None = None,
+        ephemeral_scope: SpaceContext | None = None,
+        data_row_cap: int | None = None,
     ) -> AsyncPipelineSession:
         """Async wrapper around :meth:`session` (uses threads; underlying API remains synchronous)."""
-        return AsyncPipelineSession(self.session(mode=mode, space=space))
+        return AsyncPipelineSession(
+            self.session(mode=mode, space=space, ephemeral_scope=ephemeral_scope, data_row_cap=data_row_cap)
+        )
 
     @_writer_lock_guard
     def aetherspace(
         self,
-        name: str,
+        name: str | None = None,
         space_context: SpaceContext | None = None,
         *,
+        uid: str | None = None,
         notes_file: str | None = None,
         notes: str | None = None,
     ) -> AetherSpace:
-        """Check or define a named aetherspace scope snapshot."""
-        norm = str(name).strip().lower()
-        if not norm:
-            raise ConfigError("aetherspace name must be non-empty")
-        if space_context is None:
-            return self._resolve_aetherspace(norm)[0]
-        self._require_owner("aetherspace")
-        self._require_master_context("aetherspace")
-        if norm == MASTER_AETHERSPACE_NAME:
-            raise ConfigError(
-                "master is the implicit full-scope space; it cannot be created or overwritten",
-            )
+        """Create, update, or read an aetherspace (uid is durable identity; name is a label)."""
         if notes_file is not None and notes is not None:
             raise ConfigError("set at most one of notes and notes_file")
+        try:
+            uid_norm = MainExecutionOps.validate_space_uid(str(uid).strip()) if uid is not None else None
+        except ValueError as exc:
+            raise ConfigError(f"invalid aetherspace uid: {uid!r}") from exc
+        name_norm = str(name).strip().lower() if name is not None else None
+        if space_context is None:
+            if uid_norm and name_norm:
+                raise ConfigError("read aetherspace with uid or name, not both")
+            if uid_norm:
+                return self._resolve_aetherspace(uid_norm)[0]
+            if name_norm:
+                return self._resolve_aetherspace_visible_by_name(name_norm)
+            raise ConfigError("aetherspace read requires uid or name")
+        self._require_owner("aetherspace")
+        if uid_norm:
+            if uid_norm == MASTER_AETHERSPACE_UID:
+                raise ConfigError(
+                    "master is the implicit full-scope space; it cannot be created or overwritten",
+                )
+            desc = self._resolve_aetherspace(uid_norm)[0]
+            display = name_norm if name_norm else desc.name
+        else:
+            if not name_norm:
+                raise ConfigError("aetherspace create requires name")
+            if name_norm == MASTER_AETHERSPACE_NAME:
+                raise ConfigError(
+                    "master is the implicit full-scope space; it cannot be created or overwritten",
+                )
+            try:
+                display = TemplateOps.validate_space_name(name_norm)
+            except ValueError as exc:
+                raise ConfigError(f"invalid aetherspace name: {name!r}") from exc
+            uid_norm = allocate_aetherspace_uid(str(self._artifacts_dir))
+        scope_ctx, visible = self._caller_visibility()
+        validate_aetherspace_define_within_visibility(
+            space_context.tables,
+            space_context.columns,
+            self._schema_graph,
+            scope_ctx,
+            visible,
+        )
         validated = validate_space_context_against_graph(space_context, self._schema_graph)
+        if getattr(self, "_sandbox_mode", False):
+            Sandbox.require_sandbox_space_lock(display, validated.tables)
         snapshot = subset_graph_for_space(self._schema_graph, validated)
+        snapshot["uid"] = uid_norm
+        snapshot["name"] = display
         if notes_file is not None:
             notes_path, notes_inline = notes_file, None
         elif notes is not None:
             notes_path, notes_inline = None, notes
         else:
             notes_path, notes_inline = validated.notes_file, validated.notes
+        if notes_path is not None and str(notes_path).strip() and getattr(self, "_sandbox_mode", False):
+            connection = getattr(self, "_native_connection", None)
+            host = Sandbox.sandbox_host_for_connection(connection) if connection is not None else None
+            if host is not None:
+                notes_path = Sandbox.validate_sandbox_aetherspace_notes_pairing(
+                    display,
+                    notes_path,
+                    extract_path=host._extract_path,
+                )
         if notes_inline is not None and str(notes_inline).strip():
             snapshot = enrich_space_snapshot_with_notes(
                 snapshot,
                 self._schema_graph,
                 validated,
                 notes=str(notes_inline),
+                engine_domain_knowledge=self._domain_knowledge_entries(),
             )
         elif notes_path is not None and str(notes_path).strip():
-            if getattr(self, "_sandbox_mode", False):
-                connection = getattr(self, "_native_connection", None)
-                host = Sandbox.sandbox_host_for_connection(connection) if connection is not None else None
-                if host is not None:
-                    Sandbox.validate_sandbox_aetherspace_notes_pairing(
-                        validated,
-                        notes_path,
-                        extract_path=host._extract_path,
-                    )
             snapshot = enrich_space_snapshot_with_notes(
                 snapshot,
                 self._schema_graph,
                 validated,
                 notes_path,
+                engine_domain_knowledge=self._domain_knowledge_entries(),
             )
-        save_aetherspace_snapshot(str(self._artifacts_dir), norm, snapshot)
-        return aetherspace_descriptor_from_snapshot(norm, snapshot)
+        else:
+            snapshot = enrich_space_snapshot_with_notes(
+                snapshot,
+                self._schema_graph,
+                validated,
+                engine_domain_knowledge=self._domain_knowledge_entries(),
+            )
+        snapshot["uid"] = uid_norm
+        snapshot["name"] = display
+        snapshot = filter_space_snapshot_sensitive_columns(snapshot, self._schema_graph)
+        save_aetherspace_snapshot(str(self._artifacts_dir), uid_norm, snapshot)
+        return aetherspace_descriptor_from_snapshot(uid_norm, snapshot)
 
     @_writer_lock_guard
-    def export_aetherspace(self, name: str) -> Path:
-        """Export a JSON snapshot of one named aetherspace for review or apply."""
-        self._require_master_context("export_aetherspace")
-        norm = str(name).strip().lower()
-        if norm != MASTER_AETHERSPACE_NAME and load_aetherspace_snapshot(str(self._artifacts_dir), norm) is None:
-            raise ConfigError(f"unknown aetherspace {name!r}")
-        return export_aetherspace_json(str(self._artifacts_dir), norm, self._schema_graph)
-
-    @_writer_lock_guard
-    def apply_aetherspace(self, name: str, *, source: str | os.PathLike[str] | None = None) -> AetherSpace:
-        """Apply an exported aetherspace JSON document and persist it under *name*."""
-        self._require_owner("apply_aetherspace")
-        self._require_master_context("apply_aetherspace")
-        norm = str(name).strip().lower()
-        return apply_aetherspace_json(
+    def delete_aetherspace(
+        self,
+        name: str | None = None,
+        *,
+        uid: str | None = None,
+        persist_learning: bool = True,
+    ) -> AetherspaceDeleteResult:
+        """Delete one persisted aetherspace snapshot and its learning partition."""
+        self._require_owner("delete_aetherspace")
+        token = uid if uid is not None else name
+        if token is None:
+            raise ConfigError("delete_aetherspace requires uid or name")
+        desc = self._resolve_aetherspace(str(token))[0]
+        return delete_aetherspace(
             str(self._artifacts_dir),
-            norm,
-            self._schema_graph,
-            source=source,
+            desc.uid,
+            persist_learning=persist_learning,
+            schema_graph=self._schema_graph,
         )
 
-    @_writer_lock_guard
-    def delete_aetherspace(self, name: str) -> bool:
-        """Delete one persisted named aetherspace snapshot."""
-        self._require_owner("delete_aetherspace")
-        self._require_master_context("delete_aetherspace")
-        norm = str(name).strip().lower()
-        return delete_aetherspace_snapshot(str(self._artifacts_dir), norm)
+    def list_aetherspaces(self, *, include_system: bool = False) -> tuple[AetherSpace, ...]:
+        """Return aetherspace descriptors visible to the caller. Owners include the implicit ``master`` space. Consumers omit ``master``. System credential-default spaces are omitted unless *include_system* is True."""
+        scope_ctx, visible = self._caller_visibility()
+        out: list[AetherSpace] = []
+        if self._schema_role != SchemaRole.CONSUMER:
+            out.append(build_master_space_descriptor(self._schema_graph))
+        for space_uid, _label in list_saved_aetherspace_entries(str(self._artifacts_dir)):
+            snap = load_aetherspace_snapshot(str(self._artifacts_dir), space_uid)
+            if snap is None:
+                continue
+            if not include_system and MainExecutionOps.is_credential_default_snapshot(snap):
+                continue
+            tables, columns = space_allowed_sets_from_snapshot(snap)
+            if aetherspace_within_effective_visibility(
+                tables,
+                columns,
+                self._schema_graph,
+                scope_ctx,
+                visible,
+            ):
+                out.append(aetherspace_descriptor_from_snapshot(space_uid, snap))
+        return tuple(out)
 
-    def list_aetherspaces(self) -> tuple[str, ...]:
-        """Return saved aetherspace names plus the implicit ``master`` space."""
-        self._require_master_context("list_aetherspaces")
-        saved = list_saved_aetherspace_names(str(self._artifacts_dir))
-        return (MASTER_AETHERSPACE_NAME,) + saved
+    @property
+    def default_space_uid(self) -> str:
+        """The default aetherspace for this engine: the master space for an owner, the visibility-keyed default for a consumer."""
+        if self._schema_role == SchemaRole.CONSUMER:
+            uid = getattr(self, "_credential_default_space_uid", None)
+            if uid:
+                return str(uid)
+        return MASTER_AETHERSPACE_UID
 
-    @_writer_lock_guard
-    def export_context(self, name: str) -> Path:
-        """Export a read-only JSON snapshot of one named engine context."""
-        self._require_master_context("export_context")
+    def export_context(self, name: str) -> dict[str, Any]:
+        """Return a read-only export document for one named engine context. Owner-only."""
+        self._require_owner("export_context")
         norm = str(name).strip().lower()
         if norm != MASTER_AETHERSPACE_NAME and load_named_schema_context(str(self._artifacts_dir), norm) is None:
             raise ConfigError(f"unknown engine context {name!r}")
         master_ctx = self._runtime_config.engine_context
         if not isinstance(master_ctx, EngineContext):
             raise ConfigError("export_context requires a single-engine context")
-        return export_named_schema_context_json(
+        return build_named_schema_context_export(
             str(self._artifacts_dir),
             norm,
             master_ctx,
+            schema_graph=self._schema_graph,
+            schema_role=self._schema_role,
         )
 
     def list_contexts(self) -> tuple[str, ...]:
-        """Return saved engine-context names plus the implicit ``master`` context."""
-        self._require_master_context("list_contexts")
+        """Return saved engine-context names plus the implicit ``master`` context. Owner-only."""
+        self._require_owner("list_contexts")
         saved = list_named_schema_context_names(str(self._artifacts_dir))
         return (MASTER_AETHERSPACE_NAME,) + saved
 
-    def export_engine_context(self, name: str) -> Path:
-        """Deprecated alias for :meth:`export_context`."""
-        return cast(Path, self.export_context(name))
-
-    def list_engine_contexts(self) -> tuple[str, ...]:
-        """Deprecated alias for :meth:`list_contexts`."""
-        return self.list_contexts()
-
-    def _templates_for_space(self, space: str) -> dict[str, Template] | LazyTemplateMapping:
+    def _templates_for_space(self, space: str | None) -> dict[str, Template] | LazyTemplateMapping:
         """Load the in-memory template map for one aetherspace namespace."""
-        norm = str(space).strip().lower()
+        norm = str(self._resolve_session_space(space)).strip().lower()
         self._resolve_aetherspace(norm)
         context_name = getattr(self, "_context_name", MASTER_AETHERSPACE_NAME)
         if norm == MASTER_AETHERSPACE_NAME and context_name == MASTER_AETHERSPACE_NAME:
@@ -1270,20 +1578,29 @@ class AetherEngine:
         )
         return store_to_templates(store)
 
-    def list_templates(self, *, space: str = "master") -> tuple[StoredTemplateSummary, ...]:
+    def list_templates(self, *, space: str | None = None) -> tuple[StoredTemplateSummary, ...]:
         """Enumerate caller-visible stored templates for one aetherspace namespace."""
         if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
+            raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
+        scope_ctx, visible = self._caller_visibility()
+        visible_tables = effective_visible_tables(self._schema_graph, scope_ctx, visible)
         templates = self._templates_for_space(space)
-        return list_stored_template_summaries(templates, space=space, dialect=self._dialect)
+        return list_stored_template_summaries(
+            templates,
+            space=space or MASTER_AETHERSPACE_NAME,
+            dialect=self._dialect,
+            visible_tables=visible_tables,
+        )
 
-    def fetch_template(self, template_ref: str, *, space: str = "master") -> StoredTemplateDetail:
+    def fetch_template(self, template_ref: str, *, space: str | None = None) -> StoredTemplateDetail:
         """Fetch one stored template by id or ``sql_fp`` hash."""
         if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
+            raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
+        scope_ctx, visible = self._caller_visibility()
+        visible_tables = effective_visible_tables(self._schema_graph, scope_ctx, visible)
         templates = self._templates_for_space(space)
         tmpl = resolve_template_ref(template_ref, templates)
-        if tmpl is None or not template_visible_to_callers(tmpl):
+        if tmpl is None or not TemplateOps.template_enumerable_by_caller(tmpl, visible_tables=visible_tables):
             raise ConfigError(f"unknown template ref {template_ref!r}")
         vh = tmpl.value_history
         hist_idx = 0
@@ -1292,10 +1609,12 @@ class AetherEngine:
             hist_idx = vh.questions.index(primary) if primary in vh.questions else 0
         return build_stored_template_detail(
             tmpl,
-            space=space,
+            space=space or MASTER_AETHERSPACE_NAME,
             schema=self._schema_graph,
             dialect=self._dialect,
             history_index=hist_idx,
+            schema_context=scope_ctx,
+            visible_objects=visible,
         )
 
     @_writer_lock_guard
@@ -1305,77 +1624,68 @@ class AetherEngine:
         params: dict[str, Any] | None = None,
         *,
         question: str | None = None,
-        space: str = "master",
+        space: str | None = None,
         as_dataframe: bool = False,
     ) -> TemplateExecutionResult | pandas.DataFrame:
         """Execute one stored template by id or ``sql_fp`` with caller- supplied bind values."""
         if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
+            raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
         if params is not None and not isinstance(params, dict):
             raise TypeError("params must be a dict or None")
         bind = dict(params or ())
         templates = self._templates_for_space(space)
-        runtime_cfg = getattr(self, "_runtime_config", None)
-        execution_context = getattr(runtime_cfg, "execution_context", None) if runtime_cfg is not None else None
-        scope_ctx = execution_context
-        if scope_ctx is None and runtime_cfg is not None:
-            scope_ctx = getattr(runtime_cfg, "engine_context", None)
+        scope_ctx, visible = self._caller_visibility()
+        visible_tables = effective_visible_tables(self._schema_graph, scope_ctx, visible)
         identity = getattr(self, "_engine_identity", None)
         if not isinstance(identity, EngineIdentity):
+            runtime_cfg = getattr(self, "_runtime_config", None)
             dialect_obj = self._dialect
             engine_type = str(getattr(dialect_obj, "name", getattr(self, "dialect", "")) or "")
             identity = EngineIdentity(engine_type=engine_type, runtime_config=runtime_cfg)
         identity_token = push_engine_identity(identity)
-        limits_token = push_engine_limits(getattr(self, "limits", EngineLimits()))
-        try:
-            result = execute_stored_template_by_ref(
-                template_ref,
-                bind,
-                question=question,
-                dialect=self._dialect,
-                store=self._store,
-                templates=cast(dict[str, Any], templates),
-                rejected=self._rejected,
-                schema=self._schema_graph,
-                schema_context=scope_ctx,
-                visible_objects=self._consumer_visible_objects,
-                schema_role=self._schema_role,
-                persist_template_learning=False,
-            )
-        finally:
-            pop_engine_limits(limits_token)
-            pop_engine_identity(identity_token)
+        with owner_limits_scope(self):
+            try:
+                result = execute_stored_template_by_ref(
+                    template_ref,
+                    bind,
+                    question=question,
+                    dialect=self._dialect,
+                    store=self._store,
+                    templates=cast(dict[str, Any], templates),
+                    rejected=self._rejected,
+                    schema=self._schema_graph,
+                    schema_context=scope_ctx,
+                    visible_objects=visible,
+                    visible_tables=visible_tables,
+                    schema_role=self._schema_role,
+                    persist_template_learning=False,
+                )
+            finally:
+                pop_engine_identity(identity_token)
         if as_dataframe:
             return pandas.DataFrame([list(r) for r in result.rows], columns=list(result.columns) or None)
         return result
 
-    @classmethod
-    def apply_migration_map(
-        cls,
-        path: str = "schema_migration_map.json",
-        *,
-        config_file: str | os.PathLike[str] | None = None,
-        engine_context: EngineContext,
-        artifacts_dir: str,
-        execution_engine: Any = None,
-        native_connection: Any = None,
-        role: SchemaRole = SchemaRole.OWNER,
-    ) -> AetherEngine:
-        """Copy a validated migration map into the working directory and construct ``AetherEngine``."""
-        if role != SchemaRole.OWNER:
-            raise OwnerOnlyOperationError("apply_migration_map")
-        src = Path(os.path.expanduser(str(path))).resolve()
-        dst = Path(artifacts_dir) / MIGRATION_MAP_FILENAME
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst)
-        return cls(
-            engine_context,
-            artifacts_dir=artifacts_dir,
-            config_file=config_file,
-            execution_engine=execution_engine,
-            native_connection=native_connection,
-            role=role,
+    @_writer_lock_guard
+    def apply_migration_map(self, document: Mapping[str, Any]) -> None:
+        """Validate and persist a schema migration map, then reconcile artifacts."""
+        self._require_owner("apply_migration_map")
+        self._require_open("apply_migration_map")
+        if not isinstance(document, Mapping):
+            raise ConfigError("migration map must be a JSON object")
+        payload = dict(document)
+        if "version" not in payload:
+            payload["version"] = 1
+        map_obj = TemplateOps.parse_schema_migration_map_payload(payload)
+        map_path = self._artifacts_dir / MIGRATION_MAP_FILENAME
+        map_path.parent.mkdir(parents=True, exist_ok=True)
+        map_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        TemplateOps.validate_schema_migration_map(
+            map_obj,
+            load_schema_graph_snapshot(str(self._artifacts_dir / "schema_graph.json.gz")),
+            self._schema_graph,
         )
+        self.refresh()
 
     def get_seed_warmup_summary(self) -> SeedWarmupSummarySnapshot:
         """Return the newest seed-warmup summary text if present."""
@@ -1422,18 +1732,11 @@ class AetherEngine:
             )
 
     @_writer_lock_guard
-    def run_interactive(self, *, space: str = "master") -> None:
+    def run_interactive(self, *, space: str | None = None) -> None:
         """Prompt once for a natural-language question, resolve it through the interactive prompt cycle, then return. An empty line at the question prompt warns once; a second empty line terminates with ``User terminated.``. There is no outer REPL loop; call ``run_interactive`` again for another question."""
         self._ensure_llm()
-        _, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(space)
-        exec_ctx = getattr(self._runtime_config, "execution_context", None)
-        if exec_ctx is None:
-            exec_ctx = self._runtime_config.engine_context
-        validate_space_subset_of_execution_context(
-            space_tables,
-            space_columns,
-            exec_ctx,
-            self._schema_graph,
+        _, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(
+            self._resolve_session_space(space)
         )
         payload_visible = space_tables if space_tables else None
         with diagnostic_print_listener(lambda m: print(m, file=sys.stdout, flush=True)):
@@ -1510,20 +1813,27 @@ class AetherEngine:
         max_kept_intents: int | None = SeedWarmupConfig.WARMUP_TARGET_CAP,
     ) -> None:
         """Run seed warmup execution, stratified sampling, and template writes."""
+        self._require_owner("run_seed_warmup")
         self._require_production_api("run_seed_warmup")
         self._ensure_llm()
         with diagnostic_print_listener(lambda m: print(m, file=sys.stdout, flush=True)):
-            seed_warmup_run_once(
-                schema=self._schema_graph,
-                dialect=self._dialect,
-                seed_filepath=seed_filepath,
-                output_dir=str(self._artifacts_dir),
-                store=self._store,
-                templates=self._templates,
-                interactive_gold=interactive_gold,
-                abort_on_gold_failure=abort_on_gold_failure,
-                max_kept_intents=max_kept_intents,
-            )
+            owner_tok = push_qsim_engine_owner(self)
+            scope_tok = push_simulation_artifact_scope_from_owner(self)
+            try:
+                seed_warmup_run_once(
+                    schema=self._schema_graph,
+                    dialect=self._dialect,
+                    seed_filepath=seed_filepath,
+                    output_dir=str(self._artifacts_dir),
+                    store=self._store,
+                    templates=self._templates,
+                    interactive_gold=interactive_gold,
+                    abort_on_gold_failure=abort_on_gold_failure,
+                    max_kept_intents=max_kept_intents,
+                )
+            finally:
+                pop_simulation_artifact_partition(scope_tok)
+                pop_qsim_engine_owner(owner_tok)
 
     @_writer_lock_guard
     def run_seed_warmup_from_history(
@@ -1543,6 +1853,7 @@ class AetherEngine:
             max_kept_intents: Cap on kept intents after sampling; ``None`` keeps every intent that
             passes quality and dedup checks (no budget cap).
         """
+        self._require_owner("run_seed_warmup_from_history")
         self._require_production_api("run_seed_warmup_from_history")
         self._ensure_llm()
         with diagnostic_print_listener(lambda m: print(m, file=sys.stdout, flush=True)):
@@ -1598,12 +1909,14 @@ class AetherEngine:
         seed: int | None = None,
     ) -> None:
         """Generate synthetic NL questions from schema-derived intent skeletons."""
+        self._require_owner("run_qsim")
         self._require_production_api("run_qsim")
         self._ensure_llm()
         self._validate_num_intents(num_intents)
         self._validate_num_questions(num_questions)
         with diagnostic_print_listener(lambda m: print(m, file=sys.stdout, flush=True)):
             owner_tok = push_qsim_engine_owner(self)
+            scope_tok = push_simulation_artifact_scope_from_owner(self)
             try:
                 qsim_run_once(
                     num_intents=num_intents,
@@ -1613,6 +1926,7 @@ class AetherEngine:
                     schema=self._schema_graph,
                 )
             finally:
+                pop_simulation_artifact_partition(scope_tok)
                 pop_qsim_engine_owner(owner_tok)
 
     def get_questions_only(self, version: int) -> None:
@@ -1623,130 +1937,24 @@ class AetherEngine:
         with diagnostic_print_listener(lambda m: print(m, file=sys.stdout, flush=True)):
             print_questions_bundle(version, str(self._artifacts_dir))
 
-    def show_config(self) -> ConfigSnapshot:
-        """Return a redacted snapshot of engine, schema scope, database, and LLM settings."""
-        return ConfigSnapshot(text=describe_runtime_config(self._runtime_config, self._llm_config))
+    def _resolve_learning_clear_space(self, space: str | None) -> str | None:
+        """Return None for all spaces, else a template-store partition key (``master`` or space uid)."""
+        if space is None:
+            return None
+        token = str(space).strip().lower()
+        if not token or token == "all":
+            return None
+        if token in (MASTER_AETHERSPACE_NAME, MASTER_AETHERSPACE_UID):
+            return MASTER_AETHERSPACE_NAME
+        desc = self._resolve_aetherspace(token)[0]
+        return str(desc.uid).strip().lower()
 
     @_writer_lock_guard
-    def export_overrides(self) -> Path:
-        """Write ``schema_overrides.json`` in the process working directory and return its path."""
-        self._require_owner("export_overrides")
-        target = self._artifacts_dir / SCHEMA_OVERRIDES_DEFAULT_FILENAME
-        return dump_schema_overrides_to_path(
-            self._schema_graph,
-            target,
-            business_knowledge=self.business_knowledge(),
-        )
-
-    def export_schema_overrides(self) -> Path:
-        """Deprecated alias for :meth:`export_overrides`."""
-        return cast(Path, self.export_overrides())
-
-    @_writer_lock_guard
-    def apply_overrides(self) -> None:
-        """Apply ``schema_overrides.json`` from the working directory."""
-        self._apply_schema_overrides_impl()
-
-    def apply_schema_overrides(self) -> None:
-        """Deprecated alias for :meth:`apply_overrides`."""
-        self.apply_overrides()
-
-    def _apply_schema_overrides_impl(self) -> None:
-        """Apply ``schema_overrides.json`` from the working directory to the in-memory schema graph, re-stamp the cached graph artifact, print a summary, then rename editor JSON files to ``*.applied.json`` (archiving any prior applied copy)."""
-        source = self._artifacts_dir / SCHEMA_OVERRIDES_DEFAULT_FILENAME
-        if not source.is_file():
-            raise ConfigError(f"schema overrides file not found: {source}")
-        if self._schema_role == SchemaRole.CONSUMER:
-            with open(source, encoding="utf-8") as fh:
-                document = json.load(fh)
-            ev = WriteQueueEvent(
-                kind="override_proposal",
-                schema_graph_id=self._schema_graph_id,
-                schema_hash=str(self._schema_graph.effective_structural_hash or ""),
-                produced_at=datetime.now(UTC).isoformat(),
-                payload=(("document_json", json.dumps(document, ensure_ascii=False)),),
-            )
-            emit_write_queue_event(str(self._artifacts_dir), ev)
-            return
-        self._require_owner("apply_overrides")
-        schema_json_path = str(self._artifacts_dir / "schema_graph.json.gz")
-        report = apply_overrides_and_persist(
-            self._schema_graph,
-            source,
-            schema_json_path=schema_json_path,
-            dialect=self._dialect,
-        )
-        if report.business_knowledge_entries is not None:
-            self.set_business_knowledge(report.business_knowledge_entries)
-        if (
-            report.table_edits
-            or report.column_edits
-            or report.fks_added
-            or report.fks_removed
-            or report.pks_added
-            or report.pks_endorsed
-            or report.pks_blocked
-            or report.coerced_columns
-            or report.collapsed_inferences
-        ):
-            self._schema_stats = self._schema_graph.refresh_schema_stats()
-        _print_override_summary(report)
-        editor = self._artifacts_dir / SCHEMA_OVERRIDES_DEFAULT_FILENAME
-        companion = editor.with_name(editor.stem + ".schema.json")
-        ts = datetime.now(UTC).strftime(SCHEMA_OVERRIDES_APPLIED_TIMESTAMP_FORMAT)
-        stem = Path(SCHEMA_OVERRIDES_DEFAULT_FILENAME).stem
-        applied_main = editor.parent / f"{stem}{SCHEMA_OVERRIDES_APPLIED_SUFFIX}"
-        applied_schema = editor.parent / f"{stem}.applied.schema.json"
-
-        def _archive_and_rename(src: Path, dest: Path) -> None:
-            if not src.is_file():
-                return
-            if dest.is_file():
-                archive = dest.with_name(dest.stem + f".{ts}" + dest.suffix)
-                try:
-                    dest.rename(archive)
-                except OSError:
-                    pass
-            try:
-                src.rename(dest)
-            except OSError:
-                pass
-
-        _archive_and_rename(editor, applied_main)
-        _archive_and_rename(companion, applied_schema)
-        sh = getattr(self._schema_graph, "effective_structural_hash", None)
-        self._audit_emit(
-            "apply_schema_overrides",
-            schema_hash=str(sh) if sh is not None else None,
-            details=(
-                ("table_edits", str(report.table_edits)),
-                ("column_edits", str(report.column_edits)),
-            ),
-        )
-
-    @_writer_lock_guard
-    def clear_persisted_overrides(self) -> bool:
-        """Delete the persisted overrides sidecar and the cached schema graph, then rebuild the schema from catalog and inference layers. Returns True when a sidecar existed and was removed; False when no sidecar was present. After clearing, the schema graph is rebuilt from scratch (catalog reflection, profile-based PK inference, and FK inference) and the in-memory graph is published atomically; user-added FKs, user PK overrides, and the inference block lists are all discarded."""
-        self._require_owner("clear_persisted_overrides")
-        removed = clear_persisted_overrides(EngineConfig.SCHEMA_JSON_PATH)
-        bundle = self._initialize_engine_bundle(
-            self._single_engine_context(),
-            **self._reinit_bundle_kwargs(),
-        )
-        self._apply_init_bundle(bundle)
-        self._schema_stats = self._schema_graph.refresh_schema_stats()
-        self._audit_emit(
-            "clear_persisted_overrides",
-            schema_hash=str(getattr(self._schema_graph, "effective_structural_hash", "") or None),
-            details=(("removed", str(removed)),),
-        )
-        return removed
-
-    @_writer_lock_guard
-    def clear_template_store(self) -> bool:
-        """Remove persisted templates and question feedback, then reload engine initialization state."""
+    def clear_template_store(self, *, space: str | None = None) -> bool:
+        """Owner-only: remove template learning then reload. ``space=None``/``"all"`` clears every partition; otherwise one space (uid or master)."""
         self._require_owner("clear_template_store")
-        existed = clear_template_store_only(str(self._artifacts_dir), self._schema_graph)
+        space_key = self._resolve_learning_clear_space(space)
+        existed = clear_template_store_only(str(self._artifacts_dir), self._schema_graph, space=space_key)
         bundle = self._initialize_engine_bundle(
             self._single_engine_context(),
             **self._reinit_bundle_kwargs(),
@@ -1756,7 +1964,7 @@ class AetherEngine:
         self._audit_emit(
             "clear_template_store",
             schema_hash=str(getattr(self._schema_graph, "effective_structural_hash", "") or None),
-            details=(("existed", str(existed)),),
+            details=(("existed", str(existed)), ("space", space_key or "all")),
         )
         return existed
 
@@ -1779,13 +1987,15 @@ class AetherEngine:
         return count
 
     @_writer_lock_guard
-    def clear_all_learning(self, *, keep_overrides: bool = True) -> None:
-        """Remove templates, simulation caches, and optionally persisted schema overrides, then reload."""
+    def clear_all_learning(self, *, keep_structure: bool = True, space: str | None = None) -> None:
+        """Owner-only: clear learning then reload. With ``space`` set, only that template partition is cleared (sim caches / structural overrides stay). Without ``space`` (or ``space="all"``), clears all templates, simulation caches, and optionally structural overrides. Domain knowledge is not cleared here — export, edit, and ``apply_knowledge``."""
         self._require_owner("clear_all_learning")
-        clear_template_store_only(str(self._artifacts_dir), self._schema_graph)
-        clear_simulation_caches_only(str(self._artifacts_dir))
-        if not keep_overrides:
-            clear_persisted_overrides(EngineConfig.SCHEMA_JSON_PATH)
+        space_key = self._resolve_learning_clear_space(space)
+        clear_template_store_only(str(self._artifacts_dir), self._schema_graph, space=space_key)
+        if space_key is None:
+            clear_simulation_caches_only(str(self._artifacts_dir))
+            if not keep_structure:
+                delete_persisted_structure_artifacts(str(self._artifacts_dir / "schema_graph.json.gz"))
         bundle = self._initialize_engine_bundle(
             self._single_engine_context(),
             **self._reinit_bundle_kwargs(),
@@ -1795,79 +2005,8 @@ class AetherEngine:
         self._audit_emit(
             "clear_all_learning",
             schema_hash=str(getattr(self._schema_graph, "effective_structural_hash", "") or None) or None,
-            details=(("keep_overrides", str(keep_overrides)),),
+            details=(("keep_structure", str(keep_structure)), ("space", space_key or "all")),
         )
-
-    @classmethod
-    def offline_sandbox(
-        cls,
-        *,
-        artifacts_dir: str | None = None,
-        cleanup_artifacts: bool = True,
-        deny_columns: frozenset[str] | None = None,
-        include: SchemaInclude = SchemaInclude.TABLES,
-        engine_context: EngineContext | None = None,
-        notes_file: str | None = None,
-        sql_file: str | None = None,
-        llm_config: str | os.PathLike[str] | None = None,
-        maintainer_access: bool = False,
-        seed_sql: str | None = None,
-        bundle_dir: str | None = None,
-        connection: Any | None = None,
-        owns_connection: bool | None = None,
-    ) -> SandboxHandle:
-        """Enter the offline practice environment (in-memory DuckDB and mock LLM fixtures). Pass ``include="views"`` to reflect bundled analytical views instead of base tables."""
-        return Sandbox.create_offline_sandbox(
-            cls,
-            artifacts_dir=artifacts_dir,
-            cleanup_artifacts=cleanup_artifacts,
-            deny_columns=deny_columns,
-            include=include,
-            engine_context=engine_context,
-            notes_file=notes_file,
-            sql_file=sql_file,
-            llm_config=llm_config,
-            maintainer_access=maintainer_access,
-            seed_sql=seed_sql,
-            bundle_dir=bundle_dir,
-            connection=connection,
-            owns_connection=owns_connection,
-        )
-
-    @classmethod
-    def sandbox_questions(cls) -> list[str]:
-        """Return curated natural-language sandbox practice questions."""
-        return Sandbox.sandbox_questions()
-
-    @classmethod
-    def sandbox_doctor(cls) -> list[str]:
-        """Return human-readable problems; empty list means the sandbox bundle looks healthy."""
-        return Sandbox.sandbox_doctor()
-
-    @classmethod
-    def sandbox_catalog(cls) -> dict[str, object]:
-        """Return bundled sandbox discovery metadata (paraphrase pairs, demos)."""
-        return Sandbox.sandbox_catalog()
-
-    @classmethod
-    def sandbox_paraphrase_pairs(cls) -> list[dict[str, object]]:
-        """Return canonical→paraphrase wordings from the bundled sandbox catalog."""
-        return Sandbox.sandbox_paraphrase_pairs()
-
-    @classmethod
-    def sandbox_validation_failure_demo(cls) -> list[dict[str, str]]:
-        """Return example validation-failure questions and short descriptions."""
-        return Sandbox.sandbox_validation_failure_demo()
-
-    @classmethod
-    def sandbox_feedback_demo(cls) -> dict[str, str]:
-        """Return the scripted reject/retry feedback demo."""
-        return Sandbox.sandbox_feedback_demo()
-
-    @classmethod
-    def assert_sandbox_complete(cls) -> None:
-        """Validate the shipped sandbox corpus and raise when any slot fails."""
-        Sandbox.assert_sandbox_complete(cls)
 
 
 class AetherFederation:
@@ -1878,7 +2017,8 @@ class AetherFederation:
     __slots__ = (
         "_name",
         "_members",
-        "_declaration_file",
+        "_declaration_path",
+        "_declaration_parsed",
         "_master_context",
         "_mappings",
         "_artifacts_root",
@@ -1893,13 +2033,17 @@ class AetherFederation:
         "_schema_terms",
         "_schema_stats",
         "_audit_sink",
-        "_construction_phase_callback",
-        "_ask_phase_callback",
+        "_phase_callback",
+        "_diagnostic_sink",
+        "_diagnostic_sink_token",
         "_pipeline_writer_lock",
         "_schema_role",
         "_consumer_visible_objects",
+        "_credential_default_space_uid",
         "_context_name",
         "_sandbox_mode",
+        "_sandbox_runtime",
+        "_sandbox_extract_path",
         "_sandbox_closed",
         "_closed",
         "_federation_manifest",
@@ -1910,28 +2054,27 @@ class AetherFederation:
         "_federation_source_runtimes",
         "_federation_mapping_suggestions",
         "_engine_identity",
-        "_business_knowledge",
-        "_tenant_slug",
+        "_domain_knowledge",
         "_limits",
-        "_federation_owned_members",
+        "_store_by_space",
+        "_templates_by_space",
     )
 
     def __init__(
         self,
         name: str,
         *,
-        members: Mapping[str, AetherEngine],
-        declaration_file: str,
+        members: Sequence[AetherEngine],
+        declaration: str | os.PathLike[str] | Mapping[str, Any],
         context: FederationContext | None = None,
         artifacts_dir: str | None = None,
-        tenant_slug: str | None = None,
         role: SchemaRole = SchemaRole.OWNER,
         limits: FederationLimits | None = None,
         audit_sink: Callable[[AuditEvent], None] | None = None,
-        construction_phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
-        ask_phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
+        phase_callback: Callable[[PhaseProgressEvent], None] | None = None,
+        diagnostic_sink: Callable[[Diagnostic], None] | None = None,
     ) -> None:
-        """Construct a federation over named member engines. The ``members`` mapping keys are federation ``source_id`` values: the names used in cross-source joins, logical tables, logical columns, aliases, diagnostics, and ``export_overrides(source_id)``. Choose these names to match your declaration. They are not the TOML ``connection=`` sub- block on each member engine, which only selects credentials and artifact slugs for that member's database."""
+        """Construct a federation over member engines. Each member's ``source_id`` is its connection name (TOML sub- block or mapping ``name`` key)."""
         self._name = str(name).strip()
         if not self._name:
             raise ConfigError("AetherFederation name must be non-empty")
@@ -1939,35 +2082,42 @@ class AetherFederation:
             require_driver("duckdb")
         except ConfigError as exc:
             raise ConfigError("pip install aetherdialect[federation]") from exc
-        if not members:
-            raise ConfigError("AetherFederation requires at least one member engine")
-        self._members = dict(members)
-        self._declaration_file = str(declaration_file)
+        self._members = federation_members_mapping(cast(Sequence[FederationMemberEngine], members))
+        self._declaration_parsed: tuple[FederationManifest, FederationMappings] | None
+        if isinstance(declaration, Mapping):
+            self._declaration_parsed = parse_federation_declaration(declaration)
+            self._declaration_path = None
+        else:
+            self._declaration_path = str(declaration)
+            self._declaration_parsed = None
         self._master_context = context
         self._mappings: FederationMappings | None = None
         self._artifacts_root = Path(artifacts_dir) if artifacts_dir is not None else None
-        self._tenant_slug = str(tenant_slug).strip() if tenant_slug is not None and str(tenant_slug).strip() else None
         self._audit_sink = audit_sink
-        self._construction_phase_callback = construction_phase_callback
-        self._ask_phase_callback = ask_phase_callback
+        self._phase_callback = phase_callback
+        self._diagnostic_sink = diagnostic_sink
+        self._diagnostic_sink_token = push_diagnostic_sink(diagnostic_sink)
         self._pipeline_writer_lock = threading.Lock()
         self._schema_role = role
         self._consumer_visible_objects: frozenset[str] | None = None
+        self._credential_default_space_uid: str | None = None
         self._context_name = MASTER_AETHERSPACE_NAME
         self._sandbox_mode = False
+        self._sandbox_runtime = None
+        self._sandbox_extract_path = None
         self._sandbox_closed = False
         self._closed = False
         self._limits = limits if limits is not None else FederationLimits()
-        self._federation_owned_members: set[str] = set()
+        apply_federation_member_defaults(self._members, self._limits)
         validate_federation_pool_capacity(self._members, self._limits)
-        construction_token = push_construction_phase_callback(construction_phase_callback)
+        construction_token = push_construction_phase_callback(phase_callback)
         try:
             bundle = initialize_aether_federation(
                 self._name,
                 members=self._members,
-                declaration_file=self._declaration_file,
+                declaration=self._declaration_parsed,
+                declaration_file=self._declaration_path,
                 artifacts_dir=str(self._artifacts_root) if self._artifacts_root is not None else None,
-                tenant_slug=self._tenant_slug,
                 schema_role=role,
                 master_context=self._master_context,
                 log_sink=_init_log_sink,
@@ -1975,12 +2125,28 @@ class AetherFederation:
         finally:
             pop_construction_phase_callback(construction_token)
         self._apply_init_bundle(bundle)
-        self._business_knowledge = BusinessKnowledgeHolder()
-        self._ingest_notes_business_knowledge()
-        if bundle.members is not None:
-            self._members = dict(bundle.members)
+        if isinstance(bundle.members, Mapping):
+            self._members = federation_members_mapping(bundle.members)
         if bundle.federation_mappings is not None:
             self._mappings = bundle.federation_mappings
+        self._domain_knowledge = DomainKnowledgeHolder()
+        if not self._load_persisted_domain_knowledge():
+            self._ingest_notes_domain_knowledge()
+        if self._schema_role == SchemaRole.CONSUMER:
+            holder = getattr(self, "_domain_knowledge", None)
+            engine_dk = holder.entries() if isinstance(holder, DomainKnowledgeHolder) else ()
+            self._credential_default_space_uid = MainExecutionOps.ensure_credential_default_aetherspace(
+                str(self._artifacts_dir),
+                self._schema_graph,
+                self._consumer_visible_objects,
+                engine_domain_knowledge=engine_dk,
+            )
+            MainExecutionOps.bind_owner_default_template_store(
+                self,
+                self._schema_graph,
+                str(self._artifacts_dir),
+                schema_role=self._schema_role,
+            )
         self._replay_composite_overrides()
         self._audit_emit(
             "init",
@@ -1995,12 +2161,28 @@ class AetherFederation:
         federation_id: str,
         *,
         artifacts_dir: str,
+        schema_role: SchemaRole = SchemaRole.OWNER,
     ) -> PersistedFederationInspection:
         """Load declaration and roster from a persisted ``fed_<id>`` tree without member engines."""
-        return inspect_persisted_federation(artifacts_dir, federation_id)
+        return inspect_persisted_federation(artifacts_dir, federation_id, schema_role=schema_role)
+
+    def _authored_federation_declaration(self) -> tuple[FederationManifest, FederationMappings]:
+        parsed = self._declaration_parsed
+        if parsed is not None:
+            return parsed
+        path = self._declaration_path
+        if path:
+            return load_federation_declaration_from_path(str(path))
+        raise ConfigError("federation declaration is not configured")
+
+    def _federation_declaration_export_path(self) -> str:
+        path = getattr(self, "_declaration_path", None)
+        if path:
+            return str(path)
+        return str(self._artifacts_dir / FEDERATION_DECLARATION_FILENAME)
 
     def _recompose(self) -> None:
-        manifest_decl, file_mappings = load_federation_declaration_from_path(self._declaration_file)
+        manifest_decl, file_mappings = self._authored_federation_declaration()
         active_source_ids = set(self._members)
         base_mappings = self._mappings if self._mappings is not None else file_mappings
         manifest_decl, reconciled_mappings = reconcile_authored_declaration_for_members(
@@ -2015,17 +2197,16 @@ class AetherFederation:
         bundle = initialize_aether_federation(
             self._name,
             members=self._members,
-            declaration_file=self._declaration_file,
             declaration=(manifest_decl, mappings),
+            declaration_file=self._declaration_path,
             artifacts_dir=str(self._artifacts_root) if self._artifacts_root is not None else None,
-            tenant_slug=self._tenant_slug,
             schema_role=self._schema_role,
             master_context=self._master_context,
             log_sink=_init_log_sink,
         )
         self._apply_init_bundle(bundle)
-        if bundle.members is not None:
-            self._members = dict(bundle.members)
+        if isinstance(bundle.members, Mapping):
+            self._members = federation_members_mapping(bundle.members)
         if bundle.federation_mappings is not None:
             self._mappings = bundle.federation_mappings
         self._replay_composite_overrides()
@@ -2033,7 +2214,7 @@ class AetherFederation:
             export_federation_declaration(
                 self._federation_manifest,
                 self._mappings,
-                self._declaration_file,
+                self._federation_declaration_export_path(),
             )
 
     def _composite_federation_dir(self) -> str:
@@ -2054,14 +2235,12 @@ class AetherFederation:
             raise RuntimeError(f"cannot {operation} while a session turn is in progress")
 
     @_writer_lock_guard(before_acquire=lambda self, op: self._require_no_active_session_turn(op))
-    def add_engine(self, connection_name: str, engine: AetherEngine) -> None:
+    def add_engine(self, engine: AetherEngine) -> None:
         """Register a member engine, recompose the composite graph, and persist the federation tree."""
         self._require_owner("add_engine")
         self._require_open("add_engine")
-        key = str(connection_name).strip()
-        if not key:
-            raise ConfigError("connection_name must be non-empty")
-        self._members[key] = engine
+        source_id = member_connection_name_from_engine(cast(FederationMemberEngine, engine))
+        self._members[source_id] = engine
         self._recompose()
 
     @_writer_lock_guard(before_acquire=lambda self, op: self._require_no_active_session_turn(op))
@@ -2077,7 +2256,7 @@ class AetherFederation:
         fed_dir = getattr(self, "_federation_storage_dir", None)
         if fed_dir:
             prune_federation_plan_templates_for_sources(str(fed_dir), {key})
-            binding = binding_from_member_engine(key, cast(FederationMemberEngine, member_engine))
+            binding = binding_from_member_engine(cast(FederationMemberEngine, member_engine))
             fed_manifest = self._federation_manifest
             federation_id = str(fed_manifest.federation_id) if fed_manifest is not None else None
             raw_member_dir = getattr(member_engine, "_artifacts_dir", None)
@@ -2098,58 +2277,53 @@ class AetherFederation:
             )
         self._recompose()
 
-    @_writer_lock_guard
-    def export_federation_declaration(self) -> Path:
-        """Write ``federation_declaration.json`` in the working directory (authored shape)."""
-        self._require_owner("export_federation_declaration")
+    def export_federation(self) -> dict[str, Any]:
+        """Return the federation declaration document (topology and mappings)."""
+        self._require_owner("export_federation")
         manifest = self._federation_manifest
         if manifest is None:
             raise ConfigError("federation manifest not loaded")
         mappings = self._mappings or self._federation_mappings
         if mappings is None:
             mappings = FederationMappings(version=FEDERATION_MAPPINGS_VERSION)
-        target = self._artifacts_dir / FEDERATION_DECLARATION_FILENAME
-        export_federation_declaration(manifest, mappings, target)
-        return target
+        document = federation_declaration_document(manifest, mappings)
+        document.pop("version", None)
+        self._audit_emit("export_federation", schema_hash=self._effective_structural_hash or None)
+        return document
 
     @_writer_lock_guard
-    def apply_federation_declaration(self) -> None:
-        """Apply the authored federation declaration from the working directory and recompose."""
-        self._require_owner("apply_federation_declaration")
-        source = self._artifacts_dir / FEDERATION_DECLARATION_FILENAME
-        if not source.is_file():
-            raise ConfigError(f"federation declaration file not found: {source}")
+    def apply_federation(self, document: Mapping[str, Any]) -> None:
+        """Apply a federation declaration document and recompose."""
+        self._require_owner("apply_federation")
+        payload = dict(document)
+        if "version" not in payload:
+            payload["version"] = FEDERATION_DECLARATION_VERSION
         try:
-            manifest, mappings = parse_federation_declaration(source.read_text(encoding="utf-8"))
+            manifest, mappings = parse_federation_declaration(payload)
         except FederationConfigError as exc:
-            raise FederationConfigError(
-                f"malformed federation declaration in declarations file {source!r}: {exc}"
-            ) from exc
-        export_federation_declaration(manifest, mappings, self._declaration_file)
+            raise FederationConfigError(f"malformed federation declaration: {exc}") from exc
+        self._declaration_parsed = (manifest, mappings)
         self._mappings = mappings
-        archive_federation_editor_file(str(source))
         self._recompose()
 
     @_writer_lock_guard
-    def apply_migration_map(self, path: str = "federation_migration_map.json") -> None:
-        """Copy ``federation_migration_map.json`` into the working directory and recompose."""
+    def apply_migration_map(self, document: Mapping[str, Any]) -> None:
+        """Validate and persist a federation migration map, then recompose."""
         self._require_owner("apply_migration_map")
         self._require_open("apply_migration_map")
-        src = Path(os.path.expanduser(str(path))).resolve()
+        if not isinstance(document, Mapping):
+            raise ConfigError("federation migration map must be a JSON object")
+        payload = dict(document)
+        if "version" not in payload:
+            payload["version"] = 1
+        parse_federation_migration_map(payload)
         dst = self._artifacts_dir / FEDERATION_MIGRATION_MAP_FILENAME
-        shutil.copyfile(src, dst)
+        dst.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self._recompose()
 
     def _require_owner(self, operation: str) -> None:
         if self._schema_role != SchemaRole.OWNER:
             raise OwnerOnlyOperationError(operation)
-
-    def _require_master_context(self, operation: str) -> None:
-        if getattr(self, "_context_name", MASTER_AETHERSPACE_NAME) != MASTER_AETHERSPACE_NAME:
-            raise ConfigError(
-                f"Operation {operation!r} requires the master engine context; "
-                "this instance is bound to a non-master context.",
-            )
 
     def _require_open(self, operation: str) -> None:
         if getattr(self, "_closed", False):
@@ -2170,7 +2344,7 @@ class AetherFederation:
         member = self._members.get(key)
         if member is None:
             raise ConfigError(f"unknown federation member: {connection_name!r}")
-        return member
+        return cast(AetherEngine, member)
 
     def _federation_unsupported(self, operation: str) -> NoReturn:
         raise ConfigError(
@@ -2185,8 +2359,9 @@ class AetherFederation:
         question: str | None = None,
         schema_hash: str | None = None,
         details: tuple[tuple[str, str], ...] = (),
+        turn_id: str | None = None,
     ) -> None:
-        sink = self._audit_sink
+        sink = getattr(self, "_audit_sink", None)
         if sink is None:
             return
         ev = AuditEvent(
@@ -2196,8 +2371,14 @@ class AetherFederation:
             schema_hash=schema_hash,
             provider=self._llm_config.provider,
             details=details,
+            turn_id=turn_id,
         )
         sink(ev)
+
+    @property
+    def _effective_structural_hash(self) -> str:
+        """Effective structural fingerprint of the composed federation schema graph."""
+        return str(getattr(self._schema_graph, "effective_structural_hash", "") or "")
 
     @property
     def limits(self) -> FederationLimits:
@@ -2217,6 +2398,7 @@ class AetherFederation:
         self._schema_stats = bundle.schema_stats
         self._schema_role = bundle.schema_role
         self._consumer_visible_objects = bundle.consumer_visible_objects
+        self._credential_default_space_uid = None
         self._context_name = getattr(bundle, "context_name", MASTER_AETHERSPACE_NAME)
         self._federation_manifest = getattr(bundle, "federation_manifest", None)
         self._federation_mappings = getattr(bundle, "federation_mappings", None)
@@ -2226,6 +2408,8 @@ class AetherFederation:
         self._federation_source_runtimes = getattr(bundle, "federation_source_runtimes", None)
         self._federation_mapping_suggestions = getattr(bundle, "federation_mapping_suggestions", ())
         self._engine_identity = getattr(bundle, "engine_identity", None)
+        self._store_by_space = {MASTER_AETHERSPACE_NAME: bundle.store}
+        self._templates_by_space = {MASTER_AETHERSPACE_NAME: bundle.templates}
         register_engine_skeleton_cache_owner(self)
         clear_engine_skeleton_cache(self)
 
@@ -2233,114 +2417,321 @@ class AetherFederation:
     def dialect(self) -> str:
         return str(self._runtime_config.engine)
 
-    def set_business_knowledge(self, entries: Sequence[BusinessKnowledgeEntry]) -> int:
-        """Replace prompt-time business knowledge and return the new monotonic version."""
-        holder = getattr(self, "_business_knowledge", None)
+    def _replace_domain_knowledge(self, entries: Sequence[DomainKnowledgeEntry]) -> None:
+        """Replace prompt-time domain knowledge (internal; public path is apply_knowledge)."""
+        holder = getattr(self, "_domain_knowledge", None)
         if holder is None:
-            self._business_knowledge = BusinessKnowledgeHolder()
-            holder = self._business_knowledge
-        return holder.set(entries, self._schema_graph)
+            self._domain_knowledge = DomainKnowledgeHolder()
+            holder = self._domain_knowledge
+        holder.set(entries, self._schema_graph)
+        self._persist_domain_knowledge()
 
-    def _ingest_notes_business_knowledge(self) -> None:
-        """Pass B: extract business knowledge from federation construction notes when present."""
+    def _persist_domain_knowledge(self) -> None:
+        """Write federation-level domain knowledge beside federation artifacts."""
+        holder = getattr(self, "_domain_knowledge", None)
+        if not isinstance(holder, DomainKnowledgeHolder):
+            return
+        try:
+            stamps = knowledge_artifact_save_stamps(self._schema_graph)
+            save_domain_knowledge_artifact(self._artifacts_dir, holder.entries(), **stamps)
+        except OSError:
+            pass
+
+    def _load_persisted_domain_knowledge(self) -> bool:
+        """Load federation domain knowledge from artifacts when present. Returns True when applied."""
+        loaded = load_domain_knowledge_artifact(self._artifacts_dir, self._schema_graph)
+        if loaded is None:
+            return False
+        holder = getattr(self, "_domain_knowledge", None)
+        if holder is None:
+            self._domain_knowledge = DomainKnowledgeHolder()
+            holder = self._domain_knowledge
+        holder.set(loaded, self._schema_graph)
+        self._audit_emit(
+            "domain_knowledge_ingest",
+            details=(
+                ("status", "loaded_artifact"),
+                ("kept", str(len(loaded))),
+                ("dropped", "0"),
+                ("keys", ",".join(e.key for e in loaded)),
+            ),
+        )
+        return True
+
+    def _ingest_notes_domain_knowledge(self) -> None:
+        """Merge member + federation-notes knowledge and enrich composite descriptions."""
         ctx = getattr(self, "_master_context", None)
-        notes_path = getattr(ctx, "notes_file", None) if ctx is not None else None
-        notes_inline = getattr(ctx, "notes", None) if ctx is not None else None
-        notes_content: str | None = None
-        if notes_inline is not None and str(notes_inline).strip():
-            notes_content = str(notes_inline)
-        elif notes_path is not None and str(notes_path).strip():
-            path = os.path.expanduser(str(notes_path).strip())
-            if os.path.isfile(path):
-                with open(path, encoding="utf-8") as fh:
-                    notes_content = fh.read()
-        entries = extract_business_knowledge_from_notes(notes_content, self._schema_graph)
-        if entries:
-            self.set_business_knowledge(entries)
+        notes_content = notes_content_from_context(ctx) if ctx is not None else None
+        member_dk: list[tuple[str, tuple[DomainKnowledgeEntry, ...]]] = []
+        member_structural: list[tuple[str, tuple[Any, ...]]] = []
+        member_table_universe: set[str] = set()
+        for source_id, eng in (getattr(self, "_members", None) or {}).items():
+            entries: tuple[DomainKnowledgeEntry, ...] = ()
+            try:
+                entries = tuple(eng._domain_knowledge_entries())
+            except (AttributeError, TypeError, ConfigError):
+                entries = ()
+            member_dk.append((str(source_id), entries))
+            sg = getattr(eng, "_schema_graph", None)
+            facts = tuple(getattr(sg, "structural_knowledge", ()) or ()) if sg is not None else ()
+            member_structural.append((str(source_id), facts))
+            if sg is not None:
+                member_table_universe.update(str(name) for name in sg.tables.keys())
+        for member_graph in (getattr(self, "_federation_member_graphs", None) or {}).values():
+            if member_graph is not None:
+                member_table_universe.update(str(name) for name in member_graph.tables.keys())
+        try:
+            final_dk = MainExecutionOps.enrich_federation_composite_knowledge(
+                self._schema_graph,
+                member_domain_knowledge=member_dk,
+                member_structural_knowledge=member_structural,
+                notes_content=notes_content,
+                all_schema_table_names=member_table_universe,
+            )
+        except MockFixtureMissingError:
+            if EngineConfig.is_sandbox_llm_provider(EngineConfig.LLM_PROVIDER):
+                self._audit_emit(
+                    "domain_knowledge_ingest",
+                    details=(("status", "skipped_sandbox_fixture"), ("kept", "0")),
+                )
+                return
+            raise
+        if final_dk:
+            self._replace_domain_knowledge(final_dk)
+        self._audit_emit(
+            "domain_knowledge_ingest",
+            details=(
+                (
+                    "status",
+                    "ok" if final_dk else ("skipped_no_notes" if not (notes_content or "").strip() else "empty"),
+                ),
+                ("kept", str(len(final_dk))),
+                ("members", str(len(member_dk))),
+                ("notes_chars", str(len(notes_content or ""))),
+                ("keys", ",".join(e.key for e in final_dk)),
+            ),
+        )
 
-    def business_knowledge(self) -> tuple[BusinessKnowledgeEntry, ...]:
-        """Return the active business knowledge entries."""
-        holder = getattr(self, "_business_knowledge", None)
-        if not isinstance(holder, BusinessKnowledgeHolder):
+    def _domain_knowledge_entries(self) -> tuple[DomainKnowledgeEntry, ...]:
+        """Return active domain knowledge entries (internal; public path is export_knowledge)."""
+        holder = getattr(self, "_domain_knowledge", None)
+        if not isinstance(holder, DomainKnowledgeHolder):
             return ()
         return holder.entries()
 
-    def business_knowledge_digest(self) -> str:
-        """Return a stable digest of the active business knowledge."""
-        holder = getattr(self, "_business_knowledge", None)
-        if not isinstance(holder, BusinessKnowledgeHolder):
-            return ""
-        return holder.digest()
+    def _resolve_space_knowledge_export_target(self, space: str | None) -> tuple[str | None, dict[str, Any] | None]:
+        """Resolve export target for one space; ``None`` selects :attr:`default_space_uid`."""
+        resolved = self._resolve_session_space(space)
+        norm = str(resolved).strip().lower()
+        if not norm:
+            raise ConfigError("space identity must be non-empty")
+        if norm in (MASTER_AETHERSPACE_NAME, MASTER_AETHERSPACE_UID):
+            self._require_owner("export_knowledge")
+            return MASTER_AETHERSPACE_UID, None
+        desc = self._resolve_aetherspace(norm)[0]
+        space_snapshot = load_aetherspace_snapshot(str(self._artifacts_dir), desc.uid)
+        if space_snapshot is None:
+            raise ConfigError(f"unknown aetherspace {resolved!r}")
+        return desc.uid, space_snapshot
 
-    def business_knowledge_version(self) -> int:
-        """Return the monotonic version counter for business knowledge updates."""
-        holder = getattr(self, "_business_knowledge", None)
-        if not isinstance(holder, BusinessKnowledgeHolder):
-            return 0
-        return holder.version()
-
-    def export_space_knowledge(self, space: str | None = None) -> dict[str, Any]:
-        """Return business knowledge for master or one named space (key/kind/text only)."""
-        space_snapshot = None
-        if space is not None:
-            norm = str(space).strip().lower()
-            if norm and norm != MASTER_AETHERSPACE_NAME:
-                space_snapshot = load_aetherspace_snapshot(str(self._artifacts_dir), norm)
-                if space_snapshot is None:
-                    raise ConfigError(f"unknown aetherspace {space!r}")
-        return MainExecutionOps.build_space_knowledge_export(
-            engine_entries=self.business_knowledge(),
-            business_knowledge_version=self.business_knowledge_version(),
-            space=space,
+    def export_knowledge(self, space: str | None = None) -> dict[str, Any]:
+        """Return space domain knowledge and description overlays for the default or one named space."""
+        space_token, space_snapshot = self._resolve_space_knowledge_export_target(space)
+        scope_ctx, visible = self._caller_visibility()
+        payload = MainExecutionOps.build_space_knowledge_export(
+            engine_entries=self._domain_knowledge_entries(),
+            space=space_token,
             space_snapshot=space_snapshot,
-        )
-
-    def export_knowledge(self) -> dict[str, Any]:
-        """Return engine plus per-space business knowledge wrapper."""
-        snapshots: dict[str, Any] = {}
-        for name in list_saved_aetherspace_names(str(self._artifacts_dir)):
-            snap = load_aetherspace_snapshot(str(self._artifacts_dir), name)
-            if snap is not None:
-                snapshots[name] = snap
-        return MainExecutionOps.build_knowledge_export(
-            engine_entries=self.business_knowledge(),
-            business_knowledge_version=self.business_knowledge_version(),
-            space_snapshots=snapshots,
-        )
-
-    def export_metadata(self, space: str | None = None) -> dict[str, Any]:
-        """Return deterministic table/column inventory for the composite graph."""
-        space_snapshot = None
-        if space is not None:
-            norm = str(space).strip().lower()
-            if norm and norm != MASTER_AETHERSPACE_NAME:
-                space_snapshot = load_aetherspace_snapshot(str(self._artifacts_dir), norm)
-                if space_snapshot is None:
-                    raise ConfigError(f"unknown aetherspace {space!r}")
-        members = getattr(self, "_member_table_roster", None)
-        return MainExecutionOps.build_metadata_export(
             schema_graph=self._schema_graph,
-            space=space,
+            scope_ctx=scope_ctx,
+            visible_objects=visible,
+        )
+        self._audit_emit(
+            "export_knowledge",
+            schema_hash=self._effective_structural_hash or None,
+            details=(("space", str(space_token or "default")),),
+        )
+        payload.pop("format_version", None)
+        return payload
+
+    def export_structure(self, space: str | None = None) -> dict[str, Any]:
+        """Return structural inventory merged with editable overrides for the default or one named space."""
+        resolved_space = self._resolve_session_space(space)
+        space_snapshot = None
+        space_token = resolved_space
+        norm = str(resolved_space).strip().lower()
+        if norm and norm not in (MASTER_AETHERSPACE_NAME, MASTER_AETHERSPACE_UID):
+            desc = self._resolve_aetherspace(norm)[0]
+            space_token = desc.uid
+            space_snapshot = load_aetherspace_snapshot(str(self._artifacts_dir), desc.uid)
+            if space_snapshot is None:
+                raise ConfigError(f"unknown aetherspace {resolved_space!r}")
+        members = getattr(self, "_member_table_roster", None)
+        if self._schema_role == SchemaRole.CONSUMER:
+            members = None
+        scope_ctx, visible = self._caller_visibility()
+        inventory = MainExecutionOps.build_structure_export(
+            schema_graph=self._schema_graph,
+            space=space_token,
             space_snapshot=space_snapshot,
             federation_members=members,
+            scope_ctx=scope_ctx,
+            visible_objects=visible,
+        )
+        overrides_raw = dump_structure_edits(self._schema_graph)
+        payload = build_public_structure_document(
+            inventory=inventory,
+            overrides={
+                "tables": overrides_raw.get("tables") or {},
+                "foreign_keys_add": overrides_raw.get("foreign_keys_add") or [],
+                "foreign_keys_remove": overrides_raw.get("foreign_keys_remove") or [],
+                "primary_keys_add": overrides_raw.get("primary_keys_add") or [],
+                "primary_keys_remove": overrides_raw.get("primary_keys_remove") or [],
+            },
+        )
+        self._audit_emit(
+            "export_structure",
+            schema_hash=self._effective_structural_hash or None,
+            details=(("space", str(space_token if space_token is not None else "default")),),
+        )
+        return payload
+
+    @_writer_lock_guard
+    def apply_knowledge(self, space: str, document: Mapping[str, Any]) -> None:
+        """Replace space domain knowledge and description overlays from one exported document."""
+        fields = MainExecutionOps.knowledge_document_apply_fields(document)
+        self._apply_knowledge_impl(
+            space,
+            domain_knowledge=fields.get("domain_knowledge"),
+            table_descriptions=fields.get("table_descriptions"),
+            column_descriptions=fields.get("column_descriptions"),
         )
 
-    def _resolve_aetherspace(
-        self, name: str
-    ) -> tuple[AetherSpace, frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
-        norm = str(name).strip().lower()
+    @_writer_lock_guard
+    def apply_structure(self, document: Mapping[str, Any]) -> None:
+        """Apply a structural document to the composite federation graph declaratively."""
+        self._require_owner("apply_structure")
+        fed_dir = self._composite_federation_dir()
+        schema_json_path = str(Path(fed_dir) / "schema_graph.json.gz")
+        report = apply_structure_document(
+            self._schema_graph,
+            document,
+            schema_json_path=schema_json_path,
+            dialect=self._dialect,
+            domain_knowledge=self._domain_knowledge_entries(),
+        )
+        if report.domain_knowledge_entries is not None:
+            self._replace_domain_knowledge(report.domain_knowledge_entries)
+        if (
+            report.table_edits
+            or report.column_edits
+            or report.fks_added
+            or report.fks_removed
+            or report.pks_added
+            or report.pks_endorsed
+            or report.pks_blocked
+            or report.coerced_columns
+            or report.collapsed_inferences
+        ):
+            self._schema_stats = self._schema_graph.refresh_schema_stats()
+        self._recompose()
+        sh = getattr(self._schema_graph, "effective_structural_hash", None)
+        self._audit_emit(
+            "apply_structure",
+            schema_hash=str(sh) if sh is not None else None,
+            details=(
+                ("scope", "composite"),
+                ("table_edits", str(report.table_edits)),
+                ("column_edits", str(report.column_edits)),
+            ),
+        )
+
+    def _apply_knowledge_impl(
+        self,
+        space: str,
+        *,
+        domain_knowledge: Sequence[DomainKnowledgeEntry | Mapping[str, Any]] | None = None,
+        table_descriptions: Mapping[str, str] | None = None,
+        column_descriptions: Mapping[str, str] | None = None,
+    ) -> None:
+        """Internal apply path for space knowledge overlays."""
+        self._require_owner("apply_knowledge")
+        norm = str(space).strip().lower()
         if not norm:
-            raise ConfigError("aetherspace name must be non-empty")
-        if norm == MASTER_AETHERSPACE_NAME:
+            raise ConfigError("space identity must be non-empty")
+        if norm in (MASTER_AETHERSPACE_NAME, MASTER_AETHERSPACE_UID):
+            if domain_knowledge is None and table_descriptions is None and column_descriptions is None:
+                raise ConfigError(
+                    "apply_knowledge requires domain_knowledge and/or table_descriptions and/or column_descriptions"
+                )
+            if domain_knowledge is not None:
+                self._replace_domain_knowledge(MainExecutionOps.normalize_domain_knowledge_entries(domain_knowledge))
+            if table_descriptions is not None or column_descriptions is not None:
+                MainExecutionOps.apply_master_space_knowledge_to_graph(
+                    self._schema_graph,
+                    schema_json_path=str(self._artifacts_dir / "schema_graph.json.gz"),
+                    table_descriptions=table_descriptions,
+                    column_descriptions=column_descriptions,
+                )
+            return
+        desc = self._resolve_aetherspace(norm)[0]
+        snap = load_aetherspace_snapshot(str(self._artifacts_dir), desc.uid)
+        if snap is None:
+            raise ConfigError(f"unknown aetherspace {space!r}")
+        updated = MainExecutionOps.apply_knowledge_to_snapshot(
+            snap,
+            domain_knowledge=domain_knowledge,
+            table_descriptions=table_descriptions,
+            column_descriptions=column_descriptions,
+            schema_graph=self._schema_graph,
+        )
+        updated = filter_space_snapshot_sensitive_columns(updated, self._schema_graph)
+        save_aetherspace_snapshot(str(self._artifacts_dir), desc.uid, updated)
+
+    def _caller_visibility(self) -> tuple[EngineContext | FederationContext, frozenset[str] | None]:
+        """Return scope context and caller-visible objects; consumers fail closed to an empty set when visibility is unset."""
+        scope_ctx = MainExecutionOps.resolve_preview_scope_context(self)
+        visible = getattr(self, "_consumer_visible_objects", None)
+        if self._schema_role == SchemaRole.CONSUMER and visible is None:
+            visible = frozenset()
+        if visible is not None and not isinstance(visible, frozenset):
+            visible = frozenset(visible)
+        return scope_ctx, visible
+
+    def _resolve_session_space(self, space: str | None) -> str:
+        if space is None:
+            return self.default_space_uid
+        return str(space)
+
+    def _resolve_aetherspace(
+        self, token: str
+    ) -> tuple[AetherSpace, frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
+        raw = str(token).strip()
+        if not raw:
+            raise ConfigError("aetherspace identity must be non-empty")
+        lower = raw.lower()
+        if lower == MASTER_AETHERSPACE_NAME:
             desc = build_master_space_descriptor(self._schema_graph)
             return desc, frozenset(), frozenset(), frozenset(), frozenset()
-        snap = load_aetherspace_snapshot(str(self._artifacts_dir), norm)
+        uid: str | None = None
+        snap: dict[str, Any] | None = None
+        try:
+            candidate = MainExecutionOps.validate_space_uid(raw)
+        except ValueError:
+            candidate = None
+        if candidate is not None and candidate != MASTER_AETHERSPACE_UID:
+            snap = load_aetherspace_snapshot(str(self._artifacts_dir), candidate)
+            if snap is not None:
+                uid = candidate
+        if uid is None:
+            uid = resolve_aetherspace_identity(str(self._artifacts_dir), lower)
+            if uid == MASTER_AETHERSPACE_UID:
+                desc = build_master_space_descriptor(self._schema_graph)
+                return desc, frozenset(), frozenset(), frozenset(), frozenset()
+            snap = load_aetherspace_snapshot(str(self._artifacts_dir), uid)
         if snap is None:
-            raise ConfigError(f"unknown aetherspace {name!r}")
-        tables_raw = snap.get("tables")
-        if isinstance(tables_raw, (list, tuple)) and len(tables_raw) == 0:
-            raise ConfigError("space empty after schema migration; redefine")
-        desc = aetherspace_descriptor_from_snapshot(norm, snap)
+            raise ConfigError(f"unknown aetherspace {token!r}")
+        desc = aetherspace_descriptor_from_snapshot(uid, snap)
         tables, columns = space_allowed_sets_from_snapshot(snap)
         deny_objects, deny_columns = space_deny_sets_from_snapshot(snap)
         mappings = self._federation_mappings or FederationMappings(version=FEDERATION_MAPPINGS_VERSION)
@@ -2349,7 +2740,7 @@ class AetherFederation:
             logical = collapsed.get(table_name)
             if logical is not None:
                 raise ConfigError(
-                    f"aetherspace {name!r} names collapsed member table {table_name!r}; "
+                    f"aetherspace {token!r} names collapsed member table {table_name!r}; "
                     f"use logical table {logical!r} instead",
                 )
         validate_federation_context_against_mappings(
@@ -2361,7 +2752,59 @@ class AetherFederation:
             ),
             mappings,
         )
+        scope_ctx, visible = self._caller_visibility()
+        if not aetherspace_within_effective_visibility(
+            tables,
+            columns,
+            self._schema_graph,
+            scope_ctx,
+            visible,
+            mappings=mappings,
+            federation_manifest=self._federation_manifest,
+        ):
+            raise ConfigError(f"unknown aetherspace {token!r}")
+        tables_raw = snap.get("tables")
+        if isinstance(tables_raw, (list, tuple)) and len(tables_raw) == 0:
+            raise ConfigError("space empty after schema migration; redefine")
+        if getattr(self, "_sandbox_mode", False):
+            Sandbox.require_sandbox_space_lock(desc.name, tables)
         return desc, tables, columns, deny_objects, deny_columns
+
+    def _resolve_aetherspace_visible_by_name(self, name: str) -> AetherSpace:
+        """Resolve display *name* among spaces visible to the caller (unique match required)."""
+        try:
+            norm = TemplateOps.validate_space_name(str(name).strip().lower())
+        except ValueError as exc:
+            raise ConfigError(f"invalid aetherspace name: {name!r}") from exc
+        if norm == MASTER_AETHERSPACE_NAME:
+            return build_master_space_descriptor(self._schema_graph)
+        scope_ctx, visible = self._caller_visibility()
+        mappings = self._federation_mappings or FederationMappings(version=FEDERATION_MAPPINGS_VERSION)
+        matches: list[AetherSpace] = []
+        for space_uid, label in list_saved_aetherspace_entries(str(self._artifacts_dir)):
+            if label != norm:
+                continue
+            snap = load_aetherspace_snapshot(str(self._artifacts_dir), space_uid)
+            if snap is None:
+                continue
+            tables, columns = space_allowed_sets_from_snapshot(snap)
+            if not aetherspace_within_effective_visibility(
+                tables,
+                columns,
+                self._schema_graph,
+                scope_ctx,
+                visible,
+                mappings=mappings,
+                federation_manifest=self._federation_manifest,
+            ):
+                continue
+            matches.append(aetherspace_descriptor_from_snapshot(space_uid, snap))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            uids = ", ".join(m.uid for m in matches)
+            raise ConfigError(f"ambiguous aetherspace name {norm!r}; matches uids {uids}")
+        raise ConfigError(f"unknown aetherspace {name!r}")
 
     def _ensure_llm(self) -> None:
         if not EngineConfig.llm_credentials_configured():
@@ -2402,16 +2845,39 @@ class AetherFederation:
         self,
         *,
         mode: Literal["reader", "writer"] = "writer",
-        space: str = "master",
+        space: str | None = None,
         ephemeral_scope: SpaceContext | None = None,
         data_row_cap: int | None = None,
     ) -> PipelineSession:
         self._require_open("session")
         if self._sandbox_closed:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
+            raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
         if self._schema_role == SchemaRole.CONSUMER and mode == "writer":
             raise OwnerOnlyOperationError("PipelineSession(mode='writer')")
-        _, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(space)
+        desc, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(
+            self._resolve_session_space(space)
+        )
+        if ephemeral_scope is not None and (
+            ephemeral_scope.tables
+            or ephemeral_scope.columns
+            or ephemeral_scope.deny_objects
+            or ephemeral_scope.deny_columns
+        ):
+            ephemeral_scope = validate_space_context_against_graph(
+                ephemeral_scope,
+                self._schema_graph,
+                federation_manifest=self._federation_manifest,
+            )
+            scope_ctx, visible = self._caller_visibility()
+            validate_aetherspace_define_within_visibility(
+                ephemeral_scope.tables,
+                ephemeral_scope.columns,
+                self._schema_graph,
+                scope_ctx,
+                visible,
+                mappings=self._federation_mappings or FederationMappings(version=FEDERATION_MAPPINGS_VERSION),
+                federation_manifest=self._federation_manifest,
+            )
         space_tables, space_columns, space_deny_objects, space_deny_columns = intersect_space_scope(
             space_tables,
             space_columns,
@@ -2420,9 +2886,9 @@ class AetherFederation:
             ephemeral_scope,
         )
         space_description_overlay: dict[str, Any] | None = None
-        norm = str(space).strip().lower()
-        if norm != MASTER_AETHERSPACE_NAME:
-            snap = load_aetherspace_snapshot(str(self._artifacts_dir), norm)
+        space_uid = desc.uid
+        if space_uid != MASTER_AETHERSPACE_UID:
+            snap = load_aetherspace_snapshot(str(self._artifacts_dir), space_uid)
             if isinstance(snap, dict):
                 table_descriptions = snap.get("table_descriptions")
                 column_meta = snap.get("column_meta")
@@ -2431,22 +2897,14 @@ class AetherFederation:
                         "table_descriptions": dict(table_descriptions or {}),
                         "column_meta": dict(column_meta or {}),
                     }
-        exec_ctx = getattr(self._runtime_config, "execution_context", None)
-        if exec_ctx is None:
-            exec_ctx = self._runtime_config.engine_context
-        validate_space_subset_of_execution_context(
-            space_tables,
-            space_columns,
-            exec_ctx,
-            self._schema_graph,
-        )
         payload_visible = space_tables if space_tables else None
+        MainExecutionOps.bind_template_store_for_space(self, space_uid)
         return PipelineSession(
             self,
             mode=mode,
             visible_objects=payload_visible,
             execution_visible_objects=self._consumer_visible_objects,
-            space_name=str(space).strip().lower(),
+            space_name=space_uid,
             space_tables=space_tables,
             space_columns=space_columns,
             space_deny_objects=space_deny_objects,
@@ -2455,20 +2913,29 @@ class AetherFederation:
             data_row_cap=data_row_cap,
         )
 
-    def list_templates(self, *, space: str = "master") -> tuple[StoredTemplateSummary, ...]:
+    def list_templates(self, *, space: str | None = None) -> tuple[StoredTemplateSummary, ...]:
         """Enumerate caller-visible federation plan templates."""
         if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
+            raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
         del space
-        return list_stored_template_summaries(self._templates, space="master", dialect=self._dialect)
+        scope_ctx, visible = self._caller_visibility()
+        visible_tables = effective_visible_tables(self._schema_graph, scope_ctx, visible)
+        return list_stored_template_summaries(
+            self._templates,
+            space="master",
+            dialect=self._dialect,
+            visible_tables=visible_tables,
+        )
 
-    def fetch_template(self, template_ref: str, *, space: str = "master") -> StoredTemplateDetail:
+    def fetch_template(self, template_ref: str, *, space: str | None = None) -> StoredTemplateDetail:
         """Fetch one federation plan template by id or ``sql_fp`` hash."""
         if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
+            raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
         del space
+        scope_ctx, visible = self._caller_visibility()
+        visible_tables = effective_visible_tables(self._schema_graph, scope_ctx, visible)
         tmpl = resolve_template_ref(template_ref, self._templates)
-        if tmpl is None or not template_visible_to_callers(tmpl):
+        if tmpl is None or not TemplateOps.template_enumerable_by_caller(tmpl, visible_tables=visible_tables):
             raise ConfigError(f"unknown template ref {template_ref!r}")
         vh = tmpl.value_history
         hist_idx = 0
@@ -2481,6 +2948,8 @@ class AetherFederation:
             schema=self._schema_graph,
             dialect=self._dialect,
             history_index=hist_idx,
+            schema_context=scope_ctx,
+            visible_objects=visible,
         )
 
     @_writer_lock_guard
@@ -2490,46 +2959,44 @@ class AetherFederation:
         params: dict[str, Any] | None = None,
         *,
         question: str | None = None,
-        space: str = "master",
+        space: str | None = None,
         as_dataframe: bool = False,
     ) -> TemplateExecutionResult | pandas.DataFrame:
         """Execute one federation-stored template by id or ``sql_fp`` with p-param binds."""
         if getattr(self, "_sandbox_closed", False) is True:
-            raise RuntimeError("Sandbox handle is closed; create a new offline_sandbox() instance.")
+            raise RuntimeError("Sandbox handle is closed; create a new Sandbox instance.")
         if params is not None and not isinstance(params, dict):
             raise TypeError("params must be a dict or None")
         del space
         bind = dict(params or ())
-        runtime_cfg = getattr(self, "_runtime_config", None)
-        execution_context = getattr(runtime_cfg, "execution_context", None) if runtime_cfg is not None else None
-        scope_ctx = execution_context
-        if scope_ctx is None and runtime_cfg is not None:
-            scope_ctx = getattr(runtime_cfg, "engine_context", None)
+        scope_ctx, visible = self._caller_visibility()
+        visible_tables = effective_visible_tables(self._schema_graph, scope_ctx, visible)
         identity = getattr(self, "_engine_identity", None)
         if not isinstance(identity, EngineIdentity):
+            runtime_cfg = getattr(self, "_runtime_config", None)
             dialect_obj = self._dialect
             engine_type = str(getattr(dialect_obj, "name", "duckdb") or "duckdb")
             identity = EngineIdentity(engine_type=engine_type, runtime_config=runtime_cfg)
         identity_token = push_engine_identity(identity)
-        limits_token = push_engine_limits(getattr(self, "_limits", EngineLimits()))
-        try:
-            result = execute_stored_template_by_ref(
-                template_ref,
-                bind,
-                question=question,
-                dialect=self._dialect,
-                store=self._store,
-                templates=self._templates,
-                rejected=self._rejected,
-                schema=self._schema_graph,
-                schema_context=scope_ctx,
-                visible_objects=self._consumer_visible_objects,
-                schema_role=self._schema_role,
-                persist_template_learning=False,
-            )
-        finally:
-            pop_engine_limits(limits_token)
-            pop_engine_identity(identity_token)
+        with owner_limits_scope(self):
+            try:
+                result = execute_stored_template_by_ref(
+                    template_ref,
+                    bind,
+                    question=question,
+                    dialect=self._dialect,
+                    store=self._store,
+                    templates=self._templates,
+                    rejected=self._rejected,
+                    schema=self._schema_graph,
+                    schema_context=scope_ctx,
+                    visible_objects=visible,
+                    visible_tables=visible_tables,
+                    schema_role=self._schema_role,
+                    persist_template_learning=False,
+                )
+            finally:
+                pop_engine_identity(identity_token)
         if as_dataframe:
             return pandas.DataFrame([list(r) for r in result.rows], columns=list(result.columns) or None)
         return result
@@ -2538,38 +3005,78 @@ class AetherFederation:
         self,
         *,
         mode: Literal["reader", "writer"] = "writer",
-        space: str = "master",
+        space: str | None = None,
+        ephemeral_scope: SpaceContext | None = None,
+        data_row_cap: int | None = None,
     ) -> AsyncPipelineSession:
-        return AsyncPipelineSession(self.session(mode=mode, space=space))
+        return AsyncPipelineSession(
+            self.session(mode=mode, space=space, ephemeral_scope=ephemeral_scope, data_row_cap=data_row_cap)
+        )
 
     @_writer_lock_guard
     def aetherspace(
         self,
-        name: str,
+        name: str | None = None,
         space_context: SpaceContext | None = None,
         *,
+        uid: str | None = None,
         notes_file: str | None = None,
         notes: str | None = None,
     ) -> AetherSpace:
-        """Check or define a named aetherspace scope snapshot on the composite graph."""
-        norm = str(name).strip().lower()
-        if not norm:
-            raise ConfigError("aetherspace name must be non-empty")
-        if space_context is None:
-            return self._resolve_aetherspace(norm)[0]
-        self._require_owner("aetherspace")
-        if norm == MASTER_AETHERSPACE_NAME:
-            raise ConfigError(
-                "master is the implicit full-scope space; it cannot be created or overwritten",
-            )
+        """Create, update, or read an aetherspace on the composite graph."""
         if notes_file is not None and notes is not None:
             raise ConfigError("set at most one of notes and notes_file")
+        try:
+            uid_norm = MainExecutionOps.validate_space_uid(str(uid).strip()) if uid is not None else None
+        except ValueError as exc:
+            raise ConfigError(f"invalid aetherspace uid: {uid!r}") from exc
+        name_norm = str(name).strip().lower() if name is not None else None
+        if space_context is None:
+            if uid_norm and name_norm:
+                raise ConfigError("read aetherspace with uid or name, not both")
+            if uid_norm:
+                return self._resolve_aetherspace(uid_norm)[0]
+            if name_norm:
+                return self._resolve_aetherspace_visible_by_name(name_norm)
+            raise ConfigError("aetherspace read requires uid or name")
+        self._require_owner("aetherspace")
+        if uid_norm:
+            if uid_norm == MASTER_AETHERSPACE_UID:
+                raise ConfigError(
+                    "master is the implicit full-scope space; it cannot be created or overwritten",
+                )
+            desc = self._resolve_aetherspace(uid_norm)[0]
+            display = name_norm if name_norm else desc.name
+        else:
+            if not name_norm:
+                raise ConfigError("aetherspace create requires name")
+            if name_norm == MASTER_AETHERSPACE_NAME:
+                raise ConfigError(
+                    "master is the implicit full-scope space; it cannot be created or overwritten",
+                )
+            try:
+                display = TemplateOps.validate_space_name(name_norm)
+            except ValueError as exc:
+                raise ConfigError(f"invalid aetherspace name: {name!r}") from exc
+            uid_norm = allocate_aetherspace_uid(str(self._artifacts_dir))
+        mappings = self._federation_mappings or FederationMappings(version=FEDERATION_MAPPINGS_VERSION)
+        scope_ctx, visible = self._caller_visibility()
+        validate_aetherspace_define_within_visibility(
+            space_context.tables,
+            space_context.columns,
+            self._schema_graph,
+            scope_ctx,
+            visible,
+            mappings=mappings,
+            federation_manifest=self._federation_manifest,
+        )
         validated = validate_space_context_against_graph(
             space_context,
             self._schema_graph,
             federation_manifest=self._federation_manifest,
         )
-        mappings = self._federation_mappings or FederationMappings(version=FEDERATION_MAPPINGS_VERSION)
+        if getattr(self, "_sandbox_mode", False):
+            Sandbox.require_sandbox_space_lock(display, validated.tables)
         collapsed = collapsed_member_physical_table_names(mappings)
         for table_name in validated.tables | validated.deny_objects:
             logical = collapsed.get(table_name)
@@ -2591,78 +3098,115 @@ class AetherFederation:
             validated,
             federation_manifest=self._federation_manifest,
         )
+        snapshot["uid"] = uid_norm
+        snapshot["name"] = display
         if notes_file is not None:
             notes_path, notes_inline = notes_file, None
         elif notes is not None:
             notes_path, notes_inline = None, notes
         else:
             notes_path, notes_inline = validated.notes_file, validated.notes
+        if notes_path is not None and str(notes_path).strip() and getattr(self, "_sandbox_mode", False):
+            connection = getattr(self, "_native_connection", None)
+            host = Sandbox.sandbox_host_for_connection(connection) if connection is not None else None
+            if host is not None:
+                notes_path = Sandbox.validate_sandbox_aetherspace_notes_pairing(
+                    display,
+                    notes_path,
+                    extract_path=host._extract_path,
+                )
         if notes_inline is not None and str(notes_inline).strip():
             snapshot = enrich_space_snapshot_with_notes(
                 snapshot,
                 self._schema_graph,
                 validated,
                 notes=str(notes_inline),
+                engine_domain_knowledge=self._domain_knowledge_entries(),
             )
         elif notes_path is not None and str(notes_path).strip():
-            if getattr(self, "_sandbox_mode", False):
-                connection = getattr(self, "_native_connection", None)
-                host = Sandbox.sandbox_host_for_connection(connection) if connection is not None else None
-                if host is not None:
-                    Sandbox.validate_sandbox_aetherspace_notes_pairing(
-                        validated,
-                        notes_path,
-                        extract_path=host._extract_path,
-                    )
             snapshot = enrich_space_snapshot_with_notes(
                 snapshot,
                 self._schema_graph,
                 validated,
                 notes_path,
+                engine_domain_knowledge=self._domain_knowledge_entries(),
             )
-        save_aetherspace_snapshot(str(self._artifacts_dir), norm, snapshot)
-        return aetherspace_descriptor_from_snapshot(norm, snapshot)
-
-    @_writer_lock_guard
-    def export_aetherspace(self, name: str) -> Path:
-        """Export a JSON snapshot of one named aetherspace for review or apply."""
-        self._require_master_context("export_aetherspace")
-        norm = str(name).strip().lower()
-        if norm != MASTER_AETHERSPACE_NAME and load_aetherspace_snapshot(str(self._artifacts_dir), norm) is None:
-            raise ConfigError(f"unknown aetherspace {name!r}")
-        return export_aetherspace_json(str(self._artifacts_dir), norm, self._schema_graph)
-
-    @_writer_lock_guard
-    def apply_aetherspace(self, name: str, *, source: str | os.PathLike[str] | None = None) -> AetherSpace:
-        """Apply an exported aetherspace JSON document and persist it under *name*."""
-        self._require_owner("apply_aetherspace")
-        self._require_master_context("apply_aetherspace")
-        norm = str(name).strip().lower()
-        return apply_aetherspace_json(
-            str(self._artifacts_dir),
-            norm,
+        else:
+            snapshot = enrich_space_snapshot_with_notes(
+                snapshot,
+                self._schema_graph,
+                validated,
+                engine_domain_knowledge=self._domain_knowledge_entries(),
+            )
+        snapshot["uid"] = uid_norm
+        snapshot["name"] = display
+        snapshot = filter_space_snapshot_sensitive_columns(
+            snapshot,
             self._schema_graph,
-            source=source,
             federation_manifest=self._federation_manifest,
         )
+        save_aetherspace_snapshot(str(self._artifacts_dir), uid_norm, snapshot)
+        return aetherspace_descriptor_from_snapshot(uid_norm, snapshot)
 
     @_writer_lock_guard
-    def delete_aetherspace(self, name: str) -> bool:
-        """Delete one persisted named aetherspace snapshot."""
+    def delete_aetherspace(
+        self,
+        name: str | None = None,
+        *,
+        uid: str | None = None,
+        persist_learning: bool = True,
+    ) -> AetherspaceDeleteResult:
+        """Delete one persisted aetherspace snapshot and its learning partition."""
         self._require_owner("delete_aetherspace")
-        self._require_master_context("delete_aetherspace")
-        norm = str(name).strip().lower()
-        return delete_aetherspace_snapshot(str(self._artifacts_dir), norm)
+        token = uid if uid is not None else name
+        if token is None:
+            raise ConfigError("delete_aetherspace requires uid or name")
+        desc = self._resolve_aetherspace(str(token))[0]
+        return delete_aetherspace(
+            str(self._artifacts_dir),
+            desc.uid,
+            persist_learning=persist_learning,
+            schema_graph=self._schema_graph,
+        )
 
-    def list_aetherspaces(self) -> tuple[str, ...]:
-        """Return saved aetherspace names plus the implicit ``master`` space."""
-        self._require_master_context("list_aetherspaces")
-        saved = list_saved_aetherspace_names(str(self._artifacts_dir))
-        return (MASTER_AETHERSPACE_NAME,) + saved
+    def list_aetherspaces(self, *, include_system: bool = False) -> tuple[AetherSpace, ...]:
+        """Return aetherspace descriptors visible to the caller. Owners include the implicit ``master`` space. Consumers omit ``master``. System credential-default spaces are omitted unless *include_system* is True."""
+        scope_ctx, visible = self._caller_visibility()
+        mappings = self._federation_mappings or FederationMappings(version=FEDERATION_MAPPINGS_VERSION)
+        out: list[AetherSpace] = []
+        if self._schema_role != SchemaRole.CONSUMER:
+            out.append(build_master_space_descriptor(self._schema_graph))
+        for space_uid, _label in list_saved_aetherspace_entries(str(self._artifacts_dir)):
+            snap = load_aetherspace_snapshot(str(self._artifacts_dir), space_uid)
+            if snap is None:
+                continue
+            if not include_system and MainExecutionOps.is_credential_default_snapshot(snap):
+                continue
+            tables, columns = space_allowed_sets_from_snapshot(snap)
+            if aetherspace_within_effective_visibility(
+                tables,
+                columns,
+                self._schema_graph,
+                scope_ctx,
+                visible,
+                mappings=mappings,
+                federation_manifest=self._federation_manifest,
+            ):
+                out.append(aetherspace_descriptor_from_snapshot(space_uid, snap))
+        return tuple(out)
 
-    def export_context(self, name: str) -> Path:
-        """Export a read-only JSON snapshot of one named federation context preset."""
-        self._require_master_context("export_context")
+    @property
+    def default_space_uid(self) -> str:
+        """The default aetherspace for this federation: the master space for an owner, the visibility-keyed default for a consumer."""
+        if self._schema_role == SchemaRole.CONSUMER:
+            uid = getattr(self, "_credential_default_space_uid", None)
+            if uid:
+                return str(uid)
+        return MASTER_AETHERSPACE_UID
+
+    def export_context(self, name: str) -> dict[str, Any]:
+        """Return a read-only export document for one named federation context preset. Owner-only."""
+        self._require_owner("export_context")
         norm = str(name).strip().lower()
         master_ctx = self._runtime_config.engine_context
         if not isinstance(master_ctx, FederationContext):
@@ -2671,10 +3215,8 @@ class AetherFederation:
         if norm != MASTER_AETHERSPACE_NAME and not path.is_file():
             if load_named_schema_context(str(self._artifacts_dir), norm) is None:
                 raise ConfigError(f"unknown federation context {name!r}")
-        payload = {
-            "version": NAMED_SCHEMA_CONTEXT_ARTIFACT_VERSION,
-            "name": norm,
-            "context": {
+        if norm == MASTER_AETHERSPACE_NAME:
+            context_fields = {
                 "allow_objects": sorted(master_ctx.allow_objects),
                 "include": str(master_ctx.include),
                 "deny_objects": sorted(master_ctx.deny_objects),
@@ -2682,79 +3224,46 @@ class AetherFederation:
                 "allow_columns": sorted(getattr(master_ctx, "allow_columns", frozenset())),
                 "notes_file": master_ctx.notes_file,
                 "notes": getattr(master_ctx, "notes", None),
-            },
-        }
-        path.write_text(__import__("json").dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        return path
+            }
+        else:
+            row = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            raw_context = row.get("context") if isinstance(row, dict) else None
+            if not isinstance(raw_context, dict):
+                raise ConfigError(f"unknown federation context {name!r}")
+            context_fields = cast(dict[str, Any], raw_context)
+        return {"name": norm, "context": context_fields}
 
     def list_contexts(self) -> tuple[str, ...]:
-        """Return saved federation-context names plus the implicit ``master`` context."""
-        self._require_master_context("list_contexts")
+        """Return saved federation-context names plus the implicit ``master`` context. Owner-only."""
+        self._require_owner("list_contexts")
         root = Path(str(self._artifacts_dir))
-        names = []
+        names: list[str] = []
         for p in sorted(root.glob("federation_context.*.json")):
             stem = p.name[len("federation_context.") : -len(".json")]
-            if stem and stem != MASTER_AETHERSPACE_NAME:
-                names.append(stem)
+            if not stem or stem == MASTER_AETHERSPACE_NAME:
+                continue
+            names.append(stem)
         return (MASTER_AETHERSPACE_NAME,) + tuple(names)
 
     def prepared_federated_outcome(self) -> FederatedPrepareOutcome | None:
         """Return the staged federated prepare outcome from an in-flight turn, if any."""
         return None
 
-    def preview_table(self, table_name: str, *, limit: int = TABLE_PREVIEW_DEFAULT_LIMIT) -> TablePreviewResult:
-        """Return the first rows of a composite table through federation scope and sensitivity gates."""
-        self._require_open("preview_table")
-        return preview_table_on_federation(self, table_name, limit=limit)
-
     def mapping_suggestions(self) -> tuple[FederationMappingSuggestion, ...]:
         """Return cross-source mapping suggestions computed at federation composition time."""
+        self._require_owner("mapping_suggestions")
         self._require_open("mapping_suggestions")
         return tuple(getattr(self, "_federation_mapping_suggestions", ()) or ())
 
-    def preview_plan(self, question: str, *, space: str = "master") -> PlanPreviewResult:
-        """Return what a federated turn would run for *question* without executing SQL."""
-        self._require_open("preview_plan")
-        _, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(space)
-        space_ctx = None
-        if space_tables or space_columns or space_deny_objects or space_deny_columns:
-            space_ctx = SpaceContext(
-                tables=space_tables,
-                columns=space_columns,
-                deny_objects=space_deny_objects,
-                deny_columns=space_deny_columns,
-            )
-        space_description_overlay: dict[str, Any] | None = None
-        norm = str(space).strip().lower()
-        if norm != MASTER_AETHERSPACE_NAME:
-            snap = load_aetherspace_snapshot(str(self._artifacts_dir), norm)
-            if isinstance(snap, dict):
-                table_descriptions = snap.get("table_descriptions")
-                column_meta = snap.get("column_meta")
-                if isinstance(table_descriptions, dict) or isinstance(column_meta, dict):
-                    space_description_overlay = {
-                        "table_descriptions": dict(table_descriptions or {}),
-                        "column_meta": dict(column_meta or {}),
-                    }
-        payload_visible = space_tables if space_tables else None
-        return preview_plan_on_federation(
-            self,
-            question,
-            space=space_ctx,
-            visible_objects=payload_visible,
-            execution_visible_objects=self._consumer_visible_objects,
-            space_columns=space_columns,
-            space_deny_objects=space_deny_objects,
-            space_deny_columns=space_deny_columns,
-            space_description_overlay=space_description_overlay,
-        )
-
     @_writer_lock_guard
-    def run_interactive(self, *, space: str = "master") -> None:
+    def run_interactive(self, *, space: str | None = None) -> None:
         self._ensure_llm()
-        _, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(space)
+        resolved_space = self._resolve_session_space(space)
+        _, space_tables, space_columns, space_deny_objects, space_deny_columns = self._resolve_aetherspace(
+            resolved_space
+        )
         space_description_overlay: dict[str, Any] | None = None
-        norm = str(space).strip().lower()
+        norm = str(resolved_space).strip().lower()
         if norm != MASTER_AETHERSPACE_NAME:
             snap = load_aetherspace_snapshot(str(self._artifacts_dir), norm)
             if isinstance(snap, dict):
@@ -2765,15 +3274,6 @@ class AetherFederation:
                         "table_descriptions": dict(table_descriptions or {}),
                         "column_meta": dict(column_meta or {}),
                     }
-        exec_ctx = getattr(self._runtime_config, "execution_context", None)
-        if exec_ctx is None:
-            exec_ctx = self._runtime_config.engine_context
-        validate_space_subset_of_execution_context(
-            space_tables,
-            space_columns,
-            exec_ctx,
-            self._schema_graph,
-        )
         payload_visible = space_tables if space_tables else None
         with diagnostic_print_listener(lambda m: print(m, file=sys.stdout, flush=True)):
             notify(
@@ -2892,6 +3392,7 @@ class AetherFederation:
         self._validate_num_questions(num_questions)
         with diagnostic_print_listener(lambda m: print(m, file=sys.stdout, flush=True)):
             owner_tok = push_qsim_engine_owner(self)
+            scope_tok = push_simulation_artifact_scope_from_owner(self)
             try:
                 qsim_run_once(
                     num_intents=num_intents,
@@ -2903,6 +3404,7 @@ class AetherFederation:
                     federation_mappings=self._federation_mappings,
                 )
             finally:
+                pop_simulation_artifact_partition(scope_tok)
                 pop_qsim_engine_owner(owner_tok)
 
     def get_questions_only(self, version: int) -> None:
@@ -2939,145 +3441,36 @@ class AetherFederation:
             )
         return QSimSummarySnapshot(lines=tuple(lines))
 
-    def show_config(self) -> ConfigSnapshot:
-        """Return a redacted snapshot of federation topology and LLM settings."""
-        return ConfigSnapshot(
-            text=describe_federation_config(
-                self._name,
-                self._runtime_config,
-                self._llm_config,
-                members=self._members,
-                federation_storage_dir=str(self._federation_storage_dir or self._artifacts_dir),
-            ),
-        )
-
-    def export_overrides(self, connection_name: str | None = None) -> Path:
-        """Member-scoped override export."""
-        return self._export_schema_overrides_impl(connection_name)
-
-    def export_schema_overrides(self, connection_name: str | None = None) -> Path:
-        """Deprecated alias for :meth:`export_overrides`."""
-        return self.export_overrides(connection_name)
-
-    def _export_schema_overrides_impl(self, connection_name: str | None = None) -> Path:
-        """Export schema overrides for the composite graph or one member engine."""
-        if connection_name is not None:
-            member = self._resolve_member(connection_name, "export_overrides")
-            return cast(Path, member.export_overrides())
-        self._require_owner("export_overrides")
-        target = self._artifacts_dir / SCHEMA_OVERRIDES_DEFAULT_FILENAME
-        return export_federation_composite_overrides(
-            self._schema_graph,
-            target,
-            business_knowledge=self.business_knowledge(),
-        )
+    def _resolve_learning_clear_space(self, space: str | None) -> str | None:
+        """Return None for all spaces, else a template-store partition key (``master`` or space uid)."""
+        if space is None:
+            return None
+        token = str(space).strip().lower()
+        if not token or token == "all":
+            return None
+        if token in (MASTER_AETHERSPACE_NAME, MASTER_AETHERSPACE_UID):
+            return MASTER_AETHERSPACE_NAME
+        desc = self._resolve_aetherspace(token)[0]
+        return str(desc.uid).strip().lower()
 
     @_writer_lock_guard
-    def apply_overrides(self, connection_name: str | None = None) -> None:
-        """Apply schema overrides to the composite graph or one member engine."""
-        self._apply_schema_overrides_impl(connection_name)
-
-    def apply_schema_overrides(self, connection_name: str | None = None) -> None:
-        """Deprecated alias for :meth:`apply_overrides`."""
-        self.apply_overrides(connection_name)
-
-    def _apply_schema_overrides_impl(self, connection_name: str | None = None) -> None:
-        """Apply schema overrides to the composite graph or one member engine."""
-        if connection_name is not None:
-            self._require_owner("apply_overrides")
-            member = self._resolve_member(connection_name, "apply_overrides")
-            member.apply_overrides()
-            self._recompose()
-            return
-        source = self._artifacts_dir / SCHEMA_OVERRIDES_DEFAULT_FILENAME
-        if not source.is_file():
-            raise ConfigError(f"schema overrides file not found: {source}")
-        self._require_owner("apply_overrides")
-        report = apply_federation_composite_overrides(
-            self._schema_graph,
-            self._composite_federation_dir(),
-            source,
-            dialect=self._dialect,
-        )
-        if report.business_knowledge_entries is not None:
-            self.set_business_knowledge(report.business_knowledge_entries)
-        if (
-            report.table_edits
-            or report.column_edits
-            or report.fks_added
-            or report.fks_removed
-            or report.pks_added
-            or report.pks_endorsed
-            or report.pks_blocked
-            or report.coerced_columns
-            or report.collapsed_inferences
-        ):
-            self._schema_stats = self._schema_graph.refresh_schema_stats()
-        _print_override_summary(report)
-        editor = self._artifacts_dir / SCHEMA_OVERRIDES_DEFAULT_FILENAME
-        companion = editor.with_name(editor.stem + ".schema.json")
-        ts = datetime.now(UTC).strftime(SCHEMA_OVERRIDES_APPLIED_TIMESTAMP_FORMAT)
-        stem = Path(SCHEMA_OVERRIDES_DEFAULT_FILENAME).stem
-        applied_main = editor.parent / f"{stem}{SCHEMA_OVERRIDES_APPLIED_SUFFIX}"
-        applied_schema = editor.parent / f"{stem}.applied.schema.json"
-
-        def _archive_and_rename(src: Path, dest: Path) -> None:
-            if not src.is_file():
-                return
-            if dest.is_file():
-                archive = dest.with_name(dest.stem + f".{ts}" + dest.suffix)
-                try:
-                    dest.rename(archive)
-                except OSError:
-                    pass
-            try:
-                src.rename(dest)
-            except OSError:
-                pass
-
-        _archive_and_rename(editor, applied_main)
-        _archive_and_rename(companion, applied_schema)
-        sh = getattr(self._schema_graph, "effective_structural_hash", None)
-        self._audit_emit(
-            "apply_schema_overrides",
-            schema_hash=str(sh) if sh is not None else None,
-            details=(
-                ("scope", "composite"),
-                ("table_edits", str(report.table_edits)),
-                ("column_edits", str(report.column_edits)),
-            ),
-        )
-
-    @_writer_lock_guard
-    def clear_persisted_overrides(self, connection_name: str) -> bool:
-        """Clear persisted overrides for one member engine, then recompose."""
-        self._require_owner("clear_persisted_overrides")
-        member = self._resolve_member(connection_name, "clear_persisted_overrides")
-        removed = member.clear_persisted_overrides()
-        self._recompose()
-        self._audit_emit(
-            "clear_persisted_overrides",
-            schema_hash=str(getattr(self._schema_graph, "effective_structural_hash", "") or None),
-            details=(("connection", connection_name), ("removed", str(removed))),
-        )
-        return cast(bool, removed)
-
-    @_writer_lock_guard
-    def clear_template_store(self) -> bool:
-        """Remove composite, plan-record, and member template stores, then recompose."""
+    def clear_template_store(self, *, space: str | None = None) -> bool:
+        """Owner-only: clear composite/member template learning then recompose. ``space=None``/``"all"`` clears every partition (and federation plan templates); otherwise one space partition."""
         self._require_owner("clear_template_store")
+        space_key = self._resolve_learning_clear_space(space)
         drain_write_queue(self, str(self._artifacts_dir))
         existed = clear_federation_template_stores(
             str(self._federation_storage_dir) if self._federation_storage_dir else None,
             str(self._artifacts_dir),
             self._schema_graph,
             self._members,
+            space=space_key,
         )
         self._recompose()
         self._audit_emit(
             "clear_template_store",
             schema_hash=str(getattr(self._schema_graph, "effective_structural_hash", "") or None),
-            details=(("existed", str(existed)),),
+            details=(("existed", str(existed)), ("space", space_key or "all")),
         )
         return existed
 
@@ -3099,29 +3492,38 @@ class AetherFederation:
         return count
 
     @_writer_lock_guard
-    def clear_all_learning(self, *, keep_overrides: bool = True) -> None:
-        """Remove templates, simulation caches, and optionally member overrides, then recompose."""
+    def clear_all_learning(self, *, keep_structure: bool = True, space: str | None = None) -> None:
+        """Owner-only: clear federation learning then recompose. With ``space`` set, only that template partition is cleared across composite/members. Without ``space`` (or ``space="all"``), clears all templates, simulation caches, and optionally member structural overrides."""
         self._require_owner("clear_all_learning")
+        space_key = self._resolve_learning_clear_space(space)
         drain_write_queue(self, str(self._artifacts_dir))
         clear_federation_template_stores(
             str(self._federation_storage_dir) if self._federation_storage_dir else None,
             str(self._artifacts_dir),
             self._schema_graph,
             self._members,
+            space=space_key,
         )
-        count = clear_simulation_caches_only(str(self._artifacts_dir))
-        for engine in self._members.values():
-            adir = getattr(engine, "_artifacts_dir", None)
-            if adir is not None:
-                count += clear_simulation_caches_only(str(adir))
-        if not keep_overrides:
-            for connection_name in self._members:
-                self._resolve_member(connection_name, "clear_all_learning").clear_persisted_overrides()
+        count = 0
+        if space_key is None:
+            count = clear_simulation_caches_only(str(self._artifacts_dir))
+            for engine in self._members.values():
+                adir = getattr(engine, "_artifacts_dir", None)
+                if adir is not None:
+                    count += clear_simulation_caches_only(str(adir))
+            if not keep_structure:
+                for connection_name in self._members:
+                    member = self._resolve_member(connection_name, "clear_all_learning")
+                    delete_persisted_structure_artifacts(str(member._artifacts_dir / "schema_graph.json.gz"))
         self._recompose()
         self._audit_emit(
             "clear_all_learning",
             schema_hash=str(getattr(self._schema_graph, "effective_structural_hash", "") or None) or None,
-            details=(("keep_overrides", str(keep_overrides)), ("removed_files", str(count))),
+            details=(
+                ("keep_structure", str(keep_structure)),
+                ("removed_files", str(count)),
+                ("space", space_key or "all"),
+            ),
         )
 
     @_writer_lock_guard(before_acquire=lambda self, op: self._require_no_active_session_turn(op))
@@ -3147,11 +3549,17 @@ class AetherFederation:
         diagnostics: list[Diagnostic] = []
         for report in member_reports:
             diagnostics.extend(report.diagnostics)
+        tables_added = tuple(sorted({table for report in member_reports for table in report.tables_added}))
+        tables_removed = tuple(sorted({table for report in member_reports for table in report.tables_removed}))
+        columns_added = tuple(sorted({pair for report in member_reports for pair in report.columns_added}))
+        columns_removed = tuple(sorted({pair for report in member_reports for pair in report.columns_removed}))
         return RefreshReport(
             migration_tier=migration_tier,
             schema_changed=any(report.schema_changed for report in member_reports),
-            objects_added=tuple(sorted({obj for report in member_reports for obj in report.objects_added})),
-            objects_removed=tuple(sorted({obj for report in member_reports for obj in report.objects_removed})),
+            tables_added=tables_added,
+            tables_removed=tables_removed,
+            columns_added=columns_added,
+            columns_removed=columns_removed,
             templates_invalidated=sum(report.templates_invalidated for report in member_reports),
             orphans_removed=sum(report.orphans_removed for report in member_reports),
             bytes_reclaimed=sum(report.bytes_reclaimed for report in member_reports),
@@ -3169,13 +3577,13 @@ class AetherFederation:
         if runtimes is not None:
             dispose_federation_source_runtimes(runtimes, member_engines=self._members)
             self._federation_source_runtimes = None
-        for connection_name in sorted(self._federation_owned_members):
-            member = self._members.get(connection_name)
-            if member is not None and not getattr(member, "_closed", False):
-                member.close()
         release_close_resources(self)
         drop_engine_skeleton_cache_owner(self)
         clear_expansion_subtree_pool(str(self._artifacts_dir))
+        sink_token = getattr(self, "_diagnostic_sink_token", None)
+        if sink_token is not None:
+            pop_diagnostic_sink(sink_token)
+            self._diagnostic_sink_token = cast(Any, None)
         self._closed = True
         self._audit_emit(
             "close",
@@ -3195,76 +3603,76 @@ class AetherFederation:
         return False
 
 
-def _print_override_summary(report: OverrideReport) -> None:
-    """Emit a fixed-template summary of an ``OverrideReport`` through the notify channel."""
-    notify("Schema overrides applied:", stage="overrides", code=DIAGNOSTIC_CODE_ENGINE_INFO)
+def _print_structure_summary(report: StructureReport) -> None:
+    """Emit a fixed-template summary of a ``StructureReport`` through the notify channel."""
+    notify("Schema overrides applied:", stage="structure", code=DIAGNOSTIC_CODE_ENGINE_INFO)
     notify(
         f"  Tables updated:           {report.table_edits}",
-        stage="overrides",
+        stage="structure",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     notify(
         f"  Columns updated:          {report.column_edits}",
-        stage="overrides",
+        stage="structure",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     notify(
         f"  FK edges added:           {report.fks_added}",
-        stage="overrides",
+        stage="structure",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     notify(
         f"  FK edges endorsed (user): {report.fks_endorsed}",
-        stage="overrides",
+        stage="structure",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     notify(
         f"  FK edges removed:         {report.fks_removed}",
-        stage="overrides",
+        stage="structure",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     notify(
         f"  PKs endorsed (user):     {report.pks_endorsed}",
-        stage="overrides",
+        stage="structure",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     notify(
         f"  Inferred PKs cleared:     {report.pks_blocked}",
-        stage="overrides",
+        stage="structure",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     notify(
         f"  PK/FK roles coerced:      {report.coerced_columns}",
-        stage="overrides",
+        stage="structure",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     notify(
         f"  Redundant inferences:     {report.collapsed_inferences}",
-        stage="overrides",
+        stage="structure",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     notify(
         f"  Descriptions refined:     {report.descriptions_refined}",
-        stage="overrides",
+        stage="structure",
         code=DIAGNOSTIC_CODE_ENGINE_INFO,
     )
     if report.skipped:
         notify(
             f"  Soft skips ({len(report.skipped)}):",
-            stage="overrides",
+            stage="structure",
             code=DIAGNOSTIC_CODE_ENGINE_INFO,
         )
         for skip in report.skipped:
             notify(
                 f"    {skip.path}  -  {skip.reason}",
-                stage="overrides",
+                stage="structure",
                 code=DIAGNOSTIC_CODE_ENGINE_INFO,
                 details=(("path", skip.path), ("reason", skip.reason)),
             )
     else:
         notify(
             "  Soft skips:               none",
-            stage="overrides",
+            stage="structure",
             code=DIAGNOSTIC_CODE_ENGINE_INFO,
         )
 
@@ -3285,7 +3693,7 @@ _PUBLIC_API = (
     ArtifactLockTimeoutError,
     AsyncPipelineSession,
     AuditEvent,
-    BusinessKnowledgeEntry,
+    DomainKnowledgeEntry,
     ClauseWidenedRowsetError,
     ComparisonJoinScopeExceededError,
     ConfigError,
@@ -3332,9 +3740,9 @@ _PUBLIC_API = (
     PhaseProgressEvent,
     PipelineSession,
     PipelineSuspended,
-    PlanPreviewResult,
     ProbeCtePlacementError,
     QSimSummarySnapshot,
+    RefinementRetry,
     RegistryRenderError,
     ResultCapExceededError,
     RetryableDatabaseExecutionError,
@@ -3346,13 +3754,14 @@ _PUBLIC_API = (
     SchemaStatsSnapshot,
     SeedWarmupSummarySnapshot,
     SessionActiveError,
+    SessionError,
+    SessionOutcome,
     SessionStep,
     SessionTurnCancelledError,
     SpaceContext,
     StatementTimeoutError,
     SubdayDateWindowOnDateColumnError,
     SuspendedSessionExpiredError,
-    TablePreviewResult,
     UploadIngestResult,
     __version__,
     inspect_tabular_upload,

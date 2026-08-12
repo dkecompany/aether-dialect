@@ -13,8 +13,10 @@ import pytest
 from aetherdialect import AetherFederation
 from aetherdialect._contracts_base import (
     ConfigError,
-    FederationMappings,
-    FederationPlanTemplate,
+    FederationConfigError,
+    FederationInvariantError,
+    FederationRuntimeError,
+    NormalizedExpr,
     OwnerOnlyOperationError,
     PredicateGroup,
     SpaceContext,
@@ -32,43 +34,51 @@ from aetherdialect._contracts_core import (
     SqlExecuteSuspendContext,
     SqlGenerationOutcome,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    FederationConfigError,
-    FederationInvariantError,
-    FederationRuntimeError,
-    _apply_coordinator_probe_joins,
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FederationMappings,
+    FederationPlanTemplate,
+    SchemaGraph,
+    TableMetadata,
+)
+from aetherdialect._federation_compose import (
+    assert_composite_invariants,
+    compose_composite_graph,
+    reconcile_composite_classifications,
+)
+from aetherdialect._federation_execute import (
     _assert_combine_join_plan_structure,
     _dataframe_memory_bytes,
-    _looks_aggregated,
-    _normalize_stored_member_hash_row,
     _qualified_ref_source_id,
-    _schema_column_duckdb_type,
-    assert_composite_invariants,
     clear_federated_turn_state,
-    compose_composite_graph,
     execute_federation_coordinator,
     federation_plan_combine_hash,
-    federation_plan_is_degenerate,
     federation_plan_matches_template,
-    federation_plan_sql_shape,
     federation_plan_step_fingerprints,
-    federation_table_set,
     mappings_replay_matches,
-    parse_federation_manifest,
-    parse_federation_mappings,
-    plan_federated_intent,
     prune_federation_mappings,
-    reconcile_composite_classifications,
-    render_federation_glue,
     revalidate_prepared_federation_plan,
 )
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_manifest import (
+    federation_plan_sql_shape,
+    normalize_stored_member_hash_row,
+    parse_federation_manifest,
+    parse_federation_mappings,
+)
+from aetherdialect._federation_plan import (
+    _apply_coordinator_probe_joins,
+    _looks_aggregated,
+    federation_plan_is_degenerate,
+    federation_table_set,
+    plan_federated_intent,
+    render_federation_glue,
+    schema_column_duckdb_type,
+)
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import execute_federated_prepare
+from aetherdialect._pipeline_execute import execute_federated_prepare
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import anti_join_presence_column
-from aetherdialect._utils import intent_key
+from aetherdialect._utils_intent import intent_key
 from tests.federation_helpers import union_member_graph_pair
 
 
@@ -125,7 +135,7 @@ _UNION_MANIFEST = {
 def _union_mappings() -> FederationMappings:
     return parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -198,7 +208,7 @@ def test_compose_sets_ddl_probe_hash_from_member_probes() -> None:
     )
     expected = hashlib.sha256(probe_blob.encode()).hexdigest()[:32]
     assert composite.ddl_probe_hash == expected
-    assert_composite_invariants(composite, members, manifest, FederationMappings(version="0.2.1"))
+    assert_composite_invariants(composite, members, manifest, FederationMappings(version="0.2.3"))
     assert composite.structural_hash
     assert composite.scope_hash
     assert composite.effective_structural_hash
@@ -251,7 +261,7 @@ def test_union_scalar_glue_aggregates_member_counts() -> None:
 
 @pytest.mark.fast
 def test_scalar_cross_source_plan_emits_coordinator_scalar_stage() -> None:
-    from aetherdialect._federation import plan_federated_stages
+    from aetherdialect._federation_plan import plan_federated_stages
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph(
@@ -284,7 +294,7 @@ def test_scalar_cross_source_plan_emits_coordinator_scalar_stage() -> None:
 
 @pytest.mark.fast
 def test_clear_federated_turn_state_clears_session_slots() -> None:
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._main_session import PipelineSession
 
     owner = MagicMock()
     session = PipelineSession(owner)
@@ -366,12 +376,15 @@ def test_federation_apply_migration_map_requires_owner() -> None:
     with patch("aetherdialect.aetherdialect.initialize_aether_federation"):
         fed = AetherFederation(
             "fed_gate",
-            members={"conn_a": MagicMock(), "conn_b": MagicMock()},
-            declaration_file="/tmp/aether_fed_gate_declaration.json",
+            members=[
+                MagicMock(_named_connection="conn_a", dialect="duckdb"),
+                MagicMock(_named_connection="conn_b", dialect="duckdb"),
+            ],
+            declaration="/tmp/aether_fed_gate_declaration.json",
         )
     fed._schema_role = "consumer"
     with pytest.raises(OwnerOnlyOperationError, match="apply_migration_map"):
-        fed.apply_migration_map(path="/tmp/federation_migration_map.json")
+        fed.apply_migration_map({"version": 1, "tables": []})
 
 
 @pytest.mark.fast
@@ -533,7 +546,7 @@ def test_execute_federated_prepare_degenerate_skips_coordinator() -> None:
     )
     dialect = MagicMock()
     dialect.finalize_render.return_value = "SELECT id FROM left_t"
-    with patch("aetherdialect._pipeline.execute_guarded_sql", return_value=[(1,), (2,)]) as exec_mock:
+    with patch("aetherdialect._pipeline_execute.execute_guarded_sql", return_value=[(1,), (2,)]) as exec_mock:
         outcome = execute_federated_prepare(
             prepared,
             composite,
@@ -593,14 +606,14 @@ def test_union_logical_table_plans_member_steps_and_union_specs() -> None:
 
 @pytest.mark.fast
 def test_mappings_replay_fingerprint_detects_member_drift() -> None:
-    from aetherdialect._federation import (
+    from aetherdialect._federation_execute import (
         check_federation_member_drift_at_turn_start,
         mappings_replay_matches,
         persist_federation_tree,
     )
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = {"a": _graph("left_t", source_id="a"), "b": _graph("right_t", source_id="b")}
     composite = compose_composite_graph(members, manifest, mappings)
     with tempfile.TemporaryDirectory() as tmp:
@@ -628,8 +641,8 @@ def test_mappings_replay_fingerprint_detects_member_drift() -> None:
 
 @pytest.mark.fast
 def test_federation_result_contract_kwargs_prefers_bundle_then_residual() -> None:
+    from aetherdialect._contracts_base import NormalizedExpr
     from aetherdialect._contracts_core import FederatedSqlBundle, ResidualSpec
-    from aetherdialect._intent_process import NormalizedExpr
     from aetherdialect._main_execution import MainExecutionOps
 
     plan = FederatedPlan(
@@ -654,14 +667,14 @@ def test_federation_result_contract_kwargs_prefers_bundle_then_residual() -> Non
         display_sql="-- display",
     )
     bundle = FederatedSqlBundle(statements=(), display_sql="-- display", column_names=("driver_id",))
-    kwargs = MainExecutionOps._federation_result_contract_kwargs(
+    kwargs = MainExecutionOps.federation_result_contract_kwargs(
         gen_out,
         federated_prepare=prep,
         federated_bundle=bundle,
     )
     assert kwargs["column_names"] == ("driver_id",)
     empty_bundle = FederatedSqlBundle(statements=(), display_sql="-- display", column_names=())
-    kwargs_residual = MainExecutionOps._federation_result_contract_kwargs(
+    kwargs_residual = MainExecutionOps.federation_result_contract_kwargs(
         gen_out,
         federated_prepare=prep,
         federated_bundle=empty_bundle,
@@ -672,7 +685,7 @@ def test_federation_result_contract_kwargs_prefers_bundle_then_residual() -> Non
 @pytest.mark.fast
 def test_completed_step_uses_federated_bundle_column_names() -> None:
     from aetherdialect._contracts_core import FederatedSqlBundle
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._main_session import PipelineSession
 
     owner = MagicMock()
     owner._schema_graph = None
@@ -697,7 +710,6 @@ def test_completed_step_uses_federated_bundle_column_names() -> None:
     assert step.data is not None
     assert list(step.data.columns) == ["customer_id"]
     assert step.sql is None
-    assert step.federated_bundle is bundle
     assert bundle.display_sql
     audit_calls = [call.args[0] for call in owner._audit_emit.call_args_list]
     assert "ask_done" in audit_calls
@@ -708,7 +720,7 @@ def test_completed_step_uses_federated_bundle_column_names() -> None:
 
 @pytest.mark.fast
 def test_flat_or_chain_across_sources_is_ineligible() -> None:
-    from aetherdialect._contracts_core import WhereParam
+    from aetherdialect._contracts_base import WhereParam
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph(
@@ -748,7 +760,7 @@ def test_flat_or_chain_across_sources_is_ineligible() -> None:
 
 @pytest.mark.fast
 def test_same_source_filter_group_disjunction_remains_eligible() -> None:
-    from aetherdialect._contracts_core import WhereParam
+    from aetherdialect._contracts_base import WhereParam
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph(
@@ -876,9 +888,9 @@ def test_parenthesized_non_aggregate_select_is_not_treated_as_aggregate() -> Non
 
 @pytest.mark.fast
 def test_interval_schema_type_does_not_map_to_integer() -> None:
-    assert _schema_column_duckdb_type("interval") == "INTERVAL"
-    assert _schema_column_duckdb_type("integer") == "INTEGER"
-    assert _schema_column_duckdb_type("int") == "INTEGER"
+    assert schema_column_duckdb_type("interval") == "INTERVAL"
+    assert schema_column_duckdb_type("integer") == "INTEGER"
+    assert schema_column_duckdb_type("int") == "INTEGER"
 
 
 @pytest.mark.fast
@@ -905,14 +917,14 @@ def test_dataframe_memory_measurement_failure_does_not_undercount() -> None:
         "a": pd.DataFrame({"id": [1, 2]}),
         "b": pd.DataFrame({"id": [2]}),
     }
-    with patch("aetherdialect._federation._dataframe_memory_bytes", side_effect=RuntimeError("cap probe")):
+    with patch("aetherdialect._federation_execute._dataframe_memory_bytes", side_effect=RuntimeError("cap probe")):
         with pytest.raises(RuntimeError, match="cap probe"):
             execute_federation_coordinator(frames, plan, row_cap=100, total_input_byte_cap=1)
 
 
 @pytest.mark.fast
 def test_reconcile_classification_failure_surfaces() -> None:
-    from aetherdialect._contracts_base import LogicalTableMapping, LogicalTableMember
+    from aetherdialect._contracts_schema import LogicalTableMapping, LogicalTableMember
 
     a_table = TableMetadata(
         name="payment",
@@ -950,7 +962,7 @@ def test_reconcile_classification_failure_surfaces() -> None:
         join_paths_multi=recompute_join_paths_multi({"payment": composite_table}),
     )
     mappings = FederationMappings(
-        version="0.2.1",
+        version="0.2.3",
         logical_tables=(
             LogicalTableMapping(
                 logical="payment",
@@ -983,7 +995,7 @@ def test_unresolvable_qualified_ref_does_not_yield_empty_source_id() -> None:
         _qualified_ref_source_id("missing_table.id", manifest)
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_columns": [
                 {
                     "logical": "shared_id",
@@ -1000,13 +1012,14 @@ def test_unresolvable_qualified_ref_does_not_yield_empty_source_id() -> None:
 @pytest.mark.fast
 def test_corrupt_member_hash_row_does_not_false_match() -> None:
     with pytest.raises(FederationConfigError, match="corrupt federation member hash row"):
-        _normalize_stored_member_hash_row(["only_one_field"])
+        normalize_stored_member_hash_row(["only_one_field"])
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     members = {"a": _graph("left_t", source_id="a"), "b": _graph("right_t", source_id="b")}
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     composite = compose_composite_graph(members, manifest)
     with tempfile.TemporaryDirectory() as tmp:
-        from aetherdialect._federation import federation_artifact_paths, persist_federation_tree
+        from aetherdialect._federation_execute import persist_federation_tree
+        from aetherdialect._federation_manifest import federation_artifact_paths
 
         persist_federation_tree(
             tmp,

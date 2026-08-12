@@ -101,29 +101,37 @@ def test_sandbox_data_reference_questions_are_individual_bullets() -> None:
 @pytest.mark.fast
 def test_sandbox_data_reference_publishes_bundled_note_fixtures() -> None:
     text = _reference_text()
-    for fixture_name in ("rental_shop_notes.txt", "sandbox_space_catalog_notes.txt"):
+    note_files = (
+        "rental_shop_notes.txt",
+        "federation_storefront_notes.txt",
+        "federation_catalog_notes.txt",
+        "federation_logistics_notes.txt",
+        "federation_crm_notes.txt",
+    )
+    for fixture_name in note_files:
         assert fixture_name in text
-    notes_path = _REPO / "scripts" / "data" / "rental_shop_notes.txt"
-    catalog_path = _REPO / "scripts" / "data" / "sandbox_space_catalog_notes.txt"
-    assert notes_path.read_text(encoding="utf-8").strip() in text
-    assert catalog_path.read_text(encoding="utf-8").strip() in text
+        path = _REPO / "scripts" / "data" / fixture_name
+        assert path.read_text(encoding="utf-8").strip() in text
 
 
 @pytest.mark.fast
-def test_sandbox_data_reference_publishes_demo_overrides_json() -> None:
+def test_sandbox_data_reference_publishes_demo_structure_json() -> None:
     text = _reference_text()
-    demo = (_REPO / "scripts" / "data" / "sandbox_overrides_demo.json").read_text(encoding="utf-8").strip()
-    assert "sandbox_overrides_demo.json" in text
-    assert demo in text
+    assert "schema_structure_demo.json" in text
 
 
 @pytest.mark.fast
-def test_sandbox_data_reference_consumer_scope_uses_example_allow_list() -> None:
+def test_sandbox_data_reference_publishes_four_member_allow_frozensets() -> None:
+    from aetherdialect._constants_runtime import SANDBOX_MEMBER_SPACE_TABLES
+
     text = _reference_text()
     consumer = text.split("## Consumer scopes", 1)[1].split("\n## ", 1)[0]
     assert 'role="consumer"' in consumer or "role='consumer'" in consumer
-    assert "example" in consumer.lower()
-    assert "customer" in consumer and "payment" in consumer and "rental" in consumer
+    assert "SANDBOX_MEMBER_SPACE_TABLES" in consumer
+    for member, tables in SANDBOX_MEMBER_SPACE_TABLES.items():
+        assert member in consumer
+        for table in sorted(tables):
+            assert table in consumer
     assert re.search(r"permission|schema", consumer, re.IGNORECASE)
 
 
@@ -133,3 +141,21 @@ def test_sandbox_data_reference_documents_spaces_without_required_notes() -> Non
     assert "SpaceContext" in text
     lowered = text.lower()
     assert "without notes" in lowered or "notes are optional" in lowered or "optional" in lowered
+
+
+@pytest.mark.fast
+def test_sandbox_data_reference_publishes_member_space_question_subsets() -> None:
+    from aetherdialect._constants_runtime import SANDBOX_MEMBER_SPACE_QUESTIONS
+
+    text = _reference_text()
+    assert "Member-space question subsets" in text
+    heading_by_space = {
+        "storefront": "#### Storefront member",
+        "catalog": "#### Catalog member",
+        "logistics": "#### Logistics member",
+        "crm": "#### CRM member",
+    }
+    for space_name, questions in SANDBOX_MEMBER_SPACE_QUESTIONS.items():
+        assert heading_by_space[space_name] in text
+        for question in questions:
+            assert f"- {question}" in text

@@ -18,12 +18,10 @@ from aetherdialect._contracts_core import (
     SourceStep,
 )
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    compose_composite_graph,
-    federation_member_execution_batches,
-    parse_federation_manifest,
-)
-from aetherdialect._pipeline import _execute_federation_steps_parallel
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import federation_member_execution_batches
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._pipeline_execute import _execute_federation_steps_parallel
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -185,19 +183,15 @@ def test_parallel_batch_applies_reduction_from_driving_member(monkeypatch: pytes
         return [(1,)]
 
     monkeypatch.setattr(
-        "aetherdialect._pipeline.generate_and_validate_sql",
+        "aetherdialect._pipeline_execute.generate_and_validate_sql",
         lambda *_a, **_k: type("Out", (), {"success": True, "sql": "SELECT a_id FROM tb"})(),
     )
-    monkeypatch.setattr("aetherdialect._pipeline.execute_guarded_sql", _fake_execute_guarded_sql)
-    monkeypatch.setattr("aetherdialect._pipeline.validate_federated_sub_intent", lambda *_a, **_k: None)
-    monkeypatch.setattr(
-        "aetherdialect._validation_execute.validate_sql",
-        lambda *a, **k: (True, None, None, None),
-    )
+    monkeypatch.setattr("aetherdialect._pipeline_execute.execute_guarded_sql", _fake_execute_guarded_sql)
+    monkeypatch.setattr("aetherdialect._pipeline_execute.validate_federated_sub_intent", lambda *_a, **_k: None)
     mock_dialect = MagicMock()
     mock_dialect.finalize_render.return_value = "SELECT 1"
     mock_dialect_streams = MagicMock(return_value=False)
-    monkeypatch.setattr("aetherdialect._pipeline.dialect_streams_arrow_to_coordinator", mock_dialect_streams)
+    monkeypatch.setattr("aetherdialect._pipeline_execute.dialect_streams_arrow_to_coordinator", mock_dialect_streams)
 
     execution_steps = (plan.steps[0], plan.steps[1])
 

@@ -4,12 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import (
-    MulGroup,
-    NormalizedExpr,
-    SubdayDateWindowOnDateColumnError,
-    WhereParam,
-)
+from aetherdialect._contracts_base import MulGroup, NormalizedExpr, WhereParam
+from aetherdialect._contracts_core import SubdayDateWindowOnDateColumnError
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import Dialect, DialectRegistry
 from aetherdialect._dialect_postgres import PostgresDialect

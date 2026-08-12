@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from aetherdialect._contracts_base import ClauseWidenedRowsetError, NormalizedExpr, OrderByCol
-from aetherdialect._contracts_core import RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import NormalizedExpr, OrderByCol
+from aetherdialect._contracts_core import ClauseWidenedRowsetError, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import SchemaGraph, WindowRegistryStep, WindowSpec
-from aetherdialect._validation_execute import validate_window_join_fan_out
-from aetherdialect._validation_schema import validate_clause_widened_rowset
+from aetherdialect._validation_rules import (
+    validate_clause_widened_rowset,
+    validate_window_join_fan_out,
+)
 from tests.test_join_fan_out import _join_signature, _parent_child_schema
 
 
@@ -26,7 +28,7 @@ def _parent_child_intent(**overrides) -> RuntimeIntent:
 
 
 def test_distinct_on_order_must_begin_with_partition_expressions(simple_schema: SchemaGraph) -> None:
-    from aetherdialect._validation_schema import validate_distinct_on_schema
+    from aetherdialect._validation_shape import validate_distinct_on_schema
 
     issues = validate_distinct_on_schema(
         [NormalizedExpr.from_column("customers.id")],
@@ -39,7 +41,7 @@ def test_distinct_on_order_must_begin_with_partition_expressions(simple_schema: 
 
 
 def test_distinct_on_matching_order_prefix_is_allowed(simple_schema: SchemaGraph) -> None:
-    from aetherdialect._validation_schema import validate_distinct_on_schema
+    from aetherdialect._validation_shape import validate_distinct_on_schema
 
     issues = validate_distinct_on_schema(
         [NormalizedExpr.from_column("customers.id")],
@@ -132,7 +134,7 @@ def test_grouped_parent_query_exempt_from_clause_widened_checks() -> None:
     assert not any(i.issue_id.startswith("clause_widened_rowset_") for i in issues)
 
 
-def test_grouped_count_star_still_warns_on_multiplied_join() -> None:
+def test_grouped_count_star_warns_on_multiplied_join() -> None:
     schema = _parent_child_schema()
     intent = _parent_child_intent(
         group_by_cols=[NormalizedExpr.from_column("parent.id")],
@@ -145,7 +147,7 @@ def test_grouped_count_star_still_warns_on_multiplied_join() -> None:
     assert any(i.severity == "warning" and i.issue_id.startswith("clause_widened_rowset_count_star_") for i in issues)
 
 
-def test_grouped_parent_sum_still_refuses_clause_widened_limit() -> None:
+def test_grouped_parent_sum_refuses_clause_widened_limit() -> None:
     schema = _parent_child_schema()
     intent = _parent_child_intent(
         limit=10,
@@ -157,11 +159,11 @@ def test_grouped_parent_sum_still_refuses_clause_widened_limit() -> None:
 
 
 def test_replay_refuses_clause_widened_limit() -> None:
-    from aetherdialect._pipeline import _validate_replay_join_semantics
+    from aetherdialect._validation_sql import validate_replay_join_semantics
 
     schema = _parent_child_schema()
     intent = _parent_child_intent(limit=10)
-    err = _validate_replay_join_semantics(intent, schema)
+    err = validate_replay_join_semantics(intent, schema)
     assert isinstance(err, ClauseWidenedRowsetError)
 
 

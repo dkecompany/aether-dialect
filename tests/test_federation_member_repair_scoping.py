@@ -7,8 +7,9 @@ import pytest
 from aetherdialect._contracts_base import NormalizedExpr, SqlDiagnostic, SqlDiagnosticCode
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import member_schema_slice, parse_federation_manifest
-from aetherdialect._intent_repair import apply_diagnostic_repairs, sanitize_table_names
+from aetherdialect._federation_compose import member_schema_slice
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._intent_normalize import apply_diagnostic_repairs, sanitize_table_names
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 

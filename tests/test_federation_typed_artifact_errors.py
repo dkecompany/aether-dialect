@@ -8,23 +8,26 @@ from pathlib import Path
 
 import pytest
 
-from aetherdialect._contracts_base import FederationConfigError, FederationMappings
-from aetherdialect._federation import (
-    compose_composite_graph,
-    federation_artifact_paths,
-    load_cached_federation_mapping_suggestions,
+from aetherdialect._contracts_base import FederationConfigError
+from aetherdialect._contracts_schema import FederationMappings
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import (
     load_federation_composite_graph,
     load_federation_plan_templates,
     mappings_replay_matches,
-    parse_federation_manifest,
     persist_federation_tree,
+)
+from aetherdialect._federation_manifest import (
+    federation_artifact_paths,
+    load_cached_federation_mapping_suggestions,
+    parse_federation_manifest,
 )
 from tests.test_federation_artifacts import _MANIFEST, _member_graphs
 
 
 def _persisted_tree(tmp: str) -> tuple[object, FederationMappings, dict]:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = _member_graphs()
     composite = compose_composite_graph(members, manifest, mappings)
     persist_federation_tree(
@@ -40,7 +43,7 @@ def _persisted_tree(tmp: str) -> tuple[object, FederationMappings, dict]:
 @pytest.mark.fast
 def test_corrupt_artifact_manifest_raises_instead_of_replay_miss() -> None:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = _member_graphs()
     with tempfile.TemporaryDirectory() as tmp:
         _persisted_tree(tmp)

@@ -5,12 +5,13 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP
-from aetherdialect._contracts_base import SessionStep
+from aetherdialect._contracts_base import Diagnostic
+from aetherdialect._contracts_core import SessionError, SessionOutcome, SessionStep
 
 
 @pytest.mark.fast
 def test_tautology_assertions_rejected() -> None:
-    from live_tests._federation_member_assertions import (
+    from live_tests.mydb_profile import (
         assert_delivery_rental_cross_source_linked_count,
         assert_median_payment_refused_for_mysql_family,
         assert_staff_email_from_storefront_authoritative,
@@ -35,8 +36,10 @@ def test_tautology_assertions_rejected() -> None:
         prompt=None,
         kind="result",
         sql="SELECT AVG(amount) FROM payment",
-        error="query failed",
-        refusal_diagnostic_code="SOME_OTHER_CODE",
+        error=SessionError(
+            code=SessionOutcome.EXECUTION_FAILED,
+            detail_code="SOME_OTHER_CODE",
+        ),
     )
     with pytest.raises(AssertionError):
         assert_median_payment_refused_for_mysql_family(wrong_median_code)
@@ -55,7 +58,17 @@ def test_tautology_assertions_rejected() -> None:
         done=True,
         prompt=None,
         kind="result",
-        error="median is not supported by all federation members",
-        refusal_diagnostic_code=DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP,
+        error=SessionError(
+            code=SessionOutcome.UNANSWERABLE,
+            detail_code=DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP,
+        ),
+        diagnostics=(
+            Diagnostic(
+                stage="execute",
+                level="error",
+                code=DIAGNOSTIC_CODE_REFUSAL_CAPABILITY_GAP,
+                message="median is not supported by all federation members",
+            ),
+        ),
     )
     assert_median_payment_refused_for_mysql_family(plausible_median_refusal)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from live_tests._rental_partition_metadata import apply_synthetic_rental_partition_metadata
+from live_tests.mydb_profile import apply_synthetic_rental_partition_metadata
 
 from aetherdialect._contracts_base import (
     NormalizedExpr,

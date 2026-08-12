@@ -36,7 +36,6 @@ from ._constants import (
     STRUCTURAL_CODE_TO_DIAG,
 )
 from ._contracts_base import (
-    AccessError,
     ArrayStorageKind,
     ConfigError,
     DatabaseConnectionError,
@@ -46,14 +45,13 @@ from ._contracts_base import (
     JoinEdge,
     NormalizedExpr,
     PredicateGroup,
-    ResultReaderKind,
     SqlDiagnostic,
     SqlDiagnosticCode,
     StatementTimeoutError,
     TableKind,
     WhereParam,
 )
-from ._contracts_core import RuntimeIntent
+from ._contracts_core import AccessError, ResultReaderKind, RuntimeIntent
 from ._contracts_schema import (
     CatalogStructuralConstraintsIndex,
     CatalogTableStructuralConstraints,
@@ -61,13 +59,24 @@ from ._contracts_schema import (
     FKEdge,
     SchemaGraph,
 )
-from ._core_utils import (
-    assert_dialect_usable_after_fork,
+from ._dialect import (
+    Dialect,
+)
+from ._schema_profile import (
+    array_element_type_from_data_type,
+    looks_like_json_array_values,
+    profile_schema,
+    profile_schema_spark,
+    profile_schema_sql_connector,
+)
+from ._utils import (
     build_case_folded_index,
     cost_cap_active,
     debug,
     diagnostic_debug_enabled,
     effective_explain_timeout_ms,
+    effective_profile_timeout_ms,
+    effective_statement_timeout_ms,
     engine_connect_likely_transient,
     normalize_array_contains_param_value,
     pipeline_trace,
@@ -79,16 +88,7 @@ from ._core_utils import (
     stable_json,
     wrap_database_execution_error,
 )
-from ._dialect import (
-    Dialect,
-)
-from ._schema_catalog import (
-    array_element_type_from_data_type,
-    looks_like_json_array_values,
-    profile_schema,
-    profile_schema_spark,
-    profile_schema_sql_connector,
-)
+from ._utils_artifacts import assert_dialect_usable_after_fork
 
 
 class _SqlglotParseHost(Protocol):
@@ -774,7 +774,7 @@ class SqlalchemyExecutionMixin:
             override = getattr(candidate, "profile_timeout_ms", None)
             if override is not None:
                 return int(override)
-        return PolicyConfig.PROFILE_TIMEOUT_MS
+        return effective_profile_timeout_ms()
 
     @staticmethod
     def native_connector_handle(dialect: Any) -> Any | None:
@@ -932,7 +932,7 @@ class SqlalchemyExecutionMixin:
     def parse_explain_plan(
         self, rows: list[Any], *, schema: SchemaGraph | None = None
     ) -> tuple[float | None, float | None, list[SqlDiagnostic], str]:
-        """Parse engine-specific EXPLAIN output rows into estimates and. soft diagnostics."""
+        """Parse engine-specific EXPLAIN output rows into estimates and soft diagnostics."""
         _ = rows, schema
         return None, None, [], ""
 
@@ -969,7 +969,11 @@ class SqlalchemyExecutionMixin:
                     )
             return True, soft_diags, plan_text
         except Exception as e:
-            err = str(e)
+            detail = getattr(e, "driver_detail", None)
+            if isinstance(detail, dict) and detail.get("message"):
+                err = str(detail["message"])
+            else:
+                err = str(e)
             if host._disable_explain_on_permission_denied(err):
                 return True, [], ""
             return (False, [SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_OTHER, message=err)], err)
@@ -984,7 +988,7 @@ class SqlalchemyExecutionMixin:
         backend = self.result_backend
         if backend is None:
             raise RuntimeError(f"{self.__class__.__name__} has no result backend")
-        tm = PolicyConfig.STATEMENT_TIMEOUT_MS if cost_cap_active(PolicyConfig.STATEMENT_TIMEOUT_MS) else None
+        tm = effective_statement_timeout_ms()
         return backend.fetch_rows(sql, params, timeout_ms=tm)
 
     def profile_schema(self, sg: SchemaGraph) -> None:
@@ -1034,7 +1038,7 @@ class SqlalchemyExecutionMixin:
     def refresh_full_table_distinct_for_pk_inference(
         self, table_name: str, col_name: str, *, table_kind: TableKind = TableKind.TABLE
     ) -> tuple[int, int, float] | None:
-        """Run full-table statistics for PK inference after sampled. profiling."""
+        """Run full-table statistics for PK inference after sampled profiling."""
         try:
             _ = table_kind
             host = cast(_SqlalchemyExecutionHost, self)
@@ -1116,7 +1120,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def bind_colon_parameters_for_duckdb(sql: str, parameters: dict[str, Any]) -> tuple[str, list[Any]]:
-        """Convert named ``:name`` placeholders to DuckDB positional ``?`` binds."""
+        """Convert pipeline ``:pN``/``$sN`` binds and general ``:name`` placeholders to DuckDB ``?`` binds. Applies pipeline bind tokens first, then reflection-style ``:name`` binds."""
         ordered: list[Any] = []
 
         def _replace(match: re.Match[str]) -> str:
@@ -1126,7 +1130,8 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
             ordered.append(parameters[key])
             return "?"
 
-        bound_sql = NAMED_PLACEHOLDER_RE.sub(_replace, sql)
+        bound_sql = SQL_BIND_TOKEN_RE.sub(_replace, sql)
+        bound_sql = NAMED_PLACEHOLDER_RE.sub(_replace, bound_sql)
         return bound_sql, ordered
 
     @staticmethod
@@ -1301,7 +1306,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def information_schema_normalize_row(row: dict[str, Any]) -> dict[str, Any]:
-        """Return *row* with lowercased string keys for stable Unity. Catalog. driver column naming."""
+        """Return *row* with lowercased string keys for stable Unity Catalog driver column naming."""
         return {str(k).lower(): v for k, v in row.items()}
 
     @staticmethod
@@ -1327,7 +1332,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def information_schema_key_column_lists(kcu_rows: list[dict[str, Any]]) -> dict[tuple[str, str], list[str]]:
-        """Group ``key_column_usage`` rows into ordered column-name lists. keyed by constraint identity."""
+        """Group ``key_column_usage`` rows into ordered column-name lists keyed by constraint identity."""
         buckets: dict[tuple[str, str], list[tuple[int, str]]] = {}
         for r in kcu_rows:
             cs = str(r.get("constraint_schema") or "")
@@ -1343,7 +1348,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def information_schema_trailing_relation_name(ref: str) -> str:
-        """Return the trailing SQL identifier segment from a possibly. qualified ``catalog.schema.table`` reference."""
+        """Return the trailing SQL identifier segment from a possibly qualified ``catalog.schema.table`` reference."""
         s = str(ref or "").strip()
         if not s:
             return ""
@@ -1373,7 +1378,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
     def structural_constraints_index_from_information_schema_rows(
         tc_rows: list[dict[str, Any]], kcu_rows: list[dict[str, Any]], rc_rows: list[dict[str, Any]]
     ) -> CatalogStructuralConstraintsIndex:
-        """Join normalized Unity ``information_schema`` constraint rows. into. a constraints index."""
+        """Join normalized Unity ``information_schema`` constraint rows into a constraints index."""
         tc_norm = [SqlglotEngineDialect.information_schema_normalize_row(dict(r)) for r in tc_rows]
         kcu_norm = [SqlglotEngineDialect.information_schema_normalize_row(dict(r)) for r in kcu_rows]
         rc_norm = [SqlglotEngineDialect.information_schema_normalize_row(dict(r)) for r in rc_rows]
@@ -1596,7 +1601,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def explain_diag_cartesian_join(message: str, *, node_kind: str | None = None) -> SqlDiagnostic:
-        """Build a cartesian-join soft diagnostic from an engine- specific. message."""
+        """Build a cartesian-join soft diagnostic from an engine- specific message."""
         return SqlDiagnostic(code=SqlDiagnosticCode.EXPLAIN_CARTESIAN_JOIN, message=message, node_kind=node_kind)
 
     @staticmethod
@@ -1618,7 +1623,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def pg_relation_indexed_columns(schema: SchemaGraph | None, relation_name: str) -> set[str]:
-        """Return indexed column names for *relation_name* from a schema. graph."""
+        """Return indexed column names for *relation_name* from a schema graph."""
         if schema is None:
             return set()
         table = schema.tables.get(relation_name) or schema.tables.get(relation_name.lower())
@@ -1640,7 +1645,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def mysql_relation_indexed_columns(schema: SchemaGraph | None, relation_name: str) -> set[str]:
-        """Return indexed column names for a MySQL relation from schema. graph metadata."""
+        """Return indexed column names for a MySQL relation from schema graph metadata."""
         indexed = SqlglotEngineDialect.pg_relation_indexed_columns(schema, relation_name)
         if schema is None:
             return indexed
@@ -1658,7 +1663,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def pg_walk_explain_plan(node: dict[str, Any], schema: SchemaGraph | None) -> list[SqlDiagnostic]:
-        """Recursively walk a PostgreSQL ``EXPLAIN (FORMAT JSON)`` plan. node. and emit soft diagnostics."""
+        """Recursively walk a PostgreSQL ``EXPLAIN (FORMAT JSON)`` plan node and emit soft diagnostics."""
         diags: list[SqlDiagnostic] = []
         node_type = str(node.get("Node Type", ""))
         if node_type in PG_JOIN_NODE_TYPES:
@@ -1696,7 +1701,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def pg_diagnostics_from_explain_json(raw: Any, schema: SchemaGraph | None) -> list[SqlDiagnostic]:
-        """Parse a PostgreSQL ``EXPLAIN (FORMAT JSON)`` row payload into. soft diagnostics."""
+        """Parse a PostgreSQL ``EXPLAIN (FORMAT JSON)`` row payload into soft diagnostics."""
         if isinstance(raw, str):
             try:
                 payload = json.loads(raw)
@@ -1716,7 +1721,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def pg_root_plan_estimates(plan: dict[str, Any]) -> tuple[float | None, float | None]:
-        """Return coarse ``(plan_rows, estimated_bytes)`` from a PostgreSQL. JSON plan root."""
+        """Return coarse ``(plan_rows, estimated_bytes)`` from a PostgreSQL JSON plan root."""
         rows_v = plan.get("Plan Rows")
         width_v = plan.get("Plan Width")
         pr = float(rows_v) if isinstance(rows_v, (int, float)) else None
@@ -1728,7 +1733,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def databricks_diagnostics_from_explain_text(text_payload: str) -> list[SqlDiagnostic]:
-        """Scan a Spark/Databricks ``EXPLAIN`` text payload for soft plan- shape findings."""
+        """Scan a Spark/Databricks ``EXPLAIN`` text payload for soft plan-shape findings."""
         if not text_payload:
             return []
         diags: list[SqlDiagnostic] = []
@@ -1740,7 +1745,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def databricks_plan_stats_from_explain_text(text_payload: str) -> tuple[float | None, float | None]:
-        """Extract coarse row and byte estimates from Spark/Databricks. ``EXPLAIN COST`` text."""
+        """Extract coarse row and byte estimates from Spark/Databricks ``EXPLAIN COST`` text."""
         if not text_payload:
             return None, None
         row_est: float | None = None
@@ -2055,7 +2060,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
     @staticmethod
     def snowflake_diagnostics_from_explain_json(raw: Any) -> list[SqlDiagnostic]:
-        """Parse Snowflake ``EXPLAIN USING JSON`` output for soft. diagnostics."""
+        """Parse Snowflake ``EXPLAIN USING JSON`` output for soft diagnostics."""
         if isinstance(raw, str):
             try:
                 payload = json.loads(raw)
@@ -2105,7 +2110,7 @@ class SqlglotEngineDialect(SqlglotParseMixin, SqlalchemyExecutionMixin, Dialect)
 
 @dataclass(frozen=True)
 class PartitionSqlAdapter:
-    """Dialect-specific SQL formatting hooks for partition predicate. injection."""
+    """Dialect-specific SQL formatting hooks for partition predicate injection."""
 
     quote_table_column: Callable[[str, str], str]
     format_literal: Callable[[Any], str]
@@ -2113,7 +2118,7 @@ class PartitionSqlAdapter:
 
     @staticmethod
     def get_column_ref(expr: NormalizedExpr) -> tuple[str | None, str | None]:
-        """Extract table and column names from a normalized expression. primary term."""
+        """Extract table and column names from a normalized expression primary term."""
         term = (expr.primary_term or "").strip()
         if not term:
             return None, None
@@ -2195,7 +2200,7 @@ class PartitionSqlAdapter:
 
     @staticmethod
     def contains_where_param_keys(intent: RuntimeIntent) -> set[str]:
-        """Collect ``param_key`` values from ``contains`` filters in main. and CTE intents."""
+        """Collect ``param_key`` values from ``contains`` filters in main and CTE intents."""
         keys: set[str] = set()
         for cte in intent.cte_steps or []:
             for fp in PredicateGroup.where_leaves(cte.where) or []:
@@ -2208,7 +2213,7 @@ class PartitionSqlAdapter:
 
     @staticmethod
     def flatten_param_values(intent: RuntimeIntent) -> dict[str, Any]:
-        """Merge CTE and main params and normalize values used by. ``contains`` filters."""
+        """Merge CTE and main params and normalize values used by ``contains`` filters."""
         merged: dict[str, Any] = {}
         for cte in intent.cte_steps or []:
             merged.update(cte.param_values or {})
@@ -2230,7 +2235,7 @@ class PartitionSqlAdapter:
         *,
         column_selector: Callable[[Any], list[str]] | None = None,
     ) -> list[str]:
-        """Build partition predicates from intent filters and schema. metadata."""
+        """Build partition predicates from intent filters and schema metadata."""
         tables = intent.tables or []
         filters = PredicateGroup.where_leaves(intent.where) or []
         if not tables or not filters:
@@ -2285,7 +2290,7 @@ class PartitionSqlAdapter:
 
     @staticmethod
     def predicate_already_in_sql(sql: str, predicates: list[str]) -> bool:
-        """Return True when every partition predicate already appears in. the. SQL text."""
+        """Return True when every partition predicate already appears in the SQL text."""
         sql_norm = PartitionSqlAdapter._canonical_bind_placeholders(sql).replace(" ", "").replace("\n", " ").lower()
         for pred in predicates:
             pred_norm = PartitionSqlAdapter._canonical_bind_placeholders(pred).replace(" ", "").lower()
@@ -2294,7 +2299,7 @@ class PartitionSqlAdapter:
         return True
 
     def append_where_via_ast(self, sql: str, predicate: str) -> str | None:
-        """Append *predicate* to the WHERE clause using a sqlglot AST round- trip."""
+        """Append *predicate* to the WHERE clause using a sqlglot AST round-trip."""
         try:
             tree = sqlglot.parse_one(sql, read=self.sqlglot_dialect)
         except Exception:
@@ -2308,7 +2313,7 @@ class PartitionSqlAdapter:
         return updated.sql(dialect=self.sqlglot_dialect)
 
     def append_to_where(self, sql: str, predicate: str) -> str:
-        """Append *predicate* to the SQL WHERE clause via sqlglot; raise on. failure."""
+        """Append *predicate* to the SQL WHERE clause via sqlglot; raise on failure."""
         out = self.append_where_via_ast(sql, predicate)
         if out is None:
             raise ValueError("AST refused to append WHERE predicate; SQL is unparseable")
@@ -2322,7 +2327,7 @@ class PartitionSqlAdapter:
         *,
         column_selector: Callable[[Any], list[str]] | None = None,
     ) -> str:
-        """Append missing partition predicates for pruning when absent from. *sql*."""
+        """Append missing partition predicates for pruning when absent from *sql*."""
         params = PartitionSqlAdapter.flatten_param_values(intent)
         predicates = self.build_predicates(schema, intent, params, column_selector=column_selector)
         if not predicates:
@@ -2466,7 +2471,7 @@ class ResultBackend(ABC):
         return None
 
     def fetch_first_column_text(self, sql: str, params: dict[str, Any] | None = None) -> str:
-        """Execute *sql* and join the first column of each row into. newline-separated text."""
+        """Execute *sql* and join the first column of each row into newline-separated text."""
         rows = self.fetch_rows(sql, params)
         return chr(10).join(str(r[0]) for r in rows if r and r[0] is not None)
 
@@ -2794,6 +2799,63 @@ class SqlServerResultBackend(SqlAlchemyResultBackend):
                 raise AccessError("execute", err, reason="warehouse") from e
             el = err.lower()
             if "timeout" in el and ("statement" in el or "cancel" in el or "deadline" in el):
+                raise StatementTimeoutError(err) from e
+            raise
+
+    def fetch_rows(
+        self, sql: str, params: dict[str, Any] | None = None, *, timeout_ms: int | None = None
+    ) -> list[tuple[Any, ...]]:
+        return super().fetch_rows(sql, params, timeout_ms=timeout_ms)
+
+
+class OracleResultBackend(SqlAlchemyResultBackend):
+    """Oracle backend applying statement timeouts via python-oracledb ``call_timeout``."""
+
+    def _fetch_rows_batched_impl(
+        self,
+        sql: str,
+        params: dict[str, Any] | None = None,
+        *,
+        batch_rows: int,
+        max_rows: int | None = None,
+        max_bytes: int | None = None,
+        timeout_ms: int | None = None,
+    ) -> Iterator[tuple[tuple[Any, ...], ...]]:
+        if diagnostic_debug_enabled():
+            debug(f"[{self._dialect_name}.execute] sql=" + chr(10) + f"{sql}")
+        del max_rows, max_bytes
+        try:
+            exec_params = reconcile_execute_bind_params(sql, params) or {}
+
+            def _stream(conn: Any) -> Iterator[tuple[tuple[Any, ...], ...]]:
+                if timeout_ms is not None and cost_cap_active(timeout_ms):
+                    raw = getattr(conn, "connection", None)
+                    target = raw if raw is not None else conn
+                    if target is not None and hasattr(target, "call_timeout"):
+                        target.call_timeout = int(timeout_ms)
+                result = conn.execute(text(sql), exec_params)
+                yield from ResultBackend.iter_fetchmany_batches(result.fetchmany, batch_rows)
+
+            with self._engine.connect() as conn:
+                with self._active_connection_lock:
+                    self._active_connection = conn
+                    self._capture_connection_identity(conn)
+                try:
+                    yield from _stream(conn)
+                finally:
+                    with self._active_connection_lock:
+                        if self._active_connection is conn:
+                            self._active_connection = None
+                            self._active_backend_pid = None
+                            self._active_session_id = None
+        except KeyError as e:
+            raise ValueError(f"unbound_placeholder: {e.args[0]}") from e
+        except Exception as e:
+            err = str(e)
+            if Dialect.is_permission_denied_error(err):
+                raise AccessError("execute", err, reason="warehouse") from e
+            el = err.lower()
+            if "timeout" in el and ("statement" in el or "cancel" in el or "deadline" in el or "timed out" in el):
                 raise StatementTimeoutError(err) from e
             raise
 

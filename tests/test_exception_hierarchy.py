@@ -10,10 +10,11 @@ from pathlib import Path
 import pytest
 
 import aetherdialect
-from aetherdialect import _contracts_base
+from aetherdialect import _contracts_base, _contracts_core
 
 _SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "aetherdialect"
 _CONTRACTS_PATH = _SRC_ROOT / "_contracts_base.py"
+_CONTRACTS_MODULES = (_contracts_base, _contracts_core)
 
 _ROOT_EXPORT_MARKERS = frozenset({"AetherError", "RetryableError"})
 _INDIRECT_RAISE_FACTORIES = {
@@ -24,14 +25,15 @@ _FACTORY_INSTANTIATED = frozenset({"RetryableFederationPartialFailureError"})
 
 def _library_exception_classes() -> list[type[BaseException]]:
     classes: list[type[BaseException]] = []
-    for name, obj in inspect.getmembers(_contracts_base, inspect.isclass):
-        if obj.__module__ != _contracts_base.__name__:
-            continue
-        if not issubclass(obj, BaseException):
-            continue
-        if name.startswith("_"):
-            continue
-        classes.append(obj)
+    for module in _CONTRACTS_MODULES:
+        for name, obj in inspect.getmembers(module, inspect.isclass):
+            if obj.__module__ != module.__name__:
+                continue
+            if not issubclass(obj, BaseException):
+                continue
+            if name.startswith("_"):
+                continue
+            classes.append(obj)
     return classes
 
 
@@ -99,8 +101,8 @@ def test_existing_handlers_still_catch() -> None:
     assert issubclass(_contracts_base.StatementTimeoutError, RuntimeError)
     assert issubclass(_contracts_base.ResultCapExceededError, RuntimeError)
     assert issubclass(_contracts_base.SchemaInvariantError, RuntimeError)
-    assert issubclass(_contracts_base.AccessError, _contracts_base.SchemaAccessError)
-    assert issubclass(_contracts_base.AccessError, RuntimeError)
+    assert issubclass(_contracts_core.AccessError, _contracts_base.SchemaAccessError)
+    assert issubclass(_contracts_core.AccessError, RuntimeError)
     assert issubclass(_contracts_base.DatabasePingFailed, _contracts_base.RetryableError)
     assert issubclass(_contracts_base.LlmTransientFailure, _contracts_base.RetryableError)
     assert issubclass(_contracts_base.StatementTimeoutError, _contracts_base.RetryableError)
@@ -114,7 +116,7 @@ def test_existing_handlers_still_catch() -> None:
     with pytest.raises(RuntimeError):
         raise _contracts_base.SessionActiveError("busy")
     with pytest.raises(_contracts_base.AetherError):
-        raise _contracts_base.NoJoinPathError("scope", ["a", "b"])
+        raise _contracts_core.NoJoinPathError("scope", ["a", "b"])
 
 
 def test_no_exception_shadows_a_builtin() -> None:

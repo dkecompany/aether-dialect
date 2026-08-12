@@ -12,7 +12,7 @@ from normalize_docstrings import (
 )
 
 
-def test_unwrap_summary_joins_bad_agent_wraps() -> None:
+def test_unwrap_summary_joins_wrapped_summary_lines() -> None:
     lines = [
         "Create WhereParam from",
         "dictionary.",

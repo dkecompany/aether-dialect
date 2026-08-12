@@ -1,4 +1,4 @@
-"""Template and reuse identity regression coverage."""
+"""Template and reuse identity keys, join fingerprints, and match rules."""
 
 from __future__ import annotations
 
@@ -7,13 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import (
-    FederationPlanTemplate,
-    HavingParam,
-    OrderByCol,
-    PredicateGroup,
-    WhereParam,
-)
+from aetherdialect._contracts_base import HavingParam, NormalizedExpr, OrderByCol, PredicateGroup, WhereParam
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     FederatedPlan,
@@ -24,28 +18,33 @@ from aetherdialect._contracts_core import (
     SelectCol,
     SqlGenerationOutcome,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._core_utils import colmap_signature, stable_json
-from aetherdialect._federation import (
-    federation_plan_residual_hash,
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FederationPlanTemplate,
+    FKEdge,
+    SchemaGraph,
+    SQLShape,
+    TableMetadata,
+    TemplateStats,
 )
-from aetherdialect._intent_process import (
-    NormalizedExpr,
+from aetherdialect._federation_execute import federation_plan_residual_hash
+from aetherdialect._intent_bind import join_path_key_concrete
+from aetherdialect._intent_loop import (
     collect_structural_match_templates,
-    join_path_key_concrete,
     list_union_match_candidates,
 )
-from aetherdialect._pipeline import (
+from aetherdialect._pipeline_execute import replay_federated_prepare_from_plan_template
+from aetherdialect._pipeline_generate import (
     _join_preset_scope_from_concrete,
     generate_and_validate_sql,
     match_question_level_template_reuse,
-    replay_federated_prepare_from_plan_template,
 )
-from aetherdialect._templates import TemplateOps, TemplateRefs
-from aetherdialect._utils import intent_key, template_instance_key_from_parts
+from aetherdialect._templates import TemplateRefs
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import colmap_signature, stable_json
+from aetherdialect._utils_intent import intent_key, template_instance_key_from_parts
 
 
 def _parent_child_schema(*, with_fk: bool = True) -> SchemaGraph:
@@ -230,13 +229,13 @@ def test_join_preset_scope_from_concrete_pins_main_and_cte() -> None:
     assert preset["cte:rollup"] == "J03"
 
 
-@patch("aetherdialect._pipeline.LLMProvider.chat", return_value='{"aliases":{}}')
-@patch("aetherdialect._templates.TemplateOps.save_template_store")
-@patch("aetherdialect._templates.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
-@patch("aetherdialect._pipeline.validate_sql", return_value=(True, None, None, []))
-@patch("aetherdialect._pipeline._resolve_joins_fresh", return_value=("SELECT 1", {}))
-@patch("aetherdialect._pipeline.build_deterministic_sql", return_value="SELECT 1")
-@patch("aetherdialect._pipeline.generate_join_candidates")
+@patch("aetherdialect._llm_provider.LLMProvider.chat", return_value='{"aliases":{}}')
+@patch("aetherdialect._templates_ops.TemplateOps.save_template_store")
+@patch("aetherdialect._templates_ops.TemplateOps.templates_to_store", side_effect=lambda s, t: s)
+@patch("aetherdialect._pipeline_generate.validate_sql", return_value=(True, None, None, []))
+@patch("aetherdialect._pipeline_generate._resolve_joins_fresh", return_value=("SELECT 1", {}))
+@patch("aetherdialect._sql_gen.build_deterministic_sql", return_value="SELECT 1")
+@patch("aetherdialect._pipeline_generate.generate_join_candidates")
 @pytest.mark.fast
 def test_path3_replay_passes_stored_join_preset(
     mock_generate_join_candidates,
@@ -405,7 +404,7 @@ def test_replay_federated_prepare_pins_member_schema_graph_ids() -> None:
     )
     dialect = MagicMock()
     gen_out = SqlGenerationOutcome(tmpl.sql_param, True, None, tmpl)
-    with patch("aetherdialect._pipeline.generate_and_validate_sql", return_value=gen_out):
+    with patch("aetherdialect._pipeline_execute.generate_and_validate_sql", return_value=gen_out):
         outcome = replay_federated_prepare_from_plan_template(
             plan,
             cached,
@@ -419,7 +418,7 @@ def test_replay_federated_prepare_pins_member_schema_graph_ids() -> None:
 
 @pytest.mark.fast
 def test_federation_plan_question_reuse_requires_template_match() -> None:
-    from aetherdialect._pipeline import _try_federation_plan_question_reuse
+    from aetherdialect._pipeline_execute import _try_federation_plan_question_reuse
 
     composite = replace(_parent_child_schema(with_fk=True), schema_graph_id="sg_composite")
     tmpl = _join_template()
@@ -433,11 +432,11 @@ def test_federation_plan_question_reuse_requires_template_match() -> None:
     )
     with (
         patch(
-            "aetherdialect._pipeline._resolve_federation_plan_template_for_reuse",
+            "aetherdialect._pipeline_execute._resolve_federation_plan_template_for_reuse",
             return_value=cached,
         ),
         patch(
-            "aetherdialect._pipeline.plan_federated_intent",
+            "aetherdialect._pipeline_execute.plan_federated_intent",
         ) as mock_plan,
     ):
         from aetherdialect._contracts_core import JoinSpec

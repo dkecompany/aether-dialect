@@ -10,8 +10,12 @@ import pytest
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent, SourceStep
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import parse_federation_manifest, plan_federated_intent, resolve_federated_combine
-from aetherdialect._pipeline import _federation_batch_member_join_presets
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import (
+    plan_federated_intent,
+    resolve_federated_combine,
+)
+from aetherdialect._pipeline_execute import _federation_batch_member_join_presets
 from aetherdialect._sql_gen import build_join_choice_prompt
 from tests.federation_helpers import build_two_member_federation
 
@@ -86,7 +90,7 @@ def test_cross_source_join_choice_scopes_and_candidates_are_neutral() -> None:
         captured["scopes"] = llm_scopes
         return {str(scope["scope"]): str(scope["candidates"][0]["candidate_id"]) for scope in llm_scopes}
 
-    with patch("aetherdialect._federation.get_join_choice_from_llm", side_effect=_fake_llm):
+    with patch("aetherdialect._federation_plan.get_join_choice_from_llm", side_effect=_fake_llm):
         resolve_federated_combine("count rows", plan, manifest, composite)
 
     scopes = captured["scopes"]
@@ -132,7 +136,7 @@ def test_cross_source_join_choice_prompt_user_payload_is_neutral() -> None:
         captured["user"] = user
         return {str(scope["scope"]): str(scope["candidates"][0]["candidate_id"]) for scope in llm_scopes}
 
-    with patch("aetherdialect._federation.get_join_choice_from_llm", side_effect=_fake_llm):
+    with patch("aetherdialect._federation_plan.get_join_choice_from_llm", side_effect=_fake_llm):
         resolve_federated_combine("count rows", plan, manifest, composite)
 
     payload = json.loads(str(captured["user"]))
@@ -177,7 +181,7 @@ def test_batch_member_join_choice_scopes_are_opaque() -> None:
 
     with (
         patch(
-            "aetherdialect._pipeline.join_scope_pass1_plan",
+            "aetherdialect._pipeline_execute.join_scope_pass1_plan",
             return_value=(
                 {},
                 [{"scope": "main", "candidates": [{"candidate_id": "J01"}, {"candidate_id": "J02"}]}],
@@ -185,7 +189,7 @@ def test_batch_member_join_choice_scopes_are_opaque() -> None:
                 {},
             ),
         ),
-        patch("aetherdialect._pipeline.get_join_choice_from_llm", side_effect=_fake_llm),
+        patch("aetherdialect._pipeline_execute.get_join_choice_from_llm", side_effect=_fake_llm),
     ):
         _federation_batch_member_join_presets(
             "count rows",

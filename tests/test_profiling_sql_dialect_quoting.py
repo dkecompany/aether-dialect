@@ -17,7 +17,7 @@ from aetherdialect._dialect_sqlglot_engines import (
     SQLiteDialect,
     SQLServerDialect,
 )
-from aetherdialect._schema_catalog import (
+from aetherdialect._schema_profile import (
     _build_profile_stats_sql,
     _build_value_overlap_sample_sql,
 )
@@ -120,7 +120,7 @@ def test_profile_composite_descriptive_uses_qualified_table_ref() -> None:
     from unittest.mock import MagicMock
 
     from aetherdialect._contracts_schema import ColumnMetadata, TableMetadata
-    from aetherdialect._schema_catalog import _profile_composite_descriptive
+    from aetherdialect._schema_profile import _profile_composite_descriptive
 
     captured: list[str] = []
     dialect = MagicMock()

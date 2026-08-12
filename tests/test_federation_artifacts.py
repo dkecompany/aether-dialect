@@ -8,24 +8,31 @@ from pathlib import Path
 
 import pytest
 
-from aetherdialect._contracts_base import FederationMappings, FederationPlanTemplate
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    FederationConfigError,
-    compose_composite_graph,
+from aetherdialect._contracts_base import FederationConfigError
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FederationMappings,
+    FederationPlanTemplate,
+    SchemaGraph,
+    TableMetadata,
+)
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import (
     compute_federation_storage_dir,
-    federation_artifact_paths,
-    federation_manifest_document,
     federation_plan_combine_hash,
-    hydrate_persisted_federation_manifest,
-    is_persisted_federation_manifest_sidecar,
     load_federation_composite_graph,
     load_federation_plan_templates,
     mappings_replay_matches,
-    parse_federation_manifest,
-    parse_federation_mappings,
     persist_federation_tree,
     save_federation_plan_template,
+)
+from aetherdialect._federation_manifest import (
+    federation_artifact_paths,
+    federation_manifest_document,
+    hydrate_persisted_federation_manifest,
+    is_persisted_federation_manifest_sidecar,
+    parse_federation_manifest,
+    parse_federation_mappings,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from tests.federation_helpers import enriched_manifest, stamp_union_disjointness_profiling
@@ -81,7 +88,7 @@ def test_persist_and_load_composite_graph() -> None:
         persist_federation_tree(
             tmp,
             manifest=manifest,
-            mappings=FederationMappings(version="0.2.1"),
+            mappings=FederationMappings(version="0.2.3"),
             composite=composite,
             member_graphs=members,
         )
@@ -115,7 +122,7 @@ def test_federation_manifest_document_include_derived() -> None:
 
 def test_mappings_replay_matches_after_persist() -> None:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = {"a": _graph("left_t"), "b": _graph("right_t")}
     composite = compose_composite_graph(members, manifest)
     with tempfile.TemporaryDirectory() as tmp:
@@ -148,7 +155,7 @@ def test_federation_plan_template_round_trip() -> None:
 
 def test_artifact_manifest_records_member_tuple() -> None:
     manifest = _full_manifest()
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = _member_graphs()
     composite = compose_composite_graph(members, manifest)
     with tempfile.TemporaryDirectory() as tmp:
@@ -174,7 +181,7 @@ def test_artifact_manifest_records_member_tuple() -> None:
 @pytest.mark.fast
 def test_load_composite_graph_validates_ddl_probe_and_schema_revision() -> None:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = _member_graphs()
     composite = compose_composite_graph(members, manifest, mappings)
     with tempfile.TemporaryDirectory() as tmp:
@@ -252,7 +259,7 @@ def test_compose_allows_logical_tables_collision_resolution() -> None:
     stamp_union_disjointness_profiling(members["b"].tables["payment"], overlap_sample=("3", "4"))
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -342,7 +349,7 @@ def test_federation_artifact_previous_version_is_mismatch_not_missing() -> None:
     from aetherdialect._constants import FEDERATION_ARTIFACT_FORMAT_VERSION
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     members = {"a": _graph("left_t", "a"), "b": _graph("right_t", "b")}
     with tempfile.TemporaryDirectory() as tmp:
         assert mappings_replay_matches(tmp, members, manifest, mappings) is False

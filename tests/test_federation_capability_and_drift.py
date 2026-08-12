@@ -6,20 +6,22 @@ import pytest
 
 from aetherdialect._contracts_base import (
     FederationConfigError,
+    NormalizedExpr,
     PredicateGroup,
     WhereParam,
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._federation_compose import (
     compose_composite_graph,
+    rescore_declared_mapping_drift,
+)
+from aetherdialect._federation_manifest import (
     intersect_member_dialect_capabilities,
     parse_federation_manifest,
     parse_federation_mappings,
-    plan_federated_intent,
-    rescore_declared_mapping_drift,
 )
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -111,7 +113,7 @@ def test_plan_federated_intent_allows_ilike_with_mixed_member_capabilities() -> 
 def test_federation_member_lacking_ilike_semantics_names_blocked_member() -> None:
     from unittest.mock import MagicMock
 
-    from aetherdialect._federation import _federation_member_lacking_ilike_semantics
+    from aetherdialect._federation_manifest import _federation_member_lacking_ilike_semantics
 
     manifest = parse_federation_manifest(
         {
@@ -140,7 +142,7 @@ def test_federation_member_lacking_ilike_semantics_names_blocked_member() -> Non
 
 @pytest.mark.fast
 def test_federation_refuses_ilike_when_member_lacks_native_and_wrap(monkeypatch: pytest.MonkeyPatch) -> None:
-    from aetherdialect._federation import _federation_unsupported_operator_reason
+    from aetherdialect._federation_manifest import federation_unsupported_operator_reason
 
     manifest = parse_federation_manifest(
         {
@@ -176,7 +178,7 @@ def test_federation_refuses_ilike_when_member_lacks_native_and_wrap(monkeypatch:
             ]
         ),
     )
-    reason = _federation_unsupported_operator_reason(intent, manifest)
+    reason = federation_unsupported_operator_reason(intent, manifest)
     assert reason is not None
     assert "'b'" in reason or "bigquery" in reason
     assert "ilike" in reason
@@ -184,7 +186,7 @@ def test_federation_refuses_ilike_when_member_lacks_native_and_wrap(monkeypatch:
 
 @pytest.mark.fast
 def test_ilike_renders_native_on_postgresql_and_wrap_on_bigquery() -> None:
-    from aetherdialect._contracts_core import WhereParam
+    from aetherdialect._contracts_base import WhereParam
     from aetherdialect._dialect import DialectRegistry
     from aetherdialect._sql_gen import _render_predicate_clause
 
@@ -239,7 +241,7 @@ def test_rescore_declared_mapping_drift_reports_value_overlap_collapse() -> None
     }
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_columns": [
                 {
                     "logical": "entity_id",
@@ -284,7 +286,7 @@ def test_compose_invokes_declared_mapping_drift_rescoring() -> None:
         "b": _graph("tb", source_id="b"),
     }
     with patch(
-        "aetherdialect._federation.rescore_declared_mapping_drift",
+        "aetherdialect._federation_compose.rescore_declared_mapping_drift",
         return_value=("declared drift signal",),
     ) as mock_rescore:
         with pytest.raises(FederationConfigError, match="declared mapping drift"):

@@ -8,9 +8,8 @@ from pathlib import Path
 import pytest
 
 from aetherdialect._constants import FEDERATION_DECLARATION_VERSION, FEDERATION_MAPPINGS_VERSION
-from aetherdialect._federation import (
-    FederationConfigError,
-    FederationDeclarationError,
+from aetherdialect._contracts_base import FederationConfigError, FederationDeclarationError
+from aetherdialect._federation_manifest import (
     load_federation_declaration_from_path,
     parse_federation_declaration,
 )

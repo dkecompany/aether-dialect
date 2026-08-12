@@ -11,19 +11,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import aetherdialect
-from aetherdialect import AetherEngine, AsyncPipelineSession
-from aetherdialect._config import EngineConfig
-from aetherdialect._contracts_base import (
-    AuditEvent,
-    ConfigError,
-    EngineContext,
-    LLMConfig,
-    RuntimeConfig,
-    SessionActiveError,
-    SessionStep,
-)
-from aetherdialect._core_utils import load_runtime_config
-from aetherdialect._templates import TemplateOps
+from aetherdialect import AetherEngine, AsyncPipelineSession, PipelineSession, Sandbox
+from aetherdialect._config import EngineConfig, EngineLimits
+from aetherdialect._contracts_base import ConfigError, EngineContext, SessionActiveError
+from aetherdialect._contracts_core import AuditEvent, LLMConfig, RuntimeConfig, SessionStep
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import load_runtime_config
 
 _API_REFERENCE = Path(__file__).resolve().parents[1] / "docs" / "API_REFERENCE.md"
 
@@ -53,18 +46,6 @@ def _parse_aether_engine_method_names(md: str) -> set[str]:
     return names
 
 
-def _parse_offline_sandbox_param_names(md: str) -> set[str]:
-    section = md.split("### `AetherEngine.offline_sandbox` quick path", 1)[1]
-    table = section.split("| `SandboxHandle` member", 1)[0]
-    names: set[str] = set()
-    for line in table.splitlines():
-        if not line.startswith("| `"):
-            continue
-        cell = line.split("|", 2)[1]
-        names.update(re.findall(r"`([^`]+)`", cell))
-    return names
-
-
 def _minimal_engine(**overrides: object) -> AetherEngine:
     """Construct a ``AetherEngine`` shell without running ``initialize_aether_engine``."""
     llm_exec = load_runtime_config(merged_env=dict(os.environ))
@@ -90,10 +71,11 @@ def _minimal_engine(**overrides: object) -> AetherEngine:
         _schema_role="owner",
         _consumer_visible_objects=None,
         _schema_stats={"table_count": 3, "total_filterable": 10},
-        _construction_phase_callback=None,
-        _ask_phase_callback=None,
-        _token_provider=None,
-        _tenant_slug=None,
+        _phase_callback=None,
+        _diagnostic_sink=None,
+        _diagnostic_sink_token=None,
+        _limits=EngineLimits(),
+        _limits_explicit=False,
     )
     defaults.update(overrides)
     obj = AetherEngine.__new__(AetherEngine)
@@ -147,8 +129,8 @@ def test_package_all_matches_documented_exports() -> None:
     assert set(aetherdialect.__all__) == allowed
     assert hasattr(aetherdialect, "FederationMemberExecutionError")
     assert hasattr(aetherdialect, "FederationCapExceededError")
-    assert callable(getattr(aetherdialect.PipelineSession, "cancel_active_federation_turn", None))
-    assert callable(getattr(aetherdialect.AsyncPipelineSession, "cancel_active_federation_turn", None))
+    assert callable(PipelineSession.cancel)
+    assert callable(AsyncPipelineSession.cancel)
 
 
 def test_package_exports_match_api_reference_symbols() -> None:
@@ -168,17 +150,15 @@ def test_aether_engine_documented_methods_exist() -> None:
     assert missing == [], f"API_REFERENCE documents missing AetherEngine methods: {missing}"
 
 
-def test_offline_sandbox_documented_params_exist() -> None:
-    """offline_sandbox parameter table matches the classmethod signature."""
-    documented = _parse_offline_sandbox_param_names(_api_reference_text())
-    actual = set(inspect.signature(AetherEngine.offline_sandbox).parameters)
-    bogus = sorted(documented - actual)
-    undocumented = sorted(actual - documented)
-    assert bogus == [], f"API_REFERENCE documents bogus offline_sandbox params: {bogus}"
-    assert undocumented == [], f"offline_sandbox params missing from API_REFERENCE: {undocumented}"
+def test_sandbox_create_offline_sandbox_exists() -> None:
+    """Maintainer offline handle entry remains available on Sandbox."""
+    assert callable(Sandbox.create_offline_sandbox)
+    params = set(inspect.signature(Sandbox.create_offline_sandbox).parameters)
+    assert "engine_cls" in params
+    assert "maintainer_access" in params
 
 
-def test_renamed_public_symbols_exported() -> None:
+def test_public_engine_and_context_symbols_exported() -> None:
     """Public engine and context symbols are exported."""
     assert hasattr(aetherdialect, "AetherEngine")
     assert hasattr(aetherdialect, "AetherFederation")
@@ -186,9 +166,15 @@ def test_renamed_public_symbols_exported() -> None:
     assert hasattr(aetherdialect, "Sandbox")
     assert hasattr(aetherdialect, "SpaceContext")
     assert hasattr(aetherdialect, "AetherSpace")
-    assert hasattr(AetherEngine, "sandbox_doctor")
-    assert hasattr(AetherEngine, "assert_sandbox_complete")
-    assert hasattr(AetherEngine, "sandbox_questions")
+    assert hasattr(Sandbox, "sandbox_doctor")
+    assert hasattr(Sandbox, "assert_sandbox_complete")
+    assert not hasattr(AetherEngine, "offline_sandbox")
+    assert not hasattr(AetherEngine, "sandbox_questions")
+    assert not hasattr(AetherEngine, "sandbox_member_space_questions")
+    assert not hasattr(AetherEngine, "sandbox_catalog")
+    assert not hasattr(AetherEngine, "sandbox_paraphrase_pairs")
+    assert not hasattr(AetherEngine, "sandbox_validation_failure_demo")
+    assert not hasattr(AetherEngine, "sandbox_feedback_demo")
 
 
 def test_select_engine_rejects_unknown_aether_key() -> None:
@@ -216,7 +202,7 @@ def test_configure_llm_rejects_unknown_provider_key() -> None:
 
 def test_audit_sink_invoked_on_init(tmp_path: Path) -> None:
     """``audit_sink`` receives an ``AuditEvent`` when construction succeeds."""
-    from aetherdialect._contracts_base import AetherEngineInitResult
+    from aetherdialect._contracts_core import AetherEngineInitResult
 
     events: list[AuditEvent] = []
 
@@ -261,19 +247,17 @@ def test_session_step_dataclass_shape() -> None:
         kind="ok",
         sql=None,
         data=None,
-        message=None,
+        answer=None,
         error=None,
         diagnostics=(),
         intent_summary=None,
-        status=None,
         reply_shape=None,
         semantic_warnings=(),
-        notices=(),
         data_truncated=False,
     )
     assert st.done is True
-    assert st.notices == ()
     assert st.data_truncated is False
+    assert st.error is None
 
 
 def test_async_session_wraps_pipeline_session() -> None:
@@ -296,7 +280,7 @@ def test_clear_template_store_triggers_reinit() -> None:
         patch("aetherdialect.aetherdialect.clear_template_store_only", return_value=True) as clr,
         patch("aetherdialect.aetherdialect.initialize_aether_engine") as init,
     ):
-        from aetherdialect._contracts_base import AetherEngineInitResult
+        from aetherdialect._contracts_core import AetherEngineInitResult
 
         init.return_value = AetherEngineInitResult(
             runtime_config=engine._runtime_config,

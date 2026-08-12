@@ -5,21 +5,17 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_COMPARISON_JOIN_DETOUR
-from aetherdialect._contracts_base import (
-    ComparisonJoinScopeExceededError,
-    PredicateGroup,
-    WhereParam,
-)
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import NormalizedExpr, PredicateGroup, WhereParam
+from aetherdialect._contracts_core import ComparisonJoinScopeExceededError, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._intent_normalize import reconcile_tables
+from aetherdialect._schema_graph import recompute_join_paths_multi
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._intent_repair import reconcile_tables
-from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._validation_schema import (
+from aetherdialect._validation_shape import (
     validate_comparison_join_scope,
     validate_comparison_join_scope_or_raise,
 )

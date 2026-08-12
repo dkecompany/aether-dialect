@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import DatabaseFeatureCapability
+from aetherdialect._contracts_base import DatabaseFeatureCapability, NormalizedExpr
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import column_metadata_requires_exact_comparison
-from aetherdialect._federation import _federation_ir_capability_reason
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._intent_repair import _coerce_element
-from aetherdialect._schema_build import tables_meta_to_schema_graph
+from aetherdialect._federation_manifest import federation_ir_capability_reason
+from aetherdialect._intent_normalize import coerce_element
+from aetherdialect._schema_reflect import tables_meta_to_schema_graph
+from aetherdialect._utils import column_metadata_requires_exact_comparison
 
 
 @pytest.mark.fast
@@ -81,7 +80,7 @@ def test_unsigned_flag_reflected_and_used() -> None:
     )
     assert column_metadata_requires_exact_comparison(near_max) is True
 
-    coerced = _coerce_element("18446744073709551615", "bigint unsigned", col_meta=near_max)
+    coerced = coerce_element("18446744073709551615", "bigint unsigned", col_meta=near_max)
     assert isinstance(coerced, int)
     assert coerced == 18446744073709551615
 
@@ -127,6 +126,6 @@ def test_unsigned_flag_reflected_and_used() -> None:
         array_columns_by_table={},
         supports_unsigned_semantics=False,
     )
-    reason = _federation_ir_capability_reason(intent, cap, schema=schema)
+    reason = federation_ir_capability_reason(intent, cap, schema=schema)
     assert reason is not None
     assert "unsigned" in reason.lower()

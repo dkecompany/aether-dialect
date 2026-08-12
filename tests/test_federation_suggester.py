@@ -6,14 +6,14 @@ import pytest
 
 from aetherdialect._config import PolicyConfig
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._federation_manifest import (
     _cross_source_column_suggestion_score,
     _mapping_suggestion_cutoff,
     parse_federation_manifest,
     parse_federation_mappings,
-    resolve_source_column_table,
     suggest_cross_source_mappings,
 )
+from aetherdialect._federation_plan import resolve_source_column_table
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -223,7 +223,7 @@ def test_build_federation_source_runtimes_binds_per_source_dialects() -> None:
     from unittest.mock import MagicMock
 
     from aetherdialect._dialect import DialectRegistry
-    from aetherdialect._federation import build_federation_manifest_from_members
+    from aetherdialect._federation_manifest import build_federation_manifest_from_members
     from aetherdialect._main_execution import MainExecutionOps
     from tests.conftest import duckdb_engine_identity
 

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._templates import BrokenRenameChainError, TemplateOps
+from aetherdialect._templates import BrokenRenameChainError
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _entry(

@@ -1,4 +1,4 @@
-"""Seeded tests for question-level feedback (validation + intent rejections). Each group seeds the artifact it owns and asserts only the observable output of that subsystem: persisted rows under ``question_feedback``, prompt collection via :func:`aetherdialect._templates.TemplateOps.collect_question_feedback_for_prompt`, and penalty mapping via :func:`aetherdialect._templates.TemplateOps.compute_question_feedback_penalty`."""
+"""Seeded tests for question-level feedback (validation + intent rejections). Each group seeds the artifact it owns and asserts only the observable output of that subsystem: persisted rows under ``question_feedback``, prompt collection via :func:`aetherdialect._templates_ops.TemplateOps.collect_question_feedback_for_prompt`, and penalty mapping via :func:`aetherdialect._templates_ops.TemplateOps.compute_question_feedback_penalty`."""
 
 from __future__ import annotations
 
@@ -9,11 +9,9 @@ import pytest
 from aetherdialect._config import PolicyConfig
 from aetherdialect._contracts_core import FeedbackKind, Template
 from aetherdialect._contracts_schema import TemplateStats
-from aetherdialect._templates import (
-    TemplateOps,
-)
+from aetherdialect._templates_ops import TemplateOps
 
-from ._seed_helpers import (
+from .live_support import (
     intent_customer_first_names,
     intent_rental_count_by_store,
     isolated_runner,
@@ -165,7 +163,7 @@ def test_negative_memory_penalty_caps_at_policy_limit(schema, schema_terms, t2s)
 @pytest.mark.needs_corpus
 @pytest.mark.live
 def test_intent_parse_collect_call_shape_uses_effective_hash(schema, schema_terms, t2s) -> None:
-    """Deferred live: ask-path feedback collection must scope to effective_structural_hash."""
+    """Ask-path feedback collection must scope to effective_structural_hash."""
     intent = intent_customer_first_names()
     with isolated_runner(schema, schema_terms, t2s, label="nm_call_shape") as runner:
         seed_negative_memory(

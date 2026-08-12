@@ -5,8 +5,8 @@ from __future__ import annotations
 import pandas as pd
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_FEDERATION_REDUCTION_NULL_KEYS
-from aetherdialect._core_utils import reset_diagnostic_collector, set_diagnostic_collector
-from aetherdialect._federation import distinct_semijoin_keys
+from aetherdialect._federation_execute import distinct_semijoin_keys
+from aetherdialect._utils import reset_diagnostic_collector, set_diagnostic_collector
 
 
 def test_null_keys_reported_when_dropped() -> None:

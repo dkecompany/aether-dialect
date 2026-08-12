@@ -9,7 +9,6 @@ import pytest
 
 from aetherdialect._contracts_base import EngineIdentity
 from aetherdialect._contracts_schema import ColumnMetadata
-from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
 from aetherdialect._dialect import Dialect, DialectRegistry
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import (
@@ -18,12 +17,14 @@ from aetherdialect._dialect_sqlglot_engines import (
     DuckDBDialect,
     MariaDBDialect,
     MySQLDialect,
+    OracleDialect,
     RedshiftDialect,
     SnowflakeDialect,
     SQLiteDialect,
     SQLServerDialect,
 )
 from aetherdialect._dialect_sqlglot_helper import SqlglotParseMixin
+from aetherdialect._utils import pop_engine_identity, push_engine_identity
 
 array_storage_kind = SqlglotParseMixin.array_storage_kind
 ast_structural_valid_sqlglot = SqlglotParseMixin.ast_structural_valid_sqlglot
@@ -889,6 +890,10 @@ def _sqlserver_uninit() -> SQLServerDialect:
     return SQLServerDialect.__new__(SQLServerDialect)
 
 
+def _oracle_uninit() -> OracleDialect:
+    return OracleDialect.__new__(OracleDialect)
+
+
 def _snowflake_uninit() -> SnowflakeDialect:
     return SnowflakeDialect.__new__(SnowflakeDialect)
 
@@ -937,9 +942,9 @@ class TestDuckDBDialect:
         duckdb = pytest.importorskip("duckdb")
         from aetherdialect._config import DuckDBRuntimeConfig, EngineConfig
         from aetherdialect._contracts_base import EngineIdentity
-        from aetherdialect._core_utils import pop_engine_identity, push_engine_identity
         from aetherdialect._dialect import DialectRegistry
         from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
+        from aetherdialect._utils import pop_engine_identity, push_engine_identity
 
         orig_path = EngineConfig.SCHEMA_JSON_PATH
         orig_type = EngineConfig.TYPE
@@ -1080,6 +1085,27 @@ class TestSQLServerDialect:
         d = _sqlserver_uninit()
         assert "GETDATE()" in d.date_window_upper_bound_sql("hour")
         assert "DATE" in d.date_window_upper_bound_sql("day")
+
+
+class TestOracleDialect:
+    """Basic render and quote tests for Oracle dialect."""
+
+    def test_quote_table_column_double_quotes(self) -> None:
+        d = _oracle_uninit()
+        assert d.quote_table_column("orders", "order") == '"ORDERS"."ORDER"'
+
+    def test_parse_select_emits_oracle(self) -> None:
+        parsed = _oracle_uninit().parse_select("SELECT 1 AS x FROM rental_shop.t")
+        assert parsed is not None
+        assert "SELECT" in _oracle_uninit().emit_sql(parsed).upper()
+
+    def test_render_case_insensitive_wrap(self) -> None:
+        assert _oracle_uninit().render_case_insensitive_wrap("col") == "LOWER(col)"
+
+    def test_date_window_upper_bound_sql(self) -> None:
+        d = _oracle_uninit()
+        assert d.date_window_upper_bound_sql("hour") == "SYSTIMESTAMP"
+        assert d.date_window_upper_bound_sql("day") == "TRUNC(SYSDATE)"
 
 
 class TestSnowflakeDialect:
@@ -1274,6 +1300,7 @@ class TestPerEngineQualifyTablesForExecution:
             (lambda: _duckdb_uninit(), "duckdb", None, "main"),
             (lambda: RedshiftDialect.__new__(RedshiftDialect), "redshift", None, "public"),
             (lambda: _sqlserver_uninit(), "tsql", None, "dbo"),
+            (lambda: _oracle_uninit(), "oracle", None, "RENTAL_SHOP"),
             (lambda: _snowflake_uninit(), "snowflake", "DATABASE", "SCHEMA"),
         ],
     )
@@ -1290,3 +1317,38 @@ class TestPerEngineQualifyTablesForExecution:
             pass
         result = d._qualify_tables_for_execution("SELECT 1 FROM orders")
         assert "orders" in result.lower()
+
+
+class TestNamedPlaceholderNormalization:
+    """Sqlglot dialect generators must round-trip back to canonical ``:name`` binds."""
+
+    def test_normalize_pg_and_duckdb_placeholder_forms(self) -> None:
+        assert Dialect.normalize_named_placeholders("WHERE x = %(p1)s AND y = $p2") == "WHERE x = :p1 AND y = :p2"
+
+    def test_duckdb_simplify_keeps_colon_placeholders(self) -> None:
+        out = Dialect._sql_simplify_executable(
+            "SELECT COUNT(1) FROM t WHERE LOWER(status) = :p1",
+            sqlglot_dialect="duckdb",
+        )
+        assert ":p1" in out
+        assert "$p1" not in out
+
+    def test_bind_colon_parameters_accepts_dollar_tokens(self) -> None:
+        from aetherdialect._dialect_sqlglot_helper import SqlglotEngineDialect
+
+        sql, values = SqlglotEngineDialect.bind_colon_parameters_for_duckdb(
+            "SELECT 1 WHERE status = $p1",
+            {"p1": "pending"},
+        )
+        assert sql == "SELECT 1 WHERE status = ?"
+        assert values == ["pending"]
+
+    def test_bind_colon_parameters_accepts_reflection_named_binds(self) -> None:
+        from aetherdialect._dialect_sqlglot_helper import SqlglotEngineDialect
+
+        sql, values = SqlglotEngineDialect.bind_colon_parameters_for_duckdb(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = :s",
+            {"s": "main"},
+        )
+        assert sql == "SELECT 1 FROM information_schema.tables WHERE table_schema = ?"
+        assert values == ["main"]

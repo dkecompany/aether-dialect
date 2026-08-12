@@ -15,13 +15,13 @@ from aetherdialect._contracts_schema import (
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._core_utils import read_artifact_manifest, write_gzip_json_atomic
 from aetherdialect._schema_graph import (
     assign_schema_graph_hashes,
     derive_deterministic_schema_graph_id,
     mint_schema_graph_id,
     upgrade_artifacts_schema_graph_id,
 )
+from aetherdialect._utils_artifacts import read_artifact_manifest, write_gzip_json_atomic
 
 
 def _table(name: str) -> TableMetadata:
@@ -100,7 +100,7 @@ def test_upgrade_artifacts_backfills_manifest_and_header(tmp_path, monkeypatch) 
         TEMPLATE_STORE_PARTITION_PREFIX,
         TEMPLATE_STORE_SEGMENT,
     )
-    from aetherdialect._core_utils import write_artifact_manifest
+    from aetherdialect._utils_artifacts import write_artifact_manifest
 
     adir = str(tmp_path)
     eff = "legacy_eff_hash_value"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._core_utils import active_engine_identity, bound_engine_runtime_config
+from aetherdialect._utils import active_engine_identity, bound_engine_runtime_config
 from tests.test_aetherdialect import _make_aether_stub
 
 
@@ -27,17 +26,16 @@ def test_bound_engine_runtime_config_raises_without_active_identity(unbound_engi
 
 
 @pytest.mark.fast
-def test_apply_overrides_uses_engine_artifacts_dir(
+def test_apply_structure_uses_engine_artifacts_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """apply_overrides must persist to the owning engine's artifacts_dir."""
+    """apply_structure must persist to the owning engine's artifacts_dir."""
     engine_dir = tmp_path / "engine_a"
     engine_dir.mkdir()
     global_dir = tmp_path / "global"
     global_dir.mkdir()
     monkeypatch.chdir(tmp_path)
-    (engine_dir / "schema_overrides.json").write_text(json.dumps({"tables": {}}), encoding="utf-8")
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(global_dir / "schema_graph.json.gz"))
 
     engine = _make_aether_stub(_artifacts_dir=engine_dir)
@@ -59,10 +57,21 @@ def test_apply_overrides_uses_engine_artifacts_dir(
             pks_blocked=0,
             coerced_columns=0,
             collapsed_inferences=0,
+            domain_knowledge_entries=None,
         )
 
-    with patch("aetherdialect.aetherdialect.apply_overrides_and_persist", side_effect=_capture_apply):
-        engine.apply_overrides()
+    with patch("aetherdialect.aetherdialect.apply_structure_document", side_effect=_capture_apply):
+        engine.apply_structure(
+            {
+                "tables": {},
+                "foreign_keys_add": [],
+                "foreign_keys_remove": [],
+                "primary_keys_add": [],
+                "primary_keys_remove": [],
+                "relationships": [],
+                "table_count": 0,
+            }
+        )
 
     expected = str(engine_dir / "schema_graph.json.gz")
     assert captured["schema_json_path"] == expected

@@ -16,23 +16,20 @@ from aetherdialect._contracts_base import (
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     FKEdge,
+    SchemaDiff,
     SchemaGraph,
+    TableDiff,
     TableMetadata,
 )
 from aetherdialect._dialect import Dialect
+from aetherdialect._schema_finalize import apply_diff, build_schema_graph
 from aetherdialect._schema_graph import (
-    SchemaDiff,
-    TableDiff,
     assign_schema_graph_hashes,
     diff_schemas,
     resolve_column_renames,
     resolve_table_renames,
 )
-from aetherdialect._schema_overrides import (
-    apply_diff,
-    build_schema_graph,
-    save_schema_to_cache,
-)
+from aetherdialect._schema_reflect import save_schema_to_cache
 
 pytestmark = pytest.mark.usefixtures("stub_schema_llm_classifier")
 

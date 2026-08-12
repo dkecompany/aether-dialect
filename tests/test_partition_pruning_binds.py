@@ -7,8 +7,8 @@ import pytest
 from aetherdialect._contracts_base import NormalizedExpr, PredicateGroup, WhereParam
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import reconcile_execute_bind_params
 from aetherdialect._dialect_postgres import PostgresDialect
+from aetherdialect._utils import reconcile_execute_bind_params
 
 
 def _schema_with_partition(table: str, partition_cols: list[str]) -> SchemaGraph:

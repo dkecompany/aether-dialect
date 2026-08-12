@@ -10,25 +10,13 @@ from pathlib import Path
 import pytest
 
 from aetherdialect._sandbox import Sandbox, _DataBundleAccess
+from tests._sandbox_csv_bundle import write_main_csv_ddl_bundle
 
 _extract_data_bundle = Sandbox._extract_data_bundle
 
 
 def _write_minimal_bundle(root: Path) -> None:
-    (root / "rental_shop_seed.sql").write_text(
-        "\n".join(
-            (
-                "CREATE TABLE customer (customer_id INTEGER PRIMARY KEY);",
-                "CREATE TABLE film (film_id INTEGER PRIMARY KEY);",
-            ),
-        ),
-        encoding="utf-8",
-    )
-    (root / "rental_shop.sql").write_text("SELECT 1;", encoding="utf-8")
-    (root / "rental_shop_notes.txt").write_text("catalog notes", encoding="utf-8")
-    fixtures = root / "fixtures"
-    fixtures.mkdir()
-    (fixtures / "rental_shop_mock.json").write_text('{"fixtures": []}', encoding="utf-8")
+    write_main_csv_ddl_bundle(root)
 
 
 def _write_zip_bundle(zip_path: Path, bundle_root: Path) -> None:
@@ -74,7 +62,7 @@ def test_extract_directory_removed_when_owned(
     assert not extract_path.exists()
 
 
-@pytest.mark.fast
+@pytest.mark.not_fast
 def test_no_temp_directory_survives_sandbox_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

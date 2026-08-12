@@ -5,15 +5,15 @@ from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect, MySQLDialect, SnowflakeDialect, SQLiteDialect
-from aetherdialect._federation import (
-    compose_composite_graph,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
     parse_federation_manifest,
-    plan_federated_intent,
     stamp_federation_member_graph,
 )
+from aetherdialect._federation_plan import plan_federated_intent
 from aetherdialect._schema_graph import compute_database_feature_capability, recompute_join_paths_multi
 from aetherdialect._sql_gen import _render_group_sql
-from aetherdialect._validation_schema import validate_select_cols_schema
+from aetherdialect._validation_shape import validate_select_cols_schema
 
 _CROSS_SOURCE_MANIFEST = {
     "federation_id": "fed_cross",

@@ -9,9 +9,10 @@ import pytest
 from aetherdialect._contracts_base import ApprovalState, ConfigError, NormalizedExpr
 from aetherdialect._contracts_core import ConcreteIntent, RuntimeIntent, SelectCol, Template, ValueHistory
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
-from aetherdialect._core_utils import normalize_question
-from aetherdialect._pipeline import execute_stored_template_by_ref, match_question_level_template_reuse
-from aetherdialect._utils import intent_key
+from aetherdialect._pipeline_execute import execute_stored_template_by_ref
+from aetherdialect._pipeline_generate import match_question_level_template_reuse
+from aetherdialect._utils import normalize_question
+from aetherdialect._utils_intent import intent_key
 
 
 def _schema() -> SchemaGraph:

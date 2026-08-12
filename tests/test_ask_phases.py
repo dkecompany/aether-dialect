@@ -7,12 +7,12 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._constants import ASK_PHASE_D, ASK_PHASE_F
-from aetherdialect._contracts_base import LogicalIntent, NormalizedExpr
+from aetherdialect._constants_runtime import ASK_PHASE_D, ASK_PHASE_F
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import pop_ask_phase_callback, push_ask_phase_callback
-from aetherdialect._intent_process import full_intent_parse, logical_intent_to_serialisable
+from aetherdialect._contracts_schema import ColumnMetadata, LogicalIntent, SchemaGraph, TableMetadata
+from aetherdialect._intent_loop import full_intent_parse, logical_intent_to_serialisable
+from aetherdialect._utils import pop_ask_phase_callback, push_ask_phase_callback
 
 
 def _minimal_schema() -> SchemaGraph:
@@ -53,9 +53,9 @@ def test_non_federation_ask_emits_compose_and_validate_phases() -> None:
     token = push_ask_phase_callback(lambda ev: emitted.append(ev.phase))
     try:
         with (
-            patch("aetherdialect._intent_process.LLMProvider.chat", side_effect=list(llm_seq)),
+            patch("aetherdialect._intent_loop.LLMProvider.chat", side_effect=list(llm_seq)),
             patch(
-                "aetherdialect._intent_process._format_repair_loop",
+                "aetherdialect._intent_loop._format_repair_loop",
                 return_value=(stub_intent, 0),
             ),
         ):

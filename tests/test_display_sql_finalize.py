@@ -13,11 +13,11 @@ from aetherdialect._contracts_core import (
     SelectCol,
     SqlGenerationOutcome,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import SQLShape
-from aetherdialect._pipeline import execute_stored_template_by_ref
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata, TemplateStats
+from aetherdialect._pipeline_execute import execute_stored_template_by_ref
+from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
 def _template() -> Template:
@@ -59,10 +59,33 @@ def _template() -> Template:
     )
 
 
+def _schema() -> SchemaGraph:
+    tables = {
+        "items": TableMetadata(
+            name="items",
+            columns={
+                "id": ColumnMetadata(name="id", data_type="integer", sensitivity="none"),
+                "status": ColumnMetadata(name="status", data_type="string", sensitivity="none"),
+            },
+            primary_key=["id"],
+            foreign_keys=[],
+            source_id="a",
+        ),
+    }
+    return SchemaGraph(
+        tables=tables,
+        join_paths_multi=recompute_join_paths_multi(tables),
+        schema_graph_id="sg_items",
+        effective_structural_hash="eff_items",
+    )
+
+
 def _dialect() -> MagicMock:
     dialect = MagicMock()
     dialect.execute.return_value = [(1,)]
     dialect.sqlglot_dialect = "duckdb"
+    dialect.ast_validate_full.return_value = []
+    dialect.can_explain.return_value = False
     return dialect
 
 
@@ -74,7 +97,7 @@ def test_template_execution_display_inlines() -> None:
     store: dict = {"templates": {tmpl.id: tmpl}}
     exec_sql = "SELECT id FROM items WHERE status = :p1"
     outcome = SqlGenerationOutcome(exec_sql, True, GenerationPath.EXACT_QUESTION_REUSE, tmpl)
-    with patch("aetherdialect._pipeline.execute_reuse_with_params", return_value=outcome):
+    with patch("aetherdialect._pipeline_execute.execute_reuse_with_params", return_value=outcome):
         result = execute_stored_template_by_ref(
             tmpl.id,
             {"p1": "active"},
@@ -83,7 +106,7 @@ def test_template_execution_display_inlines() -> None:
             store=store,
             templates={tmpl.id: tmpl},
             rejected={},
-            schema=MagicMock(),
+            schema=_schema(),
         )
     assert result.sql == exec_sql
     assert "status = 'active'" in result.display_sql

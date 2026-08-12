@@ -7,10 +7,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import structural_hash_fp
-from aetherdialect._schema_build import _reflect_view_definition_text, tables_referenced_in_view_definition
 from aetherdialect._schema_graph import tables_structural_payload
-from aetherdialect._validation_schema import validate_join_path_reachability_for_tables
+from aetherdialect._schema_reflect import (
+    _reflect_view_definition_text,
+    tables_referenced_in_view_definition,
+)
+from aetherdialect._utils import structural_hash_fp
+from aetherdialect._validation_shape import validate_join_path_reachability_for_tables
 
 
 def _column(name: str) -> ColumnMetadata:

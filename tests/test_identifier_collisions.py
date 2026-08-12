@@ -6,8 +6,8 @@ import pytest
 
 from aetherdialect._contracts_base import EngineContext, SchemaInvariantError
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._schema_build import resolve_graph_table_name
 from aetherdialect._schema_graph import apply_deny_objects_filter, validate_scope_against_graph
+from aetherdialect._schema_reflect import resolve_graph_table_name
 
 
 def _col(name: str) -> ColumnMetadata:

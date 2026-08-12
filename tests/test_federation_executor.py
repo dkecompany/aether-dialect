@@ -5,25 +5,26 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from aetherdialect._contracts_base import FederationInvariantError, FederationRuntimeError
 from aetherdialect._contracts_core import FederatedPrepareOutcome, RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import (
-    FederationInvariantError,
-    FederationRuntimeError,
-    compose_composite_graph,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import (
     execute_federation_coordinator,
     federation_plan_combine_hash,
     federation_plan_step_fingerprints,
-    parse_federation_manifest,
-    plan_federated_intent,
-    render_federation_glue,
     revalidate_prepared_federation_plan,
 )
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import (
+    plan_federated_intent,
+    render_federation_glue,
+)
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._pipeline import execute_federated_prepare
+from aetherdialect._pipeline_execute import execute_federated_prepare
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._utils import intent_key
+from aetherdialect._utils_intent import intent_key
 from tests.conftest import duckdb_engine_identity
 
 
@@ -270,7 +271,8 @@ def test_federation_member_probe_qualification_uses_attached_schema() -> None:
 def test_member_row_cap_raises_typed_limit_key() -> None:
     import pandas as pd
 
-    from aetherdialect._federation import FederationCapExceededError, _enforce_federation_row_cap
+    from aetherdialect._contracts_base import FederationCapExceededError
+    from aetherdialect._federation_execute import _enforce_federation_row_cap
 
     with pytest.raises(FederationCapExceededError) as excinfo:
         _enforce_federation_row_cap(pd.DataFrame({"id": [1, 2]}), 1, source_id="a")
@@ -285,7 +287,7 @@ def test_member_execute_passes_source_timeout() -> None:
     import pandas as pd
 
     from aetherdialect._contracts_core import FederatedPlan, SourceStep
-    from aetherdialect._pipeline import _execute_federation_source_step
+    from aetherdialect._pipeline_execute import _execute_federation_source_step
 
     manifest = parse_federation_manifest(
         {
@@ -317,9 +319,9 @@ def test_member_execute_passes_source_timeout() -> None:
     prepared_by_source = {
         "a": type("Prep", (), {"sub_intent": step.sub_intent, "sql": "SELECT 1", "structural_defaults": {}})(),
     }
-    with patch("aetherdialect._pipeline.execute_guarded_sql") as exec_mock:
+    with patch("aetherdialect._pipeline_execute.execute_guarded_sql") as exec_mock:
         exec_mock.return_value = [{"id": 1}]
-        with patch("aetherdialect._pipeline.build_result_dataframe", return_value=pd.DataFrame({"id": [1]})):
+        with patch("aetherdialect._pipeline_execute.build_result_dataframe", return_value=pd.DataFrame({"id": [1]})):
             mock_dialect = MagicMock()
             mock_dialect.finalize_render.return_value = "SELECT 1"
             _execute_federation_source_step(

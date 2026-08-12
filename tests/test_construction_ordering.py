@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
-import aetherdialect._schema_overrides
+import aetherdialect._schema_finalize
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import EngineContext, MigrationTier
 from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._core_utils import read_artifact_manifest, write_artifact_manifest
 from aetherdialect._dialect import Dialect
 from aetherdialect._schema_graph import assign_schema_graph_hashes, compute_dialect_probe
-from aetherdialect._schema_overrides import save_schema_to_cache
+from aetherdialect._schema_reflect import save_schema_to_cache
+from aetherdialect._utils_artifacts import read_artifact_manifest, write_artifact_manifest
 
 pytestmark = pytest.mark.usefixtures("stub_schema_llm_classifier")
 
@@ -26,7 +26,7 @@ class _ProbeCacheHitDialect(Dialect):
     name = "stub"
 
     def __init__(self, *, probe: str) -> None:
-        super().__init__(MagicMock())
+        super().__init__(SimpleNamespace())
         self._probe = probe
 
     def compute_ddl_probe(self, engine_context: EngineContext) -> str:
@@ -43,12 +43,12 @@ class _ProbeCacheHitDialect(Dialect):
 
 
 class _FingerprintCacheHitDialect(Dialect):
-    """Dialect with no DDL probe so the legacy fingerprint cache-hit path is used."""
+    """Dialect with no DDL probe so the fingerprint-only cache-hit path is used."""
 
     name = "stub"
 
     def __init__(self) -> None:
-        super().__init__(MagicMock())
+        super().__init__(SimpleNamespace())
 
     def compute_ddl_probe(self, engine_context: EngineContext) -> str:
         return ""
@@ -71,9 +71,9 @@ def cache_path(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 def _patch_build_tail(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(aetherdialect._schema_overrides, "notify_schema_path_health", lambda sg: None)
-    monkeypatch.setattr(aetherdialect._schema_overrides, "validate_scope_against_graph", lambda sg, c: None)
-    monkeypatch.setattr(aetherdialect._schema_overrides, "raise_if_schema_unusable", lambda sg, c: None)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "notify_schema_path_health", lambda sg: None)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "validate_scope_against_graph", lambda sg, c: None)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "raise_if_schema_unusable", lambda sg, c: None)
 
 
 def _save_probe_cache(schema_graph: SchemaGraph, cache_path: str, *, notes: str, probe: str) -> None:
@@ -94,29 +94,29 @@ def _save_fingerprint_cache(schema_graph: SchemaGraph, cache_path: str, *, notes
 
 def _install_call_order_tracker(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     order: list[str] = []
-    real_assign = aetherdialect._schema_overrides.assign_schema_graph_hashes
-    real_finalize = aetherdialect._schema_overrides.finalize_with_overrides
+    real_assign = aetherdialect._schema_graph.assign_schema_graph_hashes
+    real_finalize = aetherdialect._schema_finalize.finalize_with_structure
 
     def _track_assign(*args: Any, **kwargs: Any) -> None:
         order.append("assign_schema_graph_hashes")
         return real_assign(*args, **kwargs)
 
     def _track_finalize(*args: Any, **kwargs: Any) -> bool:
-        order.append("finalize_with_overrides")
+        order.append("finalize_with_structure")
         return real_finalize(*args, **kwargs)
 
-    monkeypatch.setattr(aetherdialect._schema_overrides, "assign_schema_graph_hashes", _track_assign)
-    monkeypatch.setattr(aetherdialect._schema_overrides, "finalize_with_overrides", _track_finalize)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "assign_schema_graph_hashes", _track_assign)
+    monkeypatch.setattr(aetherdialect._schema_finalize, "finalize_with_structure", _track_finalize)
     return order
 
 
 def _assert_finalize_before_assign(order: list[str]) -> None:
     assign_positions = [i for i, name in enumerate(order) if name == "assign_schema_graph_hashes"]
-    finalize_positions = [i for i, name in enumerate(order) if name == "finalize_with_overrides"]
-    assert finalize_positions, f"expected finalize_with_overrides in call order, got {order!r}"
+    finalize_positions = [i for i, name in enumerate(order) if name == "finalize_with_structure"]
+    assert finalize_positions, f"expected finalize_with_structure in call order, got {order!r}"
     assert assign_positions, f"expected assign_schema_graph_hashes in call order, got {order!r}"
     assert min(finalize_positions) < min(assign_positions), (
-        f"finalize_with_overrides must run before assign_schema_graph_hashes; got {order!r}"
+        f"finalize_with_structure must run before assign_schema_graph_hashes; got {order!r}"
     )
 
 
@@ -129,13 +129,14 @@ def test_probe_cache_hit_finalizes_overrides_before_hash_assignment(
     """Probe cache-hit path must hash only after override replay."""
     notes = ""
     ctx = EngineContext()
-    probe = compute_dialect_probe(_ProbeCacheHitDialect(probe="probe_seed"), ctx)
+    raw_probe = "probe_seed"
+    dialect = _ProbeCacheHitDialect(probe=raw_probe)
+    probe = compute_dialect_probe(dialect, ctx)
     _save_probe_cache(schema_graph, cache_path, notes=notes, probe=probe)
     _patch_build_tail(monkeypatch)
     order = _install_call_order_tracker(monkeypatch)
 
-    dialect = _ProbeCacheHitDialect(probe=probe)
-    aetherdialect._schema_overrides.build_schema_graph_with_diff(dialect, ctx, notes_content=notes)
+    aetherdialect._schema_finalize.build_schema_graph_with_diff(dialect, ctx, notes_content=notes)
 
     _assert_finalize_before_assign(order)
 
@@ -154,7 +155,7 @@ def test_fingerprint_cache_hit_finalizes_overrides_before_hash_assignment(
     order = _install_call_order_tracker(monkeypatch)
 
     dialect = _FingerprintCacheHitDialect()
-    aetherdialect._schema_overrides.build_schema_graph_with_diff(dialect, ctx, notes_content=notes)
+    aetherdialect._schema_finalize.build_schema_graph_with_diff(dialect, ctx, notes_content=notes)
 
     _assert_finalize_before_assign(order)
 

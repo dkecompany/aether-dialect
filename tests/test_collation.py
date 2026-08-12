@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_core import OrderByCol, ResidualSpec, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import NormalizedExpr, OrderByCol
+from aetherdialect._contracts_core import ResidualSpec, RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import render_federation_residual_sql
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_plan import render_federation_residual_sql
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import _build_deterministic_select_block, build_deterministic_sql
 

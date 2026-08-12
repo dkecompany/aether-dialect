@@ -11,11 +11,13 @@ import pytest
 import duckdb
 from aetherdialect import AetherEngine, UploadIngestResult
 from aetherdialect._config import DuckDBRuntimeConfig, EngineConfig
-from aetherdialect._contracts_base import ConfigError, EngineContext, EngineIdentity, LLMConfig, RuntimeConfig
+from aetherdialect._contracts_base import ConfigError, EngineContext, EngineIdentity
+from aetherdialect._contracts_core import LLMConfig, RuntimeConfig
 from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._core_utils import load_runtime_config, pop_engine_identity, push_engine_identity
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import pop_engine_identity, push_engine_identity
+from aetherdialect._utils_artifacts import load_runtime_config
 from tests.test_aetherdialect import _make_aether_stub
 
 
@@ -47,7 +49,7 @@ def _patch_upload_llm() -> None:
 
 @pytest.fixture(autouse=True)
 def _patch_ingest_schema_profiling() -> None:
-    with patch("aetherdialect._schema_overrides._profile_subset"):
+    with patch("aetherdialect._schema_finalize._profile_subset"):
         yield
 
 

@@ -3,7 +3,6 @@
 import pytest
 
 from aetherdialect._contracts_base import (
-    ColumnRole,
     FailureCategory,
     HavingParam,
     MulGroup,
@@ -21,6 +20,7 @@ from aetherdialect._contracts_schema import (
     CaseWhenBranch,
     CaseWhenExpr,
     ColumnMetadata,
+    ColumnRole,
     CteOutputColumnMeta,
     FKEdge,
     SchemaGraph,
@@ -28,11 +28,7 @@ from aetherdialect._contracts_schema import (
     WindowRegistryStep,
     WindowSpec,
 )
-from aetherdialect._validation_schema import (
-    _validate_agg_func_valid,
-    _validate_having_agg,
-    _validate_scalar_func_valid,
-    _validate_where_col,
+from aetherdialect._intent_expr import (
     extract_agg_col,
     extract_col_from_scalar_wrapper,
     extract_functions_from_term,
@@ -40,7 +36,16 @@ from aetherdialect._validation_schema import (
     get_col_type,
     is_col_arithmetic_role,
     is_col_numeric,
+)
+from aetherdialect._validation_rules import (
     selectability_exempt_qualified_refs,
+    validate_selectability,
+)
+from aetherdialect._validation_shape import (
+    _validate_agg_func_valid,
+    _validate_having_agg,
+    _validate_scalar_func_valid,
+    _validate_where_col,
     validate_case_when_schema,
     validate_contains_array_filters,
     validate_date_diff_units,
@@ -55,7 +60,6 @@ from aetherdialect._validation_schema import (
     validate_order_by_cols_schema,
     validate_redundant_extract_year_column_literals,
     validate_select_cols_schema,
-    validate_selectability,
     validate_where_ops_per_column,
     validate_where_value_type_alignment,
     validate_window_partition_group_by_alignment,
@@ -505,7 +509,7 @@ class TestValidateFiltersSchema:
         assert len(bool_op_issues) == 0
 
     def test_invalid_bool_op_raises_issue(self, simple_schema):
-        """Leaf params no longer carry bool_op; schema validation ignores removed fields."""
+        """Leaf params omit bool_op; schema validation ignores unknown leaf fields."""
         fp = WhereParam(
             left_expr=NormalizedExpr.from_column("customers.name"),
             op="=",
@@ -583,7 +587,7 @@ class TestValidateHavingSchema:
         assert len(bool_op_issues) == 0
 
     def test_invalid_having_bool_op_raises_issue(self, simple_schema):
-        """Leaf params no longer carry bool_op; schema validation ignores removed fields."""
+        """Leaf params omit bool_op; schema validation ignores unknown leaf fields."""
         hp = HavingParam(
             left_expr=NormalizedExpr(add_groups=[MulGroup(coefficient=1.0, multiply=["COUNT(customers.id)"])]),
             op=">",
@@ -1579,8 +1583,7 @@ class TestContainsArrayValidator:
     def test_contains_on_array_ok(self, typed_schema):
         tags = typed_schema.tables["orders"].columns.get("tags")
         if tags is None:
-            from aetherdialect._contracts_base import ColumnRole
-            from aetherdialect._contracts_schema import ColumnMetadata
+            from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole
 
             typed_schema.tables["orders"].columns["tags"] = ColumnMetadata(
                 name="tags",
@@ -2333,7 +2336,7 @@ def _deep_or_predicate_tree(depth: int):
 def test_where_predicate_depth_four_reports_max_nesting() -> None:
     from aetherdialect._constants import MAX_PREDICATE_NESTING_DEPTH
     from aetherdialect._contracts_base import PredicateGroup
-    from aetherdialect._validation_schema import validate_predicate_nesting_depth
+    from aetherdialect._validation_sql import validate_predicate_nesting_depth
 
     nested = _deep_or_predicate_tree(MAX_PREDICATE_NESTING_DEPTH + 1)
     assert nested.depth() > MAX_PREDICATE_NESTING_DEPTH
@@ -2350,7 +2353,7 @@ def test_where_predicate_depth_four_reports_max_nesting() -> None:
 def test_having_predicate_depth_four_reports_max_nesting() -> None:
     from aetherdialect._constants import MAX_PREDICATE_NESTING_DEPTH
     from aetherdialect._contracts_base import HavingParam, PredicateGroup
-    from aetherdialect._validation_schema import validate_predicate_nesting_depth
+    from aetherdialect._validation_sql import validate_predicate_nesting_depth
 
     def _having_leaf() -> HavingParam:
         return HavingParam(left_expr=NormalizedExpr.from_agg("count", "*"), op=">", raw_value=1)

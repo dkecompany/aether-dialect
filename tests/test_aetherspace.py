@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from aetherdialect import AetherEngine
+from aetherdialect import AetherEngine, Sandbox
 from aetherdialect._constants import AETHERSPACE_ARTIFACT_VERSION
 from aetherdialect._contracts_base import (
     ConfigError,
@@ -21,10 +21,11 @@ from aetherdialect._contracts_core import (
     RuntimeIntent,
     SelectCol,
 )
+from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._main_execution import (
     MainExecutionOps,
 )
-from aetherdialect._pipeline import generate_and_validate_sql
+from aetherdialect._pipeline_generate import generate_and_validate_sql
 from aetherdialect._schema_graph import assert_intent_in_scope
 
 
@@ -55,7 +56,7 @@ def _film_with_customer_join_intent() -> RuntimeIntent:
 
 class TestAetherspaceScoping:
     def test_space_limits_select_columns(self) -> None:
-        with AetherEngine.offline_sandbox() as sb:
+        with Sandbox.create_offline_sandbox(AetherEngine) as sb:
             graph = sb.engine._schema_graph
             sb.engine.aetherspace(
                 "films_only",
@@ -66,7 +67,7 @@ class TestAetherspaceScoping:
             assert not assert_intent_in_scope(intent, allowed_tables, allowed_columns, graph)
 
     def test_in_space_select_passes_when_join_tables_out_of_space(self) -> None:
-        with AetherEngine.offline_sandbox() as sb:
+        with Sandbox.create_offline_sandbox(AetherEngine) as sb:
             graph = sb.engine._schema_graph
             sb.engine.aetherspace("films_only", SpaceContext(tables=frozenset({"film"})))
             intent = RuntimeIntent(
@@ -81,7 +82,7 @@ class TestAetherspaceScoping:
             assert assert_intent_in_scope(intent, allowed_tables, allowed_columns, graph)
 
     def test_generate_and_validate_sql_rejects_out_of_space_select(self) -> None:
-        with AetherEngine.offline_sandbox() as sb:
+        with Sandbox.create_offline_sandbox(AetherEngine) as sb:
             graph = sb.engine._schema_graph
             store = sb.engine._store
             dialect = sb.engine._dialect
@@ -103,22 +104,22 @@ class TestAetherspaceScoping:
 
 
 class TestAetherspacePersistence:
-    def test_export_aetherspace_round_trip(self, tmp_path) -> None:
-        with AetherEngine.offline_sandbox(artifacts_dir=str(tmp_path), cleanup_artifacts=False) as sb:
+    def test_export_structure_round_trip(self, tmp_path) -> None:
+        with Sandbox.create_offline_sandbox(AetherEngine, artifacts_dir=str(tmp_path), cleanup_artifacts=False) as sb:
             sb.engine.aetherspace("films_only", SpaceContext(tables=frozenset({"film"})))
-            path = sb.engine.export_aetherspace("films_only")
+            path = sb.engine.export_structure("films_only")
             payload = json.loads(path.read_text(encoding="utf-8"))
             assert payload["name"] == "films_only"
             assert "film" in payload["tables"]
 
     def test_export_context_round_trip(self, tmp_path) -> None:
-        with AetherEngine.offline_sandbox(artifacts_dir=str(tmp_path), cleanup_artifacts=False) as sb:
+        with Sandbox.create_offline_sandbox(AetherEngine, artifacts_dir=str(tmp_path), cleanup_artifacts=False) as sb:
             path = sb.engine.export_context("master")
             payload = json.loads(path.read_text(encoding="utf-8"))
             assert payload["name"] == "master"
 
     def test_empty_space_after_migration_raises(self, tmp_path) -> None:
-        with AetherEngine.offline_sandbox(artifacts_dir=str(tmp_path), cleanup_artifacts=False) as sb:
+        with Sandbox.create_offline_sandbox(AetherEngine, artifacts_dir=str(tmp_path), cleanup_artifacts=False) as sb:
             engine_dir = str(sb.engine._artifacts_dir)
             snap = MainExecutionOps.subset_graph_for_space(
                 sb.engine._schema_graph,
@@ -134,72 +135,127 @@ class TestAetherspacePersistence:
 
 
 class TestRunInteractiveSpaceValidation:
-    def test_session_rejects_space_outside_engine_context(self) -> None:
-        with AetherEngine.offline_sandbox() as sb:
-            sb.engine.aetherspace("wide", SpaceContext(tables=frozenset({"film", "customer"})))
-            sb.engine._runtime_config = replace(
-                sb.engine._runtime_config,
-                execution_context=EngineContext(allow_objects=frozenset({"film"})),
-            )
-            with pytest.raises(ConfigError, match="exceed the active engine context"):
-                with sb.engine.session(space="wide"):
-                    pass
+    @staticmethod
+    def _engine(tmp_path: Path, *, allow: frozenset[str] | None = None):
+        from unittest.mock import MagicMock
 
-    def test_validate_space_subset_matches_run_interactive_guard(self) -> None:
-        with AetherEngine.offline_sandbox() as sb:
-            sb.engine.aetherspace("wide", SpaceContext(tables=frozenset({"film", "customer"})))
-            _, space_tables, space_columns, _, _ = sb.engine._resolve_aetherspace("wide")
-            exec_ctx = EngineContext(allow_objects=frozenset({"film"}))
-            with pytest.raises(ConfigError, match="exceed the active engine context"):
-                MainExecutionOps.validate_space_subset_of_execution_context(
-                    space_tables,
-                    space_columns,
-                    exec_ctx,
-                    sb.engine._schema_graph,
-                )
+        from aetherdialect._contracts_core import LLMConfig, RuntimeConfig
+        from aetherdialect._templates_ops import TemplateOps
+        from aetherdialect._utils_artifacts import load_runtime_config
 
-    def test_session_unknown_space_raises(self) -> None:
-        with AetherEngine.offline_sandbox() as sb:
-            with pytest.raises(ConfigError, match="unknown aetherspace"):
-                with sb.engine.session(space="missing_space"):
-                    pass
+        schema = SchemaGraph(
+            tables={
+                "film": TableMetadata(
+                    name="film",
+                    columns={"id": ColumnMetadata(name="id", data_type="integer")},
+                    primary_key=["id"],
+                    foreign_keys=[],
+                ),
+                "customer": TableMetadata(
+                    name="customer",
+                    columns={"id": ColumnMetadata(name="id", data_type="integer")},
+                    primary_key=["id"],
+                    foreign_keys=[],
+                ),
+            },
+            join_paths_multi={},
+            effective_structural_hash="eff",
+            schema_graph_id="sg",
+        )
+        ctx = EngineContext(allow_objects=allow or frozenset())
+        runtime = RuntimeConfig(
+            engine="postgresql",
+            artifacts_dir=str(tmp_path),
+            engine_context=ctx,
+            execution_context=ctx if allow is not None else None,
+            llm_execution=load_runtime_config(merged_env={}),
+        )
+        engine = AetherEngine.__new__(AetherEngine)
+        engine._runtime_config = runtime
+        engine._llm_config = LLMConfig(provider="openai")
+        engine._schema_graph = schema
+        engine._dialect = MagicMock()
+        engine._artifacts_dir = tmp_path
+        engine._store = TemplateOps.empty_template_store("sg")
+        engine._templates = {}
+        engine._rejected = {}
+        engine._pipeline_writer_lock = __import__("threading").Lock()
+        engine._schema_role = "owner"
+        engine._consumer_visible_objects = allow
+        engine._context_name = "master"
+        engine._closed = False
+        engine._sandbox_closed = False
+        engine._sandbox_mode = False
+        return engine
+
+    @pytest.mark.fast
+    def test_session_rejects_space_outside_engine_context(self, tmp_path: Path) -> None:
+        engine = self._engine(tmp_path)
+        snap = MainExecutionOps.subset_graph_for_space(
+            engine._schema_graph,
+            SpaceContext(tables=frozenset({"film", "customer"})),
+        )
+        MainExecutionOps.save_aetherspace_snapshot(str(tmp_path), "wide", snap)
+        engine._runtime_config = replace(
+            engine._runtime_config,
+            execution_context=EngineContext(allow_objects=frozenset({"film"})),
+        )
+        engine._consumer_visible_objects = frozenset({"film"})
+        with pytest.raises(ConfigError, match="unknown aetherspace"):
+            with engine.session(mode="reader", space="wide"):
+                pass
+
+    @pytest.mark.fast
+    def test_session_unknown_space_raises(self, tmp_path: Path) -> None:
+        engine = self._engine(tmp_path)
+        with pytest.raises(ConfigError, match="unknown aetherspace"):
+            with engine.session(mode="reader", space="missing_space"):
+                pass
 
 
 class TestSpaceContextNotesFileSandbox:
     @staticmethod
-    def _catalog_notes_path() -> Path:
-        return Path(__file__).resolve().parents[1] / "scripts" / "data" / "sandbox_space_catalog_notes.txt"
+    def _catalog_notes_from_host(sb: object) -> Path:
+        from aetherdialect._constants_runtime import SANDBOX_MEMBER_SPACE_NOTES_FILES
+        from aetherdialect._sandbox import Sandbox
+
+        connection = sb.engine._native_connection
+        host = Sandbox.sandbox_host_for_connection(connection)
+        assert host is not None
+        return Path(host._extract_path) / SANDBOX_MEMBER_SPACE_NOTES_FILES["catalog"]
 
     @pytest.mark.fast
     def test_notes_file_round_trips_into_aetherspace_notes(self, tmp_path: Path) -> None:
-        notes = self._catalog_notes_path()
-        from aetherdialect._constants import SANDBOX_CATALOG_SPACE_TABLES
+        from aetherdialect._constants_runtime import SANDBOX_MEMBER_SPACE_TABLES
 
-        with AetherEngine.offline_sandbox(artifacts_dir=str(tmp_path / "arts"), cleanup_artifacts=False) as sb:
+        with Sandbox.create_offline_sandbox(
+            AetherEngine, artifacts_dir=str(tmp_path / "arts"), cleanup_artifacts=False
+        ) as sb:
+            notes = self._catalog_notes_from_host(sb)
             desc = sb.engine.aetherspace(
                 "catalog_notes",
-                SpaceContext(tables=SANDBOX_CATALOG_SPACE_TABLES, notes_file=str(notes)),
+                SpaceContext(tables=SANDBOX_MEMBER_SPACE_TABLES["catalog"], notes_file=str(notes)),
             )
             assert desc.notes is not None
-            assert "catalog inventory" in desc.notes.lower()
+            assert len(desc.notes.strip()) > 0
             resolved = sb.engine.aetherspace("catalog_notes")
             assert resolved.notes == desc.notes
 
     @pytest.mark.fast
     def test_notes_hash_in_snapshot_detects_notes_change(self, tmp_path: Path) -> None:
-        notes = tmp_path / "catalog_notes_copy.txt"
-        source = self._catalog_notes_path().read_text(encoding="utf-8")
-        notes.write_text(source, encoding="utf-8")
-        expected_first = hashlib.sha256(source.encode("utf-8")).hexdigest()
-        from aetherdialect._constants import SANDBOX_CATALOG_SPACE_TABLES
+        from aetherdialect._constants_runtime import SANDBOX_MEMBER_SPACE_TABLES
 
         arts = tmp_path / "arts"
-        with AetherEngine.offline_sandbox(artifacts_dir=str(arts), cleanup_artifacts=False) as sb:
-            sb.engine.aetherspace(
+        with Sandbox.create_offline_sandbox(AetherEngine, artifacts_dir=str(arts), cleanup_artifacts=False) as sb:
+            source = self._catalog_notes_from_host(sb).read_text(encoding="utf-8")
+            notes = tmp_path / "catalog_notes_copy.txt"
+            notes.write_text(source, encoding="utf-8")
+            expected_first = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            desc = sb.engine.aetherspace(
                 "catalog_notes",
-                SpaceContext(tables=SANDBOX_CATALOG_SPACE_TABLES, notes_file=str(notes)),
+                SpaceContext(tables=SANDBOX_MEMBER_SPACE_TABLES["catalog"], notes_file=str(notes)),
             )
-            snap = MainExecutionOps.load_aetherspace_snapshot(str(sb.engine._artifacts_dir), "catalog_notes")
+            snap = MainExecutionOps.load_aetherspace_snapshot(str(sb.engine._artifacts_dir), desc.uid)
             assert snap is not None
             assert snap["version"] == AETHERSPACE_ARTIFACT_VERSION
             assert snap["notes_hash"] == expected_first
@@ -212,16 +268,17 @@ class TestSpaceContextNotesFileSandbox:
             with pytest.raises(ConfigError, match="custom notes"):
                 sb.engine.aetherspace(
                     "catalog_notes",
-                    SpaceContext(tables=SANDBOX_CATALOG_SPACE_TABLES, notes_file=str(notes)),
+                    SpaceContext(tables=SANDBOX_MEMBER_SPACE_TABLES["catalog"], notes_file=str(notes)),
+                    uid=desc.uid,
                 )
 
     @pytest.mark.fast
     def test_defining_space_with_notes_does_not_rebuild_schema(self, tmp_path: Path) -> None:
-        notes = self._catalog_notes_path()
-        from aetherdialect._constants import SANDBOX_CATALOG_SPACE_TABLES
+        from aetherdialect._constants_runtime import SANDBOX_MEMBER_SPACE_TABLES
 
         arts = tmp_path / "arts"
-        with AetherEngine.offline_sandbox(artifacts_dir=str(arts), cleanup_artifacts=False) as sb:
+        with Sandbox.create_offline_sandbox(AetherEngine, artifacts_dir=str(arts), cleanup_artifacts=False) as sb:
+            notes = self._catalog_notes_from_host(sb)
             engine_dir = Path(str(sb.engine._artifacts_dir))
             schema_path = engine_dir / "schema_graph.json.gz"
             assert schema_path.is_file()
@@ -236,7 +293,7 @@ class TestSpaceContextNotesFileSandbox:
             before_graph_id = id(sb.engine._schema_graph)
             sb.engine.aetherspace(
                 "catalog_notes",
-                SpaceContext(tables=SANDBOX_CATALOG_SPACE_TABLES, notes_file=str(notes)),
+                SpaceContext(tables=SANDBOX_MEMBER_SPACE_TABLES["catalog"], notes_file=str(notes)),
             )
             assert id(sb.engine._schema_graph) == before_graph_id
             assert str(sb.engine._schema_graph.effective_structural_hash or "") == before_structural

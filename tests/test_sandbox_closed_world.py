@@ -9,14 +9,15 @@ import pytest
 
 from aetherdialect import EngineContext
 from aetherdialect._config import PolicyConfig
-from aetherdialect._contracts_base import ConfigError, RuntimeConfig
+from aetherdialect._contracts_base import ConfigError
+from aetherdialect._contracts_core import RuntimeConfig
 from aetherdialect._llm_provider import SandboxRuntimeState
-from aetherdialect._main_execution import load_runtime_config
 from aetherdialect._sandbox import Sandbox, SandboxFaithfulnessExpectation
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import load_runtime_config
+from tests._sandbox_csv_bundle import write_main_csv_ddl_bundle
 
 _apply_bundled_federation_mappings = Sandbox._apply_bundled_federation_mappings
-_apply_bundled_schema_overrides = Sandbox._apply_bundled_schema_overrides
 _apply_sandbox_consumer_execution_scope = Sandbox._apply_sandbox_consumer_execution_scope
 _resolve_sandbox_fixture_path = Sandbox._resolve_sandbox_fixture_path
 _resolve_sandbox_notes_and_sql = Sandbox._resolve_sandbox_notes_and_sql
@@ -32,7 +33,6 @@ def test_sandbox_trust_baseline_matches_for_engine_and_preset_paths() -> None:
         bundled_notes="/bundle/rental_shop_notes.txt",
         bundled_sql="/bundle/rental_shop.sql",
         deny_columns=None,
-        restricted_consumer=False,
         include="tables",
         engine_context=narrowed,
         notes_file=None,
@@ -43,7 +43,7 @@ def test_sandbox_trust_baseline_matches_for_engine_and_preset_paths() -> None:
 
 @pytest.mark.fast
 def test_narrowed_scope_matches_trust_and_graphs_across_entry_paths(tmp_path: Path) -> None:
-    """Sandbox.engine() and create_preset_engine() must agree on trust flags and scoped graphs."""
+    """Repeated Sandbox.engine() calls with the same scope agree on trust flags and scoped graphs."""
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     _write_minimal_bundle_for_parity(bundle)
@@ -58,8 +58,8 @@ def test_narrowed_scope_matches_trust_and_graphs_across_entry_paths(tmp_path: Pa
             contexts_seen.append(allow)
             self._schema_graph = MagicMock(schema_literal_json="{}")
             self._trust_bundled_baseline = bool(kwargs.get("trust_bundled_baseline", False))
-            from aetherdialect._contracts_base import RuntimeConfig
-            from aetherdialect._main_execution import load_runtime_config
+            from aetherdialect._contracts_core import RuntimeConfig
+            from aetherdialect._utils_artifacts import load_runtime_config
 
             llm_exec = load_runtime_config(merged_env={})
             self._runtime_config = RuntimeConfig(
@@ -79,12 +79,7 @@ def test_narrowed_scope_matches_trust_and_graphs_across_entry_paths(tmp_path: Pa
         with Sandbox(maintainer_access=True, bundle_dir=str(bundle), auto_seed=False) as sandbox:
             sandbox.load_dataset("main")
             sandbox.engine(scope)
-            sandbox.create_preset_engine(
-                FakeEngine,
-                preset="owner_writer",
-                connection=sandbox.connection(),
-                engine_context=scope,
-            )
+            sandbox.engine(scope)
     finally:
         aetherdialect._sandbox.Sandbox._aether_engine_cls = original
 
@@ -94,20 +89,11 @@ def test_narrowed_scope_matches_trust_and_graphs_across_entry_paths(tmp_path: Pa
 
 
 def _write_minimal_bundle_for_parity(root: Path) -> None:
-    (root / "rental_shop_seed.sql").write_text(
-        "\n".join(
-            (
-                "CREATE TABLE customer (customer_id INTEGER PRIMARY KEY);",
-                "CREATE TABLE film (film_id INTEGER PRIMARY KEY);",
-            ),
-        ),
-        encoding="utf-8",
-    )
-    (root / "rental_shop.sql").write_text("SELECT 1;", encoding="utf-8")
-    (root / "rental_shop_notes.txt").write_text("catalog notes", encoding="utf-8")
-    fixtures = root / "fixtures"
-    fixtures.mkdir()
-    (fixtures / "rental_shop_mock.json").write_text('{"fixtures": []}', encoding="utf-8")
+    write_main_csv_ddl_bundle(root)
+
+
+def _write_minimal_bundle(root: Path) -> None:
+    write_main_csv_ddl_bundle(root)
 
 
 @pytest.mark.fast
@@ -133,22 +119,23 @@ def test_consumer_scope_honours_user_subset() -> None:
         engine_context=EngineContext(allow_objects=frozenset({"film", "customer"})),
         llm_execution=load_runtime_config(merged_env={}),
     )
-    Sandbox._apply_sandbox_consumer_execution_scope(owner)
+    Sandbox._apply_sandbox_consumer_execution_scope(owner, allow_objects=frozenset({"film", "customer"}))
     assert owner._runtime_config.execution_context.allow_objects == frozenset({"film", "customer"})
     assert owner._consumer_visible_objects == frozenset({"film", "customer"})
 
 
 @pytest.mark.fast
-def test_consumer_scope_refuses_outside_owner() -> None:
+def test_consumer_scope_noop_without_explicit_allow_objects() -> None:
+    """No caller-supplied allow_objects means the reapply step is a no- op (nothing to override)."""
     owner = MagicMock()
     owner._runtime_config = RuntimeConfig(
         engine="postgresql",
         artifacts_dir="/tmp/sandbox",
-        engine_context=EngineContext(allow_objects=frozenset({"not_a_table"})),
+        engine_context=EngineContext(allow_objects=frozenset({"film", "customer"})),
         llm_execution=load_runtime_config(merged_env={}),
     )
-    with pytest.raises(ConfigError, match="exceed sandbox owner scope"):
-        Sandbox._apply_sandbox_consumer_execution_scope(owner)
+    Sandbox._apply_sandbox_consumer_execution_scope(owner)
+    assert owner._runtime_config.execution_context is None
 
 
 @pytest.mark.fast
@@ -162,11 +149,38 @@ def test_resolve_bundled_fixture_alias_notes(tmp_path: Path) -> None:
 
 
 @pytest.mark.fast
-def test_resolve_bundled_fixture_existing_path_unchanged(tmp_path: Path) -> None:
+def test_resolve_bundled_fixture_rejects_absolute_path(tmp_path: Path) -> None:
+    notes = tmp_path / "rental_shop_notes.txt"
+    notes.write_text("catalog notes", encoding="utf-8")
+    resolved, notice = Sandbox._resolve_sandbox_fixture_path(tmp_path, str(notes))
+    assert resolved is None
+    assert notice is None
+
+
+@pytest.mark.fast
+def test_resolve_bundled_fixture_rejects_parent_traversal(tmp_path: Path) -> None:
+    notes = tmp_path / "rental_shop_notes.txt"
+    notes.write_text("catalog notes", encoding="utf-8")
+    resolved, notice = Sandbox._resolve_sandbox_fixture_path(tmp_path, "../rental_shop_notes.txt")
+    assert resolved is None
+    assert notice is None
+
+
+@pytest.mark.fast
+def test_resolve_bundled_fixture_rejects_unknown_basename(tmp_path: Path) -> None:
     custom = tmp_path / "custom_notes.txt"
     custom.write_text("custom", encoding="utf-8")
-    resolved, notice = Sandbox._resolve_sandbox_fixture_path(tmp_path, str(custom))
-    assert resolved == str(custom)
+    resolved, notice = Sandbox._resolve_sandbox_fixture_path(tmp_path, "custom_notes.txt")
+    assert resolved is None
+    assert notice is None
+
+
+@pytest.mark.fast
+def test_resolve_bundled_fixture_existing_path_unchanged(tmp_path: Path) -> None:
+    notes = tmp_path / "rental_shop_notes.txt"
+    notes.write_text("catalog notes", encoding="utf-8")
+    resolved, notice = Sandbox._resolve_sandbox_fixture_path(tmp_path, "rental_shop_notes.txt")
+    assert resolved == str(notes)
     assert notice is None
 
 
@@ -189,45 +203,20 @@ def test_resolve_sandbox_notes_and_sql_applies_fixture_aliases(tmp_path: Path) -
     assert notices
 
 
-def _write_minimal_bundle(root: Path) -> None:
-    (root / "rental_shop_seed.sql").write_text(
-        "\n".join(
-            (
-                "CREATE TABLE customer (customer_id INTEGER PRIMARY KEY);",
-                "CREATE TABLE film (film_id INTEGER PRIMARY KEY);",
-            ),
-        ),
-        encoding="utf-8",
-    )
-    (root / "rental_shop.sql").write_text("SELECT 1;", encoding="utf-8")
-    (root / "rental_shop_notes.txt").write_text("catalog notes", encoding="utf-8")
-    fixtures = root / "fixtures"
-    fixtures.mkdir()
-    (fixtures / "rental_shop_mock.json").write_text('{"fixtures": []}', encoding="utf-8")
-
-
-@pytest.mark.fast
-def test_offline_sandbox_rejects_preset_kwarg() -> None:
-    from aetherdialect import AetherEngine
-
-    with pytest.raises(TypeError, match="preset"):
-        AetherEngine.offline_sandbox(preset="consumer_reader")
-
-
 @pytest.mark.fast
 def test_create_offline_sandbox_rejects_preset_kwarg() -> None:
-    from aetherdialect import AetherEngine
+    from aetherdialect import AetherEngine, Sandbox
 
     with pytest.raises(TypeError, match="preset"):
         Sandbox.create_offline_sandbox(AetherEngine, preset="consumer_reader")
 
 
 @pytest.mark.fast
-def test_offline_sandbox_rejects_restricted_consumer_kwarg() -> None:
-    from aetherdialect import AetherEngine
+def test_create_offline_sandbox_rejects_restricted_consumer_kwarg() -> None:
+    from aetherdialect import AetherEngine, Sandbox
 
     with pytest.raises(TypeError, match="restricted_consumer"):
-        AetherEngine.offline_sandbox(restricted_consumer=True)
+        Sandbox.create_offline_sandbox(AetherEngine, restricted_consumer=True)
 
 
 @pytest.mark.fast
@@ -293,12 +282,43 @@ def test_sandbox_rejects_data_zip_override_without_maintainer_access(
 
 
 @pytest.mark.fast
-def test_sandbox_default_llm_mode_is_mock(tmp_path: Path) -> None:
+def test_sandbox_default_llm_mode_is_sandbox(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     _write_minimal_bundle(bundle)
     with Sandbox(maintainer_access=True, bundle_dir=str(bundle), auto_seed=False) as sandbox:
-        assert sandbox.llm_mode == "mock"
+        assert sandbox.llm_mode == "sandbox"
+        assert sandbox.uses_network is False
+
+
+@pytest.mark.fast
+def test_sandbox_default_toml_uses_sandbox_provider(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    _write_minimal_bundle(bundle)
+    with Sandbox(maintainer_access=True, bundle_dir=str(bundle), auto_seed=False) as sandbox:
+        config_path = sandbox.config_file
+        assert config_path is not None
+        text = Path(config_path).read_text(encoding="utf-8")
+        assert 'provider = "sandbox"' in text
+        assert "[sandbox]" in text
+        assert "[mock]" not in text
+
+
+@pytest.mark.fast
+def test_sandbox_mock_provider_synonym_is_offline(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    _write_minimal_bundle(bundle)
+    config = tmp_path / "mock_provider_synonym.toml"
+    config.write_text('[llm]\nprovider = "mock"\n', encoding="utf-8")
+    with Sandbox(
+        maintainer_access=True,
+        bundle_dir=str(bundle),
+        auto_seed=False,
+        llm_config=str(config),
+    ) as sandbox:
+        assert sandbox.llm_mode == "sandbox"
         assert sandbox.uses_network is False
 
 
@@ -446,15 +466,14 @@ def test_sandbox_context_manager_closes_and_cleans_up(tmp_path: Path) -> None:
 
 
 @pytest.mark.fast
-def test_apply_bundled_schema_overrides_leaves_cwd_unchanged(
+def test_stage_demo_schema_structure_leaves_cwd_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from aetherdialect._constants import SCHEMA_OVERRIDES_DEFAULT_FILENAME
-
     bundle = tmp_path / "bundle"
     bundle.mkdir()
-    (bundle / "schema_overrides_demo.json").write_text("{}", encoding="utf-8")
+    _write_minimal_bundle(bundle)
+    (bundle / "schema_structure_demo.json").write_text('{"tables": {}}', encoding="utf-8")
     work = tmp_path / "work"
     work.mkdir()
     monkeypatch.chdir(work)
@@ -462,14 +481,10 @@ def test_apply_bundled_schema_overrides_leaves_cwd_unchanged(
     engine = MagicMock()
     engine._artifacts_dir = str(tmp_path / "artifacts")
     Path(engine._artifacts_dir).mkdir()
-    monkeypatch.setattr(
-        "aetherdialect._sandbox.Sandbox._open_data_bundle",
-        lambda **kwargs: type("Access", (), {"path": bundle, "owns_cleanup": False})(),
-    )
-    Sandbox._apply_bundled_schema_overrides(engine, None)
+    with Sandbox(maintainer_access=True, bundle_dir=str(bundle), auto_seed=False):
+        Sandbox._stage_demo_schema_structure(engine, bundle)
     after = {p.name for p in work.iterdir()}
-    applied = Path(engine._artifacts_dir) / SCHEMA_OVERRIDES_DEFAULT_FILENAME
-    assert applied.is_file()
+    engine.apply_structure.assert_called_once()
     assert after == before
 
 
@@ -495,3 +510,18 @@ def test_federation_mapping_demo_leaves_cwd_unchanged(
     after = {p.name for p in work.iterdir()}
     assert (Path(engine._artifacts_dir) / FEDERATION_DECLARATION_FILENAME).is_file()
     assert after == before
+
+
+@pytest.mark.fast
+def test_docs_do_not_recommend_mock_provider_default() -> None:
+    docs_dir = Path(__file__).resolve().parents[1] / "docs"
+    offenders: list[str] = []
+    for path in sorted(docs_dir.glob("*.md")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if 'provider = "mock"' not in stripped:
+                continue
+            if "synonym" in line.lower():
+                continue
+            offenders.append(f"{path.name}: {stripped}")
+    assert offenders == []

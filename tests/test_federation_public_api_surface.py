@@ -2,20 +2,19 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from aetherdialect import AetherEngine, AetherFederation, MigrationPreview
-from aetherdialect._constants import FEDERATION_DECLARATION_FILENAME, FEDERATION_DECLARATION_VERSION
-from aetherdialect._contracts_base import FederationDeclarationError, FederationMappings
-from aetherdialect._federation import (
+from aetherdialect._constants import FEDERATION_DECLARATION_VERSION
+from aetherdialect._contracts_base import FederationDeclarationError
+from aetherdialect._contracts_schema import FederationMappings
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
     binding_from_member_engine,
-    compose_composite_graph,
     federation_declaration_document,
-    load_federation_declaration_from_path,
     parse_federation_declaration,
     parse_federation_manifest,
     parse_federation_mappings,
@@ -29,7 +28,7 @@ from tests.test_aether_federation_public_surface import (
 )
 
 _MAPPINGS_PAYLOAD = {
-    "version": "0.2.1",
+    "version": "0.2.3",
     "logical_tables": [],
     "logical_columns": [],
 }
@@ -63,29 +62,30 @@ def test_aether_engine_connection_parameter_sets_handle() -> None:
 @pytest.mark.fast
 def test_binding_error_explains_source_id_vs_connection() -> None:
     member = _minimal_member(connection="storefront")
-    member._connection = "storefront_pg"
-    with pytest.raises(Exception, match="source_id") as exc:
-        binding_from_member_engine("storefront", member)
-    msg = str(exc.value)
-    assert "connection" in msg.lower() or "storefront_pg" in msg
+    member._named_connection = None
+    member._connection = None
+    member._connection_mapping = None
+    with pytest.raises(Exception, match="connection name"):
+        binding_from_member_engine(member)
 
 
 @pytest.mark.fast
-def test_federation_member_key_is_source_id_not_toml_connection() -> None:
+def test_federation_member_key_is_named_connection() -> None:
     member = _minimal_member(connection="storefront")
     member._named_connection = "storefront_pg"
     member._connection = "storefront"
-    binding = binding_from_member_engine("storefront", member)
-    assert binding.source_id == "storefront"
+    binding = binding_from_member_engine(member)
+    assert binding.source_id == "storefront_pg"
     assert binding.connection == "storefront_pg"
 
 
 @pytest.mark.fast
-def test_apply_federation_declaration_is_public() -> None:
-    assert hasattr(AetherFederation, "apply_federation_declaration")
+def test_apply_federation_is_public() -> None:
+    assert hasattr(AetherFederation, "apply_federation")
+    assert callable(AetherFederation.apply_federation)
 
 
-def test_apply_federation_declaration_applies_manifest_sections(
+def test_apply_federation_applies_manifest_sections(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -99,32 +99,24 @@ def test_apply_federation_declaration_applies_manifest_sections(
     with patch("aetherdialect.aetherdialect.initialize_aether_federation", return_value=bundle):
         fed = AetherFederation(
             "fed_public",
-            members={"a": _minimal_member(connection="a"), "b": _minimal_member(connection="b")},
-            declaration_file=str(declaration_path),
+            members=[_minimal_member(connection="a"), _minimal_member(connection="b")],
+            declaration=str(declaration_path),
         )
-    editor = Path(fed._artifacts_dir) / FEDERATION_DECLARATION_FILENAME
-    editor.parent.mkdir(parents=True, exist_ok=True)
     edited = dict(_MANIFEST)
     edited["cross_source_joins"] = [
         {"left": "left_t.id", "right": "right_t.id", "kind": "left", "logical_key": "id"},
     ]
-    editor.write_text(
-        json.dumps(
-            {
-                "version": FEDERATION_DECLARATION_VERSION,
-                **edited,
-                "logical_columns": [],
-                "logical_tables": _MAPPINGS_PAYLOAD["logical_tables"],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    document = {
+        "version": FEDERATION_DECLARATION_VERSION,
+        **edited,
+        "logical_columns": [],
+        "logical_tables": _MAPPINGS_PAYLOAD["logical_tables"],
+    }
     with patch.object(AetherFederation, "_recompose") as recompose:
-        fed.apply_federation_declaration()
+        fed.apply_federation(document)
     recompose.assert_called_once()
-    manifest, _ = load_federation_declaration_from_path(fed._declaration_file)
-    assert manifest.cross_source_joins[0].kind == "left"
+    assert fed._declaration_parsed is not None
+    assert fed._declaration_parsed[0].cross_source_joins[0].kind == "left"
 
 
 @pytest.mark.fast
@@ -143,7 +135,7 @@ def test_parse_federation_mappings_rejects_unknown_version() -> None:
 @pytest.mark.fast
 def test_export_declaration_round_trips_empty_logical_sections() -> None:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     doc = federation_declaration_document(manifest, mappings)
     assert "logical_columns" in doc
     assert "logical_tables" in doc
@@ -157,14 +149,14 @@ def test_export_declaration_round_trips_empty_logical_sections() -> None:
 def test_export_union_omits_empty_authoritative_source() -> None:
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     mappings = FederationMappings(
-        version="0.2.1",
+        version="0.2.3",
         logical_tables=(
-            __import__("aetherdialect._contracts_base", fromlist=["LogicalTableMapping"]).LogicalTableMapping(
+            __import__("aetherdialect._contracts_schema", fromlist=["LogicalTableMapping"]).LogicalTableMapping(
                 logical="payment",
                 semantics="union",
                 authoritative_source="",
                 members=(
-                    __import__("aetherdialect._contracts_base", fromlist=["LogicalTableMember"]).LogicalTableMember(
+                    __import__("aetherdialect._contracts_schema", fromlist=["LogicalTableMember"]).LogicalTableMember(
                         source="a", table="t", columns={"id": "id"}
                     ),
                 ),
@@ -244,7 +236,7 @@ def test_constructor_accepts_source_selections() -> None:
 def test_aether_federation_apply_migration_map_is_documented() -> None:
     method = AetherFederation.apply_migration_map
     assert method.__doc__ is not None
-    assert "federation_migration_map" in method.__doc__
+    assert "migration map" in method.__doc__.lower()
 
 
 @pytest.mark.fast
@@ -254,7 +246,7 @@ def test_aether_engine_preview_migration_map_returns_migration_preview() -> None
             tier="compatible",
             affected_tables=(),
             affected_columns=(),
-            skeleton_path="",
+            skeleton_document={},
         )
         with patch("aetherdialect.aetherdialect.initialize_aether_engine") as init:
             init.return_value = MagicMock(
@@ -275,4 +267,5 @@ def test_aether_engine_preview_migration_map_returns_migration_preview() -> None
             )
             engine = AetherEngine()
         result = engine.preview_migration_map()
-    assert isinstance(result, MigrationPreview)
+        assert isinstance(result, MigrationPreview)
+        assert result.tier == "compatible"

@@ -9,7 +9,7 @@ import pytest
 from aetherdialect._constants import DIAGNOSTIC_CODE_CANCEL_NOT_SUPPORTED
 from aetherdialect._contracts_base import FederationTurnCancelledError, SessionTurnCancelledError
 from aetherdialect._dialect import Dialect
-from aetherdialect._pipeline import _raise_federation_turn_cancelled
+from aetherdialect._pipeline_execute import _raise_federation_turn_cancelled
 
 
 @pytest.mark.fast
@@ -35,14 +35,14 @@ def test_unsupported_cancel_reports() -> None:
 
 @pytest.mark.fast
 def test_cancelled_turn_reports_cancelled_not_failed() -> None:
-    from aetherdialect._main_execution import PipelineSession
+    from aetherdialect._main_session import PipelineSession
 
     owner = MagicMock()
     owner._runtime_config = MagicMock()
     owner._runtime_config.llm_execution = MagicMock()
     owner._artifacts_dir = None
     owner._pipeline_writer_lock = None
-    owner._ask_phase_callback = None
+    owner._phase_callback = None
     owner._active_space_name = "master"
     owner.dialect = "duckdb"
     owner._runtime_config = owner._runtime_config
@@ -52,27 +52,26 @@ def test_cancelled_turn_reports_cancelled_not_failed() -> None:
     session._turn_llm_scope_tok = None
     with (
         patch(
-            "aetherdialect._main_execution.MainExecutionOps.interactive_run_once",
+            "aetherdialect._main_init.MainInitOps.interactive_run_once",
             side_effect=SessionTurnCancelledError("Turn cancelled."),
         ),
-        patch("aetherdialect._main_execution.push_session_turn_cancel"),
-        patch("aetherdialect._main_execution.pop_session_turn_cancel"),
-        patch("aetherdialect._main_execution.push_ask_phase_callback"),
-        patch("aetherdialect._main_execution.pop_ask_phase_callback"),
-        patch("aetherdialect._main_execution.llm_usage_session_scope"),
-        patch("aetherdialect._main_execution.snapshot_llm_usage_records", return_value=[]),
+        patch("aetherdialect._utils.push_session_turn_cancel"),
+        patch("aetherdialect._utils.pop_session_turn_cancel"),
+        patch("aetherdialect._utils.push_ask_phase_callback"),
+        patch("aetherdialect._utils.pop_ask_phase_callback"),
+        patch("aetherdialect._utils.llm_usage_session_scope"),
+        patch("aetherdialect._utils.snapshot_llm_usage_records", return_value=[]),
         patch.object(session, "_resources", return_value=(None, {}, {}, [], {})),
         patch.object(session, "_owner_engine_identity", return_value=MagicMock()),
-        patch("aetherdialect._main_execution.push_engine_identity"),
-        patch("aetherdialect._main_execution.pop_engine_identity"),
-        patch("aetherdialect._main_execution.push_engine_limits"),
-        patch("aetherdialect._main_execution.pop_engine_limits"),
+        patch("aetherdialect._utils.push_engine_identity"),
+        patch("aetherdialect._utils.pop_engine_identity"),
+        patch("aetherdialect._utils.owner_limits_scope"),
     ):
         step = session._drive_question_turn("how many rows?")
 
     assert step.done is True
-    assert step.status == "cancelled"
-    assert step.status != "execution_other_error"
+    assert step.error is not None
+    assert step.error.code.value == "cancelled"
 
 
 @pytest.mark.fast
@@ -80,8 +79,8 @@ def test_federation_cancel_path_uses_cancel_helper() -> None:
     dialect = MagicMock()
     dialect.supports_statement_cancellation = True
     with (
-        patch("aetherdialect._pipeline.Dialect.cancel_in_flight_statement") as cancel_mock,
-        patch("aetherdialect._pipeline.notify"),
+        patch("aetherdialect._dialect.Dialect.cancel_in_flight_statement") as cancel_mock,
+        patch("aetherdialect._pipeline_execute.notify"),
         pytest.raises(FederationTurnCancelledError),
     ):
         _raise_federation_turn_cancelled(

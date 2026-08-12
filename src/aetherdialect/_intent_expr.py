@@ -6,7 +6,6 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
-from datetime import UTC, datetime
 from typing import Any, TypeVar, cast
 
 import jsonschema
@@ -16,10 +15,10 @@ from sqlglot import exp
 from ._config import PolicyConfig
 from ._constants import (
     AGGREGATE_FUNCTION_NAMES,
+    AGGREGATION_FUNCTION_NAMES_ORDERED,
+    ARITHMETIC_ROLES,
     AST_AGG_NODE_TO_NAME,
     CTE_DEFAULT_AGGS,
-    CTE_FULL_AGGS,
-    CTE_HAVING_COMPARE_OPS,
     CTE_NUMERIC_WHERE_OPS,
     CTE_OUTPUT_ALIAS_RE,
     DATE_INTERVAL_EXPR_SUBSTRINGS,
@@ -28,57 +27,66 @@ from ._constants import (
     IN_OPS,
     IN_STRING_SEPARATORS,
     INTEGER_SCALARS,
-    INTENT_SCHEMA,
-    INTERPRET_PLAN_SCHEMA,
-    LOGICAL_INTENT_SCHEMA,
+    NUMERIC_COMPARE_OPS_ORDERED,
     NUMERIC_RESULT_AGGS,
     NUMERIC_RESULT_SCALARS,
-    PLANNER_PROSE_FIELDS,
     REGISTRY_TOKEN_PATTERN,
     SCALAR_FUNC_DEFAULTS,
     SCALAR_FUNCTIONS_LEADING_ARG,
-    SQL_AGG_FUNC_CALL_RE,
     SQLGLOT_AGG_FUNC_KEY_ALIASES,
+    VALID_AGGREGATION_FUNCTIONS,
+    VALID_SCALAR_FUNCTIONS,
+)
+from ._constants_runtime import (
+    INTENT_SCHEMA,
+    INTERPRET_PLAN_SCHEMA,
+    INTERPRET_PROSE_FIELDS,
+    LOGICAL_INTENT_SCHEMA,
 )
 from ._contracts_base import (
     ConfigError,
     CteEmissionKind,
-    CteIntent,
     ExprValue,
     FailureCategory,
     HavingParam,
-    LogicalIntent,
     MulGroup,
     NormalizedExpr,
     OrderByCol,
     OrderByNullPlacement,
     PredicateGroup,
     RawValue,
+    SensitivityClassification,
     WhereParam,
 )
 from ._contracts_core import (
     ConcreteIntent,
-    FeedbackKind,
     InterpretPlan,
-    RejectionBucket,
     RuntimeCteStep,
     RuntimeIntent,
     SelectCol,
-    Template,
 )
 from ._contracts_schema import (
     CaseRegistryStep,
     CaseWhenBranch,
     CaseWhenExpr,
+    ColumnMetadata,
+    CteIntent,
     CteOutputColumnMeta,
     IntentIssue,
+    LogicalIntent,
     SchemaGraph,
     VirtualColumnSpec,
     VirtualTableSpec,
     WindowRegistryStep,
     WindowSpec,
 )
-from ._core_utils import debug, is_structural_param_key, normalize_op, safe_json_loads, stable_json
+from ._utils import (
+    debug,
+    is_structural_param_key,
+    join_signature_tables,
+    safe_json_loads,
+    stable_json,
+)
 
 
 def _is_date_or_interval_expr(s: str) -> bool:
@@ -312,7 +320,7 @@ def _ast_literal_value(node: exp.Expression) -> int | float | str | None:
 
 
 def _ast_render_token(node: exp.Expression) -> str:
-    """Render a column/star/identifier node into the legacy ``table.column`` token form."""
+    """Render a column/star/identifier node into the ``table.column`` token form."""
     node = _ast_unwrap_paren(node)
     if isinstance(node, exp.Column):
         table = node.table
@@ -807,8 +815,8 @@ def tag_expr_numeric(intent: RuntimeIntent, schema: SchemaGraph) -> RuntimeInten
                 select_cols=cte_sc,
                 order_by_cols=cte_obc,
                 group_by_cols=cte_gb,
-                where=PredicateGroup.from_list(cte_fp),
-                having=PredicateGroup.from_list(cte_hp),
+                where=PredicateGroup.rebuild_from_leaves(cte.where, cte_fp),
+                having=PredicateGroup.rebuild_from_leaves(cte.having, cte_hp),
             )
         )
     return replace(
@@ -816,8 +824,8 @@ def tag_expr_numeric(intent: RuntimeIntent, schema: SchemaGraph) -> RuntimeInten
         select_cols=select_cols,
         order_by_cols=order_by_cols,
         group_by_cols=group_by_cols,
-        where=PredicateGroup.from_list(where_params),
-        having=PredicateGroup.from_list(having_param),
+        where=PredicateGroup.rebuild_from_leaves(intent.where, where_params),
+        having=PredicateGroup.rebuild_from_leaves(intent.having, having_param),
         cte_steps=cte_steps,
     )
 
@@ -974,8 +982,8 @@ def build_cte_output_metadata(
                     value_type=value_type,
                     groupable=False,
                     valid_where_ops=list(CTE_NUMERIC_WHERE_OPS),
-                    valid_aggregations=list(CTE_FULL_AGGS),
-                    valid_having_ops=list(CTE_HAVING_COMPARE_OPS),
+                    valid_aggregations=list(AGGREGATION_FUNCTION_NAMES_ORDERED),
+                    valid_having_ops=list(NUMERIC_COMPARE_OPS_ORDERED),
                     sensitivity=None,
                 )
                 continue
@@ -999,7 +1007,7 @@ def build_cte_output_metadata(
             groupable = src_meta.is_groupable if src_meta else True
             vf_ops = list(src_meta.get_valid_where_ops()) if src_meta else list(CTE_NUMERIC_WHERE_OPS)
             v_aggs = sorted(src_meta.get_valid_aggregations()) if src_meta else list(CTE_DEFAULT_AGGS)
-            vh_ops = list(src_meta.get_valid_having_ops()) if src_meta else list(CTE_HAVING_COMPARE_OPS)
+            vh_ops = list(src_meta.get_valid_having_ops()) if src_meta else list(NUMERIC_COMPARE_OPS_ORDERED)
             out_sensitivity = src_meta.sensitivity.value if src_meta else None
         elif kind == "aggregation":
             role = "numeric_measure"
@@ -1015,8 +1023,8 @@ def build_cte_output_metadata(
             aggregatable = True
             groupable = False
             vf_ops = list(CTE_NUMERIC_WHERE_OPS)
-            v_aggs = list(CTE_FULL_AGGS)
-            vh_ops = list(CTE_HAVING_COMPARE_OPS)
+            v_aggs = list(AGGREGATION_FUNCTION_NAMES_ORDERED)
+            vh_ops = list(NUMERIC_COMPARE_OPS_ORDERED)
             out_sensitivity = None
         elif kind == "scalar":
             if scalar in NUMERIC_RESULT_SCALARS:
@@ -1025,8 +1033,8 @@ def build_cte_output_metadata(
                 aggregatable = True
                 groupable = False
                 vf_ops = list(CTE_NUMERIC_WHERE_OPS)
-                v_aggs = list(CTE_FULL_AGGS)
-                vh_ops = list(CTE_HAVING_COMPARE_OPS)
+                v_aggs = list(AGGREGATION_FUNCTION_NAMES_ORDERED)
+                vh_ops = list(NUMERIC_COMPARE_OPS_ORDERED)
                 out_sensitivity = None
             else:
                 role = src_meta.role if src_meta else None
@@ -1035,7 +1043,7 @@ def build_cte_output_metadata(
                 groupable = src_meta.is_groupable if src_meta else True
                 vf_ops = list(src_meta.get_valid_where_ops()) if src_meta else list(CTE_NUMERIC_WHERE_OPS)
                 v_aggs = sorted(src_meta.get_valid_aggregations()) if src_meta else list(CTE_DEFAULT_AGGS)
-                vh_ops = list(src_meta.get_valid_having_ops()) if src_meta else list(CTE_HAVING_COMPARE_OPS)
+                vh_ops = list(src_meta.get_valid_having_ops()) if src_meta else list(NUMERIC_COMPARE_OPS_ORDERED)
                 out_sensitivity = src_meta.sensitivity.value if src_meta else None
             filterable = True
         else:
@@ -1045,8 +1053,8 @@ def build_cte_output_metadata(
             aggregatable = True
             groupable = False
             vf_ops = list(CTE_NUMERIC_WHERE_OPS)
-            v_aggs = list(CTE_FULL_AGGS)
-            vh_ops = list(CTE_HAVING_COMPARE_OPS)
+            v_aggs = list(AGGREGATION_FUNCTION_NAMES_ORDERED)
+            vh_ops = list(NUMERIC_COMPARE_OPS_ORDERED)
             out_sensitivity = None
         lineage_phys_table: str | None = None
         lineage_phys_column: str | None = None
@@ -1091,7 +1099,7 @@ def build_cte_output_metadata(
 
 
 def build_virtual_table_specs(intent: RuntimeIntent, schema: SchemaGraph | None) -> dict[str, VirtualTableSpec]:
-    """Build join-graph virtual nodes for each CTE that exposes output. column metadata. Args: intent: Runtime intent including ``cte_steps`` with ``output_column_metadata``. schema: Physical schema (unused today; reserved for cross-checks). Returns: Map ``cte_name -> VirtualTableSpec`` for CTEs with at least one output column."""
+    """Build join-graph virtual nodes for each CTE that exposes output. column metadata. Args: intent: Runtime intent including ``cte_steps`` with ``output_column_metadata``. schema: Physical schema; when None, return an empty map. Returns: Map ``cte_name -> VirtualTableSpec`` for CTEs with at least one output column."""
     if schema is None:
         return {}
     out: dict[str, VirtualTableSpec] = {}
@@ -1202,88 +1210,6 @@ def _order_by_col_from_obc(obc: dict[str, Any]) -> OrderByCol:
     )
 
 
-def _coerce_where_group_token(x: Any) -> int | None:
-    if x is None:
-        return None
-    if isinstance(x, bool):
-        return None
-    if isinstance(x, int):
-        return x
-    if isinstance(x, float) and x.is_integer():
-        return int(x)
-    if isinstance(x, str) and x.strip():
-        t = x.strip()
-        if t.lstrip("-").isdigit():
-            return int(t)
-    return None
-
-
-def _where_group_for_param(raw: Any) -> int | None:
-    return _coerce_where_group_token(raw)
-
-
-def _parse_where_param_from_llm(fp: dict[str, Any]) -> list[WhereParam]:
-    """
-    Parse one LLM filter object into at most one ``WhereParam`` row.
-
-    Args:
-
-        fp: Raw filter dict.
-
-    Returns:
-
-        Zero or one param; empty when ``left_expr`` is missing.
-    """
-    left_str = fp.get("left_expr") or fp.get("left_col") or ""
-    if not left_str:
-        return []
-    right_str = fp.get("right_expr") or fp.get("right_col") or ""
-    if right_str and "." not in right_str and not _is_date_or_interval_expr(right_str):
-        right_str = ""
-    left_ex = parse_expr_string(left_str)
-    op = normalize_op(fp.get("op", "="))
-    right_ex = parse_expr_string(right_str) if right_str else None
-    vt = fp.get("value_type", "string")
-    raw_v = fp.get("value")
-    if right_ex is None and raw_v is not None and not isinstance(raw_v, (list, dict)):
-        promoted = _bound_value_to_right_expr(raw_v)
-        if promoted is not None:
-            right_ex = promoted
-            raw_v = None
-    return [WhereParam(left_expr=left_ex, op=op, right_expr=right_ex, value_type=vt, param_key="", raw_value=raw_v)]
-
-
-def _parse_having_param_from_llm(hp: dict[str, Any]) -> list[HavingParam]:
-    """
-    Parse one LLM having object into at most one ``HavingParam`` row.
-
-    Args:
-
-        hp: Raw having dict.
-
-    Returns:
-
-        Zero or one param; empty when ``left_expr`` is missing.
-    """
-    left_str = hp.get("left_expr") or hp.get("left_agg") or ""
-    if not left_str:
-        return []
-    right_str = hp.get("right_expr") or hp.get("right_agg") or ""
-    if right_str and "." not in right_str and not _is_date_or_interval_expr(right_str):
-        right_str = ""
-    left_ex = parse_expr_string(left_str)
-    op = normalize_op(hp.get("op", ">"))
-    right_ex = parse_expr_string(right_str) if right_str else None
-    vt = hp.get("value_type", "integer")
-    raw_v = hp.get("value")
-    if right_ex is None and raw_v is not None and not isinstance(raw_v, (list, dict)):
-        promoted = _bound_value_to_right_expr(raw_v)
-        if promoted is not None:
-            right_ex = promoted
-            raw_v = None
-    return [HavingParam(left_expr=left_ex, op=op, right_expr=right_ex, value_type=vt, param_key="", raw_value=raw_v)]
-
-
 def _parse_select_col_from_llm(sc: dict[str, Any]) -> SelectCol:
     """
     Parse select-col dict with ``expr`` string or object.
@@ -1370,52 +1296,60 @@ def _canonicalise_cte_output_columns(intent_dict: dict[str, Any]) -> None:
         cte["output_columns"] = new_oc
 
 
-def _legacy_where_group_raw(item: Mapping[str, Any]) -> Any:
-    if "where_group" in item:
-        return item["where_group"]
-    return None
-
-
-def _sanitize_where_having_param_item(item: dict[str, Any]) -> None:
-    """Coerce compose JSON where/having rows so they pass ``INTENT_SCHEMA`` validation."""
-    if item.get("bool_op") is None:
-        item.pop("bool_op", None)
-    wg_raw = _legacy_where_group_raw(item)
-    if isinstance(wg_raw, list | tuple):
-        wg_coerced = _where_group_for_param(wg_raw[0] if wg_raw else None)
-        if wg_coerced is not None:
-            item["where_group"] = wg_coerced
-        else:
-            item.pop("where_group", None)
-    elif wg_raw is None:
-        item.pop("where_group", None)
-    for key in ("left_expr", "right_expr", "left_agg", "right_agg"):
-        val = item.get(key)
-        if isinstance(val, dict):
-            expr_text = val.get("expr", "")
-            if isinstance(expr_text, str) and expr_text.strip():
-                item[key] = expr_text.strip()
-            else:
-                item.pop(key, None)
-        elif isinstance(val, str) and val.strip() and SQL_AGG_FUNC_CALL_RE.search(val):
-            parsed = parse_expr_string(val)
-            if parsed.agg_func or parsed.add_groups or parsed.sub_groups:
-                item[key] = val.strip()
-
-
 def _sanitize_compose_intent_json(parsed: dict[str, Any]) -> None:
     """Normalize compose intent JSON in place before ``INTENT_SCHEMA`` validation."""
-    for key in ("where_param", "having_param"):
-        for item in parsed.get(key, []) or []:
-            if isinstance(item, dict):
-                _sanitize_where_having_param_item(item)
+    props = INTENT_SCHEMA.get("properties")
+    allowed_root = set(props.keys()) if isinstance(props, dict) else set()
+    for key in list(parsed.keys()):
+        if key not in allowed_root:
+            parsed.pop(key, None)
+    nl = parsed.get("natural_language")
+    if nl is None:
+        parsed["natural_language"] = ""
+    elif not isinstance(nl, str):
+        parsed["natural_language"] = str(nl)
+    _sanitize_order_by_cols_json(parsed.get("order_by_cols"))
+    _sanitize_window_registry_json(parsed.get("window_registry"))
+    cte_steps_schema = props.get("cte_steps") if isinstance(props, dict) else None
+    cte_items = cte_steps_schema.get("items") if isinstance(cte_steps_schema, dict) else None
+    cte_props = cte_items.get("properties") if isinstance(cte_items, dict) else None
+    allowed_cte = set(cte_props.keys()) if isinstance(cte_props, dict) else set()
     for cte in parsed.get("cte_steps", []) or []:
         if not isinstance(cte, dict):
             continue
-        for key in ("where_param", "having_param"):
-            for item in cte.get(key, []) or []:
-                if isinstance(item, dict):
-                    _sanitize_where_having_param_item(item)
+        for key in list(cte.keys()):
+            if allowed_cte and key not in allowed_cte:
+                cte.pop(key, None)
+        _sanitize_order_by_cols_json(cte.get("order_by_cols"))
+        _sanitize_window_registry_json(cte.get("window_registry"))
+
+
+def _sanitize_order_by_cols_json(rows: Any) -> None:
+    """Coerce null direction values on compose order_by rows before schema validation."""
+    if not isinstance(rows, list):
+        return
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        direction = item.get("direction")
+        if direction is None or (isinstance(direction, str) and not direction.strip()):
+            item["direction"] = "ASC"
+
+
+def _sanitize_window_registry_json(rows: Any) -> None:
+    """Coerce null window function names on compose window_registry rows."""
+    if not isinstance(rows, list):
+        return
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        ws = item.get("window_spec")
+        if not isinstance(ws, dict):
+            continue
+        fn = ws.get("function")
+        if fn is None or (isinstance(fn, str) and not fn.strip()):
+            ws["function"] = "row_number"
+        _sanitize_order_by_cols_json(ws.get("order_by"))
 
 
 def _intent_schema_validation_error(parsed: dict[str, Any]) -> str | None:
@@ -1575,12 +1509,8 @@ def parse_intent_response(
         elif isinstance(obc, dict):
             order_by_cols.append(_order_by_col_from_obc(obc))
 
-    where = PredicateGroup.from_stored(parsed.get("where"), legacy_key="where")
-    if where is None:
-        where = PredicateGroup.from_legacy_flat_where_dicts(parsed.get("where_param", []))
-    having = PredicateGroup.from_stored(parsed.get("having"), legacy_key="having", having=True)
-    if having is None:
-        having = PredicateGroup.from_legacy_having_dicts(parsed.get("having_param", []))
+    where = PredicateGroup.from_stored(parsed.get("where"))
+    having = PredicateGroup.from_stored(parsed.get("having"), having=True)
 
     cte_steps_raw = parsed.get("cte_steps", [])
     cte_steps = []
@@ -1604,12 +1534,8 @@ def parse_intent_response(
                 elif isinstance(obc, dict):
                     cte_order_by.append(_order_by_col_from_obc(obc))
 
-            cte_where = PredicateGroup.from_stored(cte.get("where"), legacy_key="where")
-            if cte_where is None:
-                cte_where = PredicateGroup.from_legacy_flat_where_dicts(cte.get("where_param", []))
-            cte_having_group = PredicateGroup.from_stored(cte.get("having"), legacy_key="having", having=True)
-            if cte_having_group is None:
-                cte_having_group = PredicateGroup.from_legacy_having_dicts(cte.get("having_param", []))
+            cte_where = PredicateGroup.from_stored(cte.get("where"))
+            cte_having_group = PredicateGroup.from_stored(cte.get("having"), having=True)
 
             cte_output_columns_raw = cte.get("output_columns", [])
             if isinstance(cte_output_columns_raw, str):
@@ -1675,7 +1601,7 @@ def parse_intent_response(
         except ValueError:
             limit = None
 
-    natural_language = parsed.get("natural_language", "").strip() or question
+    natural_language = str(parsed.get("natural_language") or "").strip() or question
     debug(f"[intent_parse.full_intent_parse] extracted natural_language='{natural_language}'")
 
     has_agg = any(sc.is_aggregated for sc in select_cols)
@@ -2131,8 +2057,8 @@ def extract_structural_params(intent: RuntimeIntent) -> RuntimeIntent:
                 case_registry=new_case,
                 group_by_cols=new_gb,
                 order_by_cols=new_ob,
-                where=PredicateGroup.from_list(new_fp),
-                having=PredicateGroup.from_list(new_hp),
+                where=PredicateGroup.rebuild_from_leaves(cte.where, new_fp),
+                having=PredicateGroup.rebuild_from_leaves(cte.having, new_hp),
             )
         )
     limit_param_key = ""
@@ -2174,8 +2100,8 @@ def extract_structural_params(intent: RuntimeIntent) -> RuntimeIntent:
         case_registry=new_case_registry,
         group_by_cols=new_group_by,
         order_by_cols=new_order_by,
-        where=PredicateGroup.from_list(new_filters),
-        having=PredicateGroup.from_list(new_having),
+        where=PredicateGroup.rebuild_from_leaves(intent.where, new_filters),
+        having=PredicateGroup.rebuild_from_leaves(intent.having, new_having),
     )
 
 
@@ -2469,8 +2395,8 @@ def assign_param_keys(
         updated_cte_steps.append(
             replace(
                 cte,
-                where=PredicateGroup.from_list(cte_fp),
-                having=PredicateGroup.from_list(cte_hp),
+                where=PredicateGroup.rebuild_from_leaves(cte.where, cte_fp),
+                having=PredicateGroup.rebuild_from_leaves(cte.having, cte_hp),
                 case_registry=new_cte_case_registry,
             )
         )
@@ -2598,26 +2524,7 @@ def _normalize_case_registry_between(case_registry: list[CaseRegistryStep] | Non
 
 
 def decompose_between_params(intent: RuntimeIntent) -> RuntimeIntent:
-    """
-    Decompose BETWEEN filter and having operators into paired >= and.
-
-    <= conditions. Applies to where, having, and their counterparts in
-
-    CTE steps. CASE branch conditions under
-
-    ``case_registry[*].case_when`` cannot be split into two flat
-
-    predicates; instead their raw_value is normalised to a ``(lo, hi)``
-
-    tuple and rendered via the BETWEEN arm of
-
-    ``_render_case_branch_sql`` after two param keys are allocated.
-
-    Args: intent: RuntimeIntent containing where, having, and cte_steps
-        to process. Returns: New RuntimeIntent with all BETWEEN operators
-        split into >= and <= pairs in flat lists and canonicalised
-        raw_values inside CASE branches.
-    """
+    """Decompose BETWEEN filter and having operators into paired >= and. <= conditions. Applies to where, having, and their counterparts in CTE steps. CASE branch conditions under ``case_registry[*].case_when`` cannot be split into two flat predicates; instead their raw_value is normalised to a ``(lo, hi)`` tuple and rendered via the BETWEEN arm of ``render_case_branch_sql`` after two param keys are allocated. Args: intent: RuntimeIntent containing where, having, and cte_steps to process. Returns: New RuntimeIntent with all BETWEEN operators split into >= and <= pairs in flat lists and canonicalised raw_values inside CASE branches."""
     new_fp = _decompose_between_param_list(PredicateGroup.where_leaves(intent.where) or [])
     new_hp = _decompose_between_param_list(PredicateGroup.having_leaves(intent.having) or [])
     new_case_registry = _normalize_case_registry_between(intent.case_registry)
@@ -2697,15 +2604,15 @@ def normalize_in_raw_values(intent: RuntimeIntent) -> RuntimeIntent:
         new_cte_steps.append(
             replace(
                 cte,
-                where=PredicateGroup.from_list(cte_fp),
-                having=PredicateGroup.from_list(cte_hp),
+                where=PredicateGroup.rebuild_from_leaves(cte.where, cte_fp),
+                having=PredicateGroup.rebuild_from_leaves(cte.having, cte_hp),
                 case_registry=cte_cr or [],
             )
         )
     return replace(
         intent,
-        where=PredicateGroup.from_list(new_fp),
-        having=PredicateGroup.from_list(new_hp),
+        where=PredicateGroup.rebuild_from_leaves(intent.where, new_fp),
+        having=PredicateGroup.rebuild_from_leaves(intent.having, new_hp),
         case_registry=new_cr or [],
         cte_steps=new_cte_steps,
     )
@@ -2808,7 +2715,7 @@ def normalize_date_diff_raw_values(intent: RuntimeIntent) -> RuntimeIntent:
     """
     Canonicalize ``unit`` in date_window and date_diff filters via.
 
-    ``DATE_UNIT_ALIAS_TO_CANONICAL``. Coerce legacy numeric scalars to
+    ``DATE_UNIT_ALIAS_TO_CANONICAL``. Coerce bare numeric scalars to
 
     structured ``{unit, amount}`` payloads for both value types. Args:
 
@@ -2844,12 +2751,16 @@ def normalize_date_diff_raw_values(intent: RuntimeIntent) -> RuntimeIntent:
         cte_fp = _process(PredicateGroup.where_leaves(cte.where) or [])
         cte_hp = _process(PredicateGroup.having_leaves(cte.having) or [])
         new_cte_steps.append(
-            replace(cte, where=PredicateGroup.from_list(cte_fp), having=PredicateGroup.from_list(cte_hp))
+            replace(
+                cte,
+                where=PredicateGroup.rebuild_from_leaves(cte.where, cte_fp),
+                having=PredicateGroup.rebuild_from_leaves(cte.having, cte_hp),
+            )
         )
     return replace(
         intent,
-        where=PredicateGroup.from_list(new_fp),
-        having=PredicateGroup.from_list(new_hp),
+        where=PredicateGroup.rebuild_from_leaves(intent.where, new_fp),
+        having=PredicateGroup.rebuild_from_leaves(intent.having, new_hp),
         cte_steps=new_cte_steps,
     )
 
@@ -3033,8 +2944,8 @@ def promote_date_subtraction_to_date_diff(intent: RuntimeIntent) -> RuntimeInten
     new_cte_steps = []
     for cte in intent.cte_steps or []:
         cte_fp = _process(PredicateGroup.where_leaves(cte.where) or [])
-        new_cte_steps.append(replace(cte, where=PredicateGroup.from_list(cte_fp)))
-    return replace(intent, where=PredicateGroup.from_list(new_fp), cte_steps=new_cte_steps)
+        new_cte_steps.append(replace(cte, where=PredicateGroup.rebuild_from_leaves(cte.where, cte_fp)))
+    return replace(intent, where=PredicateGroup.rebuild_from_leaves(intent.where, new_fp), cte_steps=new_cte_steps)
 
 
 def repair_misclassified_date_diff(intent: RuntimeIntent) -> RuntimeIntent:
@@ -3057,89 +2968,22 @@ def repair_misclassified_date_diff(intent: RuntimeIntent) -> RuntimeIntent:
     new_cte_steps = []
     for cte in intent.cte_steps or []:
         cte_fp = _process(PredicateGroup.where_leaves(cte.where) or [])
-        new_cte_steps.append(replace(cte, where=PredicateGroup.from_list(cte_fp)))
-    return replace(intent, where=PredicateGroup.from_list(new_fp), cte_steps=new_cte_steps)
+        new_cte_steps.append(replace(cte, where=PredicateGroup.rebuild_from_leaves(cte.where, cte_fp)))
+    return replace(intent, where=PredicateGroup.rebuild_from_leaves(intent.where, new_fp), cte_steps=new_cte_steps)
 
 
 def concat_logical_intent_prose(logical: LogicalIntent) -> str:
-    """Concatenate every planner prose field from the top intent and. each CTE step. Args: logical: Parsed planner intent whose string fields should be flattened. Returns: Lowercase-friendly haystack text; empty fields are skipped so spacing stays stable."""
+    """Concatenate every interpret prose field from the top intent and. each CTE step. Args: logical: Parsed interpret intent whose string fields should be flattened. Returns: Lowercase-friendly haystack text; empty fields are skipped so spacing stays stable."""
     chunks: list[str] = []
-    for field in PLANNER_PROSE_FIELDS:
+    for field in INTERPRET_PROSE_FIELDS:
         chunks.append(str(getattr(logical, field, "") or ""))
     for step in logical.cte_steps:
-        for field in PLANNER_PROSE_FIELDS:
+        for field in INTERPRET_PROSE_FIELDS:
             chunks.append(str(getattr(step, field, "") or ""))
     return " ".join(c for c in chunks if c.strip())
 
 
 NormalizedExpr.register_parse_expr_string(parse_expr_string)
-
-_TEMPLATES_MODULE: Any = None
-
-
-def dedupe_prior_question_feedback_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Return *rows* de-duplicated by ``(intent_structural_hash, summary prefix)``, preserving order."""
-    seen: set[tuple[str, str]] = set()
-    out: list[dict[str, str]] = []
-    for row in rows:
-        ihash = str(row.get("intent_structural_hash", "") or "")
-        summary = str(row.get("summary", "") or "")
-        key = (ihash, summary[:120])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(row)
-    return out
-
-
-def in_turn_row_from_semantic_errors(
-    errors: list[IntentIssue], schema_hash: str, intent: RuntimeIntent
-) -> dict[str, str]:
-    """Build one ``to_prompt_row``-shaped dict from semantic validation errors."""
-    max_b = PolicyConfig.MAX_SUMMARY_BULLETS
-    lines = [f"[{e.category.value}] {e.message}" for e in errors[:max_b]]
-    summary = "\n".join(lines)
-    ts = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    tplm = _TEMPLATES_MODULE
-    if tplm is None:
-        ish, ipay = "", ""
-    else:
-        ish, ipay = tplm.compute_intent_structural_signature(intent)
-    return {
-        "kind": FeedbackKind.VALIDATION_FAILURE.value,
-        "summary": summary,
-        "buckets": RejectionBucket.OTHER.value,
-        "effective_structural_hash": schema_hash,
-        "intent_structural_hash": ish,
-        "intent_payload": ipay,
-        "created_at": ts,
-        "updated_at": ts,
-        "is_post_restart": "False",
-    }
-
-
-def register_templates_module(module: Any) -> None:
-    global _TEMPLATES_MODULE
-    _TEMPLATES_MODULE = module
-
-
-def get_templates_module() -> Any:
-    """Return the module registered via :func:`register_templates_module`."""
-    return _TEMPLATES_MODULE
-
-
-def is_template_store_view(store: Any) -> bool:
-    """Return True when *store* is the registered templates module :class:`TemplateStoreView`."""
-    mod = _TEMPLATES_MODULE
-    return mod is not None and isinstance(store, mod.TemplateStoreView)
-
-
-def refresh_template_store_indexes_for_view(store: Any, *, template_objs: list[Template] | None = None) -> None:
-    """Refresh matcher indexes on *store* when it is a registered :class:`TemplateStoreView`."""
-    mod = _TEMPLATES_MODULE
-    if mod is None:
-        return
-    mod._refresh_template_store_indexes(store, template_objs=template_objs)
 
 
 if PolicyConfig.MAX_ASK_COMPOSE_REPAIRS < 1:
@@ -3205,7 +3049,7 @@ def _logical_coerce_bool(v: Any) -> bool:
 
 
 def _cte_intent_from_obj(obj: dict[str, Any]) -> CteIntent:
-    """Materialise one :class:`CteIntent` from a planner JSON object."""
+    """Materialise one :class:`CteIntent` from a interpret JSON object."""
     return CteIntent(
         name=str(obj.get("name", "") or "").strip(),
         tables=tuple(_logical_coerce_str_list(obj.get("tables"))),
@@ -3221,7 +3065,7 @@ def _cte_intent_from_obj(obj: dict[str, Any]) -> CteIntent:
 
 
 def logical_intent_from_parsed(d: dict[str, Any]) -> LogicalIntent:
-    """Materialise a :class:`LogicalIntent` from validated planner JSON."""
+    """Materialise a :class:`LogicalIntent` from validated interpret JSON."""
     ctes: list[CteIntent] = []
     for c in d.get("cte_steps") or []:
         if isinstance(c, dict):
@@ -3238,6 +3082,25 @@ def logical_intent_from_parsed(d: dict[str, Any]) -> LogicalIntent:
         case=_logical_coerce_optional_str(d.get("case")),
         cte_steps=tuple(ctes),
     )
+
+
+def interpret_plan_is_unanswerable(plan: InterpretPlan) -> bool:
+    """True when Interpret marked schema_invalid and left tables empty (outside-space abort)."""
+    return bool(plan.schema_invalid) and not plan.tables
+
+
+def interpret_plan_references_absent_entities(plan: InterpretPlan, allowed_tables: frozenset[str]) -> bool:
+    """True when the interpret plan names tables outside the filtered schema payload."""
+    if not allowed_tables:
+        return bool(plan.tables) or any(ref.split(".", 1)[0].strip() for ref, _ in plan.grounding)
+    for table in plan.tables:
+        if table not in allowed_tables:
+            return True
+    for ref, _ in plan.grounding:
+        base = ref.split(".", 1)[0].strip()
+        if base and base not in allowed_tables:
+            return True
+    return False
 
 
 def interpret_plan_for_ground(plan: InterpretPlan) -> dict[str, Any]:
@@ -3298,6 +3161,8 @@ def parse_interpret_plan_response(raw: str) -> tuple[InterpretPlan | None, list[
             )
         ]
     plan = _interpret_plan_from_dict(parsed)
+    if plan.schema_invalid and not plan.tables:
+        return plan, []
     if not plan.approach:
         issues.append(
             IntentIssue.make(
@@ -3354,7 +3219,7 @@ def _logical_intent_schema_issues(parsed: dict[str, Any] | None) -> list[IntentI
 def parse_logical_intent_response(
     raw: str, schema_graph: SchemaGraph
 ) -> tuple[LogicalIntent | None, list[IntentIssue]]:
-    """Parse and validate a planner model payload against schema and graph rules."""
+    """Parse and validate a interpret model payload against schema and graph rules."""
     obj = safe_json_loads(raw.strip())
     issues = _logical_intent_schema_issues(obj if isinstance(obj, dict) else None)
     if issues:
@@ -3376,13 +3241,6 @@ def parse_logical_intent_response(
     if issues:
         return None, issues
     return li, []
-
-
-def serialized_prior_feedback_rows(rows: list[dict[str, str]] | None) -> str:
-    """Serialise merged feedback rows for Ground as compact JSON text."""
-    if not rows:
-        return ""
-    return stable_json({"items": rows})
 
 
 def _predicate_group_structure_key(group: PredicateGroup | None) -> tuple[Any, ...]:
@@ -3553,25 +3411,7 @@ def _cte_step_similarity(cte1: RuntimeCteStep, cte2: RuntimeCteStep) -> float:
 
 
 def intent_similarity(intent1: RuntimeIntent | ConcreteIntent, intent2: RuntimeIntent | ConcreteIntent) -> float:
-    """
-    Blend weighted main-body clause similarity with per-step CTE.
-
-    similarity (position-aligned). Main body uses
-
-    :func:`_base_similarity` (tables, filters, select, group, order,
-
-    having). It does not use :func:`aetherdialect._utils.intent_key`;
-
-    keys hash serialised clauses while similarity uses clause-wise
-
-    scores, so equal keys imply high similarity but the converse is not
-
-    guaranteed. Args: intent1: First intent. intent2: Second intent.
-
-    Returns:
-
-        Score in ``[0, 1]``.
-    """
+    """Blend weighted main-body clause similarity with per-step CTE. similarity (position-aligned). Main body uses :func:`_base_similarity` (tables, filters, select, group, order, having). It does not use :func:`aetherdialect._utils_intent.intent_key`; keys hash serialised clauses while similarity uses clause-wise scores, so equal keys imply high similarity but the converse is not guaranteed. Args: intent1: First intent. intent2: Second intent. Returns: Score in ``[0, 1]``."""
     base_sim = _base_similarity(
         intent1.tables or [],
         intent2.tables or [],
@@ -3612,3 +3452,254 @@ def _jaccard(set1: set[str], set2: set[str]) -> float:
     intersection = set1 & set2
     union = set1 | set2
     return len(intersection) / len(union) if union else 1.0
+
+
+def join_resolved_scope_tables(signature: list[str], scope_tables: list[str]) -> list[str]:
+    """Return intent scope tables union every table touched by a join path signature."""
+    covered = join_signature_tables([str(x) for x in signature])
+    return sorted(set(scope_tables) | covered)
+
+
+def intent_join_reachability_tables(intent: RuntimeIntent) -> list[str]:
+    """Tables used for join-path reachability on the main intent (resolved scope when set)."""
+    if intent.resolved_join_tables:
+        return list(intent.resolved_join_tables)
+    sig = list(intent.chosen_join_path_signature or [])
+    if sig and intent.tables:
+        return join_resolved_scope_tables(sig, list(intent.tables))
+    return list(intent.tables or [])
+
+
+def cte_join_reachability_tables(cte: RuntimeCteStep) -> list[str]:
+    """Tables used for join-path reachability on a CTE step (resolved scope when set)."""
+    if cte.resolved_join_tables:
+        return list(cte.resolved_join_tables)
+    sig = list(cte.chosen_join_path_signature or [])
+    if sig and cte.tables:
+        return join_resolved_scope_tables(sig, list(cte.tables))
+    return list(cte.tables or [])
+
+
+def extract_col_from_scalar_wrapper(col_expr: str) -> str:
+    """Strip a scalar wrapper and leading `DISTINCT`, returning the. inner column expression."""
+    if not col_expr:
+        return col_expr
+    match = re.match(r"^\s*(\w+)\s*\(\s*(.+)\s*\)\s*$", col_expr, re.IGNORECASE)
+    if match:
+        func_name = match.group(1).lower()
+        if func_name in VALID_SCALAR_FUNCTIONS:
+            return strip_leading_distinct_from_column_ref(match.group(2).strip())
+    return strip_leading_distinct_from_column_ref(col_expr)
+
+
+def extract_agg_col(agg_expr: str) -> tuple[str | None, str | None, bool]:
+    """Parse `(func, target, has_distinct)` from an aggregation. expression string."""
+    if not agg_expr:
+        return (None, None, False)
+    match = re.match(r"^\s*(\w+)\s*\(\s*(.*)\s*\)\s*$", agg_expr, re.IGNORECASE)
+    if not match:
+        return (None, None, False)
+    func = match.group(1).lower()
+    inner = match.group(2).strip()
+    has_distinct = False
+    actual_target = inner
+    if inner.upper().startswith("DISTINCT "):
+        has_distinct = True
+        actual_target = inner[9:].strip()
+    actual_target = extract_col_from_scalar_wrapper(actual_target)
+    return (func, actual_target, has_distinct)
+
+
+def extract_concat_agg_targets(target: str) -> list[str] | None:
+    """Return CONCAT argument strings when *target* is a CONCAT expression or unwrap residue."""
+    stripped = (target or "").strip()
+    if not stripped:
+        return None
+    concat_match = re.match(r"^\s*CONCAT\s*\(\s*(.*)\s*\)\s*$", stripped, re.IGNORECASE | re.DOTALL)
+    if concat_match:
+        return _split_sql_comma_args(concat_match.group(1))
+    if "," in stripped and not re.match(r"^\s*\w+\s*\(", stripped):
+        return _split_sql_comma_args(stripped)
+    return None
+
+
+def extract_functions_from_term(term: str) -> tuple[str | None, str | None]:
+    """Extract outer scalar and inner aggregation function names from a. term."""
+    result = extract_agg_col(term)
+    if len(result) != 3 or not result[0]:
+        return None, None
+    outer = result[0]
+    if outer in VALID_AGGREGATION_FUNCTIONS:
+        return None, outer
+    inner_result = extract_agg_col(result[1]) if result[1] else (None, None, False)
+    if len(inner_result) == 3 and inner_result[0] and inner_result[0] in VALID_AGGREGATION_FUNCTIONS:
+        return outer, inner_result[0]
+    return outer, None
+
+
+def where_param_to_having_param(fp: WhereParam) -> HavingParam:
+    """Convert a `WhereParam` into a `HavingParam` carrying the same. predicate fields. Used when a `CaseWhenBranch` declares ``condition_scope == "having"`` so that HAVING-shaped validators can be applied to its filter-shaped condition."""
+    return HavingParam(
+        left_expr=fp.left_expr,
+        op=fp.op,
+        right_expr=fp.right_expr,
+        value_type=fp.value_type,
+        param_key=fp.param_key,
+        raw_value=fp.raw_value,
+    )
+
+
+def iterate_case_branch_conditions(
+    select_cols: list[SelectCol] | None,
+    case_registry: list[CaseRegistryStep] | None,
+    window_registry: list[WindowRegistryStep] | None,
+    location_prefix: str,
+) -> list[tuple[WhereParam, str, str]]:
+    """Enumerate every CASE branch condition reachable from a query. body. Collects conditions from ``case_registry`` entries referenced by bare ``cNN`` tokens in ``select_cols`` and from orphan registry rows not referenced by any select column."""
+    out: list[tuple[WhereParam, str, str]] = []
+    seen_registry_ids: set[str] = set()
+    for _, sc in enumerate(select_cols or []):
+        ref = sc.expr.registry_ref() or "" if sc.expr is not None else ""
+        if not ref.startswith("c"):
+            continue
+        parts = sc.effective_parts(window_registry, case_registry)
+        cw = parts.case_when
+        if cw is None:
+            continue
+        seen_registry_ids.add(ref)
+        base_loc = f"{location_prefix} case_registry[{ref}]"
+        scope = (cw.condition_scope or "where").strip().lower() or "where"
+        for bi, br in enumerate(cw.branches or []):
+            out.append((br.condition, scope, f"{base_loc}.branches[{bi}]"))
+    for step in case_registry or []:
+        if not step or step.case_when is None:
+            continue
+        rid = (step.registry_id or "").strip()
+        if rid and rid in seen_registry_ids:
+            continue
+        cw = step.case_when
+        scope = (cw.condition_scope or "where").strip().lower() or "where"
+        base_loc = f"{location_prefix} case_registry[{rid or step.label or '?'}]"
+        for bi, br in enumerate(cw.branches or []):
+            out.append((br.condition, scope, f"{base_loc}.branches[{bi}]"))
+    return out
+
+
+def build_cte_outputs_map(intent: RuntimeIntent) -> dict[str, dict[str, CteOutputColumnMeta]]:
+    return {c.cte_name: dict(c.output_column_metadata or {}) for c in (intent.cte_steps or []) if c.cte_name}
+
+
+def get_col_meta(
+    col_expr: str, schema: SchemaGraph, cte_outputs: dict[str, dict[str, CteOutputColumnMeta]]
+) -> Any | None:
+    """Resolve `ColumnMetadata` from the schema graph or synthesise it. from CTE outputs."""
+    actual_col = extract_col_from_scalar_wrapper(col_expr)
+    if "." not in actual_col:
+        return None
+    table_name, col_name = actual_col.rsplit(".", 1)
+    if table_name in cte_outputs:
+        cte_meta = cte_outputs[table_name].get(col_name) or cte_outputs[table_name].get(col_name.lower())
+        if not cte_meta:
+            return None
+        return ColumnMetadata(
+            name=col_name,
+            data_type=cte_meta.data_type or "unknown",
+            role=cte_meta.role,
+            is_filterable_override=cte_meta.filterable,
+            is_aggregatable_override=cte_meta.aggregatable,
+            is_groupable_override=cte_meta.groupable,
+            valid_where_ops=list(cte_meta.valid_where_ops or []),
+            valid_aggregations=list(cte_meta.valid_aggregations or []),
+            valid_having_ops=list(cte_meta.valid_having_ops or []),
+            sensitivity=SensitivityClassification.from_dict({"sensitivity": cte_meta.sensitivity}),
+        )
+    if table_name not in schema.tables:
+        return None
+    table_meta = schema.tables[table_name]
+    return table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
+
+
+def is_col_arithmetic_role(
+    col_ref: str, schema: SchemaGraph, cte_outputs: dict[str, dict[str, CteOutputColumnMeta]]
+) -> bool | None:
+    """Return whether a column's role allows use in arithmetic. expressions."""
+    meta = get_col_meta(col_ref, schema, cte_outputs)
+    if meta and meta.role:
+        return meta.role in ARITHMETIC_ROLES
+    actual_col = extract_col_from_scalar_wrapper(col_ref)
+    if "." in actual_col:
+        table_name, col_name = actual_col.rsplit(".", 1)
+        if table_name in cte_outputs:
+            cte_meta = cte_outputs[table_name].get(col_name) or cte_outputs[table_name].get(col_name.lower())
+            if cte_meta and cte_meta.role:
+                return cte_meta.role in ARITHMETIC_ROLES
+    return None
+
+
+def expr_has_arithmetic(expr: NormalizedExpr) -> bool:
+    """Return `True` if a `NormalizedExpr` contains arithmetic. operations."""
+    if len(expr.add_groups) + len(expr.sub_groups) > 1:
+        return True
+    if expr.add_values or expr.sub_values:
+        return True
+    for g in expr.add_groups + expr.sub_groups:
+        if (g.scalar_func or "").lower() == "concat":
+            continue
+        if g.coefficient != 1.0 or g.divide or len(g.multiply) > 1:
+            return True
+    return False
+
+
+def get_col_type(
+    col_expr: str, schema: SchemaGraph, cte_outputs: dict[str, dict[str, CteOutputColumnMeta]]
+) -> str | None:
+    """Resolve a column's `value_type` from the schema or CTE outputs."""
+    actual_col = extract_col_from_scalar_wrapper(col_expr)
+    if "." not in actual_col:
+        return None
+    table_name, col_name = actual_col.rsplit(".", 1)
+    if table_name in cte_outputs:
+        meta = cte_outputs[table_name].get(col_name) or cte_outputs[table_name].get(col_name.lower())
+        return meta.value_type if meta else None
+    if table_name not in schema.tables:
+        return None
+    table_meta = schema.tables[table_name]
+    col_meta = table_meta.columns.get(col_name) or table_meta.columns.get(col_name.lower())
+    if not col_meta:
+        return None
+    return col_meta.value_type
+
+
+def is_col_numeric(
+    col_ref: str, schema: SchemaGraph, cte_outputs: dict[str, dict[str, CteOutputColumnMeta]]
+) -> bool | None:
+    """Return whether a column's value type is numeric."""
+    col_type = get_col_type(col_ref, schema, cte_outputs)
+    if col_type is None:
+        return None
+    return col_type in ("integer", "number")
+
+
+def _split_sql_comma_args(arg_str: str) -> list[str]:
+    """Split comma-separated SQL args respecting single-quoted string literals."""
+    parts: list[str] = []
+    cur: list[str] = []
+    in_quote = False
+    for ch in arg_str:
+        if ch == "'" and not in_quote:
+            in_quote = True
+            cur.append(ch)
+        elif ch == "'" and in_quote:
+            in_quote = False
+            cur.append(ch)
+        elif ch == "," and not in_quote:
+            part = "".join(cur).strip()
+            if part:
+                parts.append(part)
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts

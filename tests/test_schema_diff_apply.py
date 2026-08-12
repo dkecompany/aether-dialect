@@ -19,17 +19,14 @@ from aetherdialect._contracts_schema import (
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._core_utils import read_gzip_json
 from aetherdialect._dialect import Dialect
+from aetherdialect._schema_finalize import apply_diff, build_schema_graph
 from aetherdialect._schema_graph import (
     assign_schema_graph_hashes,
     diff_schemas,
 )
-from aetherdialect._schema_overrides import (
-    apply_diff,
-    build_schema_graph,
-    save_schema_to_cache,
-)
+from aetherdialect._schema_reflect import save_schema_to_cache
+from aetherdialect._utils_artifacts import read_gzip_json
 
 pytestmark = pytest.mark.usefixtures("stub_schema_llm_classifier")
 

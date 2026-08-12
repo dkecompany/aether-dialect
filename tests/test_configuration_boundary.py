@@ -2,18 +2,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import pytest
 
-from aetherdialect._config import (
-    REMOVED_BEHAVIOUR_ENVIRONMENT_KEYS,
-    EngineLimits,
-    FederationLimits,
-    PolicyConfig,
-    PostgresRuntimeConfig,
-)
-from aetherdialect._constants import DIAGNOSTIC_CODE_CONFIGURATION_KEY_IGNORED
+from aetherdialect._config import EngineLimits, FederationLimits, PolicyConfig, PostgresRuntimeConfig
 from aetherdialect._main_execution import (
     MainExecutionOps,
 )
@@ -36,7 +27,7 @@ _BEHAVIOUR_KEY_CASES: tuple[tuple[str, str, str, object], ...] = (
     _BEHAVIOUR_KEY_CASES,
     ids=[case[0] for case in _BEHAVIOUR_KEY_CASES],
 )
-def test_behaviour_keys_no_longer_read_from_environment(
+def test_behaviour_keys_not_read_from_environment(
     env_key: str,
     policy_attr: str,
     poison: str,
@@ -48,7 +39,7 @@ def test_behaviour_keys_no_longer_read_from_environment(
 
 
 @pytest.mark.fast
-def test_connection_keys_still_read_from_file(tmp_path) -> None:
+def test_connection_keys_read_from_file(tmp_path) -> None:
     path = tmp_path / "conn.toml"
     path.write_text(
         "\n".join(
@@ -105,15 +96,3 @@ def test_caller_supplied_limits_not_overlaid_by_file(tmp_path) -> None:
     assert caller_engine_limits.pool_size == 2
     assert caller_engine_limits.statement_timeout_ms == 30_000
     assert caller_fed_limits.max_members == 8
-
-
-@pytest.mark.fast
-def test_removed_key_still_set_emits_diagnostic() -> None:
-    env = {"AETHERDIALECT_STATEMENT_TIMEOUT_MS": "45000"}
-    with patch("aetherdialect._main_execution.notify") as notify_mock:
-        MainExecutionOps.emit_ignored_behaviour_environment_diagnostics(env)
-    notify_mock.assert_called_once()
-    assert notify_mock.call_args.kwargs["code"] == DIAGNOSTIC_CODE_CONFIGURATION_KEY_IGNORED
-    details = dict(notify_mock.call_args.kwargs["details"])
-    assert details["key"] == "AETHERDIALECT_STATEMENT_TIMEOUT_MS"
-    assert details["replacement"] == REMOVED_BEHAVIOUR_ENVIRONMENT_KEYS["AETHERDIALECT_STATEMENT_TIMEOUT_MS"]

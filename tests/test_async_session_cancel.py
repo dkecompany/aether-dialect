@@ -18,25 +18,25 @@ def test_cancel_during_ask_no_context_token_error() -> None:
     seen: dict[str, str | None] = {}
 
     class _Inner:
-        def cancel(self) -> bool:
-            seen["cancel"] = _PROBE.get()
-            return True
+        def __init__(self) -> None:
+            self._calls = 0
 
-        def cancel_active_federation_turn(self) -> bool:
-            seen["fed"] = _PROBE.get()
-            return False
+        def cancel(self) -> bool:
+            self._calls += 1
+            seen[f"cancel{self._calls}"] = _PROBE.get()
+            return self._calls == 1
 
     ap = AsyncPipelineSession(cast(Any, _Inner()))
     token = _PROBE.set("cancel-bound")
 
     async def _run() -> None:
         assert await ap.cancel() is True
-        assert await ap.cancel_active_federation_turn() is False
+        assert await ap.cancel() is False
 
     try:
         asyncio.run(_run())
     finally:
         _PROBE.reset(token)
 
-    assert seen["cancel"] == "cancel-bound"
-    assert seen["fed"] == "cancel-bound"
+    assert seen["cancel1"] == "cancel-bound"
+    assert seen["cancel2"] == "cancel-bound"

@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import ColumnRole
-from aetherdialect._contracts_schema import ColumnMetadata, QSimSkeleton, SchemaGraph, TableMetadata
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, QSimSkeleton, SchemaGraph, TableMetadata
 from aetherdialect._qsim import _skeleton_cache, generate_all_skeletons
 
 

@@ -1,4 +1,4 @@
-"""Intent interpret/ground prompts pass schema and business context as structured JSON."""
+"""Intent interpret/ground prompts pass schema and domain context as structured JSON."""
 
 from __future__ import annotations
 
@@ -6,28 +6,28 @@ import json
 
 import pytest
 
-from aetherdialect._contracts_base import BusinessKnowledgeEntry, FailureCategory
+from aetherdialect._contracts_base import DomainKnowledgeEntry, FailureCategory
 from aetherdialect._contracts_core import InterpretPlan
 from aetherdialect._contracts_schema import IntentIssue
-from aetherdialect._core_utils import business_knowledge_digest, business_knowledge_scope
-from aetherdialect._intent_process import (
+from aetherdialect._intent_loop import (
     build_intent_ground_prompt,
     build_intent_interpret_prompt,
     build_intent_parse_prompt,
     build_intent_semantic_repair_prompt,
 )
+from aetherdialect._utils import domain_knowledge_digest, domain_knowledge_scope
 
 
 @pytest.mark.fast
-def test_schema_and_bk_are_structured() -> None:
+def test_schema_and_dk_are_structured() -> None:
     domain = {"tables": {"orders": {"columns": {"id": {"type": "integer"}}}}}
     ground = {"orders": {"columns": {"id": {"type": "integer", "role": "identifier"}}}}
     entries = (
-        BusinessKnowledgeEntry(key="arr", text="Annual recurring revenue.", kind="glossary"),
-        BusinessKnowledgeEntry(key="fy", text="Fiscal year starts in July.", kind="policy"),
+        DomainKnowledgeEntry(key="arr", text="Annual recurring revenue.", kind="glossary"),
+        DomainKnowledgeEntry(key="fy", text="Fiscal year starts in July.", kind="policy"),
     )
-    digest = business_knowledge_digest(entries)
-    with business_knowledge_scope(entries, digest):
+    digest = domain_knowledge_digest(entries)
+    with domain_knowledge_scope(entries, digest):
         interpret = json.loads(
             build_intent_interpret_prompt(
                 "what is arr",
@@ -66,13 +66,13 @@ def test_schema_and_bk_are_structured() -> None:
             )
         )
     assert isinstance(interpret["schema_domain"], dict)
-    assert isinstance(interpret["business_context"], list)
-    assert all(isinstance(row, dict) for row in interpret["business_context"])
-    assert interpret["business_context"][0]["key"] == "arr"
+    assert isinstance(interpret["domain_context"], list)
+    assert all(isinstance(row, dict) for row in interpret["domain_context"])
+    assert interpret["domain_context"][0]["key"] == "arr"
     assert isinstance(ground_prompt["schema_literal_json"], dict)
-    assert isinstance(ground_prompt["business_context"], list)
+    assert isinstance(ground_prompt["domain_context"], list)
     assert isinstance(parse_payload["schema_summary"], dict)
-    assert isinstance(parse_payload["business_context"], list)
+    assert isinstance(parse_payload["domain_context"], list)
     assert isinstance(repair["schema_info"], dict)
     assert isinstance(repair["current_intent"], dict)
-    assert isinstance(repair["business_context"], list)
+    assert isinstance(repair["domain_context"], list)

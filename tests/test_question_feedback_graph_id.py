@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._contracts_base import LogicalIntent, NormalizedExpr
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
     FeedbackKind,
     QuestionFeedbackEntry,
@@ -15,10 +15,10 @@ from aetherdialect._contracts_core import (
     RuntimeIntent,
     SelectCol,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._intent_process import full_intent_parse, logical_intent_to_serialisable
+from aetherdialect._contracts_schema import ColumnMetadata, LogicalIntent, SchemaGraph, TableMetadata
+from aetherdialect._intent_loop import full_intent_parse, logical_intent_to_serialisable
 from aetherdialect._schema_graph import derive_deterministic_schema_graph_id
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _schema_with_distinct_ids() -> SchemaGraph:
@@ -92,9 +92,9 @@ def test_collect_matches_stored_hash() -> None:
 
     with (
         patch.object(TemplateOps, "collect_question_feedback_for_prompt", side_effect=_spy_collect),
-        patch("aetherdialect._intent_process.LLMProvider.chat", side_effect=[interpret_ok, good_ground, "{}"]),
+        patch("aetherdialect._intent_loop.LLMProvider.chat", side_effect=[interpret_ok, good_ground, "{}"]),
         patch(
-            "aetherdialect._intent_process._format_repair_loop",
+            "aetherdialect._intent_loop._format_repair_loop",
             return_value=(stub_intent, 0),
         ),
     ):

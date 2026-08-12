@@ -7,8 +7,8 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import normalize_question
 from aetherdialect._seed_warmup import SeedWarmupCacheSession
+from aetherdialect._utils import normalize_question
 
 
 def _ambiguous_join_schema() -> SchemaGraph:

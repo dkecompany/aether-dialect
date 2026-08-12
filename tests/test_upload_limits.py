@@ -6,8 +6,8 @@ import pytest
 
 from aetherdialect._config import EngineLimits
 from aetherdialect._contracts_base import ConfigError
-from aetherdialect._core_utils import pop_engine_limits, push_engine_limits
 from aetherdialect._data_quality import _resolve_tabular_upload_path, inspect_tabular_upload
+from aetherdialect._utils import pop_engine_limits, push_engine_limits
 
 
 @pytest.mark.fast

@@ -8,13 +8,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._constants import ASK_PHASE_B, SCHEMA_BUILD_PHASE_C, SCHEMA_BUILD_PHASE_E
-from aetherdialect._contracts_base import EngineContext, PhaseProgressEvent
+from aetherdialect._constants_runtime import ASK_PHASE_B, SCHEMA_BUILD_PHASE_C, SCHEMA_BUILD_PHASE_E
+from aetherdialect._contracts_base import EngineContext
+from aetherdialect._contracts_core import PhaseProgressEvent
 from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._core_utils import emit_ask_phase, emit_construction_phase
 from aetherdialect._dialect import Dialect
-from aetherdialect._main_execution import PipelineSession
-from aetherdialect._schema_overrides import build_schema_graph_with_diff
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._schema_finalize import build_schema_graph_with_diff
+from aetherdialect._utils import emit_ask_phase, emit_construction_phase
 from tests.test_aetherdialect import _make_aether_stub
 
 
@@ -69,7 +70,7 @@ def test_emit_construction_phase_invokes_callback() -> None:
     def capture(ev: PhaseProgressEvent) -> None:
         events.append(ev)
 
-    from aetherdialect._core_utils import pop_construction_phase_callback, push_construction_phase_callback
+    from aetherdialect._utils import pop_construction_phase_callback, push_construction_phase_callback
 
     token = push_construction_phase_callback(capture)
     try:
@@ -89,7 +90,7 @@ def test_emit_ask_phase_reports_source_and_stage() -> None:
     def capture(ev: PhaseProgressEvent) -> None:
         events.append(ev)
 
-    from aetherdialect._core_utils import pop_ask_phase_callback, push_ask_phase_callback
+    from aetherdialect._utils import pop_ask_phase_callback, push_ask_phase_callback
 
     token = push_ask_phase_callback(capture)
     try:
@@ -102,6 +103,29 @@ def test_emit_ask_phase_reports_source_and_stage() -> None:
     assert events[0].source == "catalog"
     assert events[0].stage == 2
     assert not hasattr(events[0], "source_id")
+
+
+@pytest.mark.fast
+def test_emit_ask_phase_sets_elapsed_ms() -> None:
+    events: list[PhaseProgressEvent] = []
+
+    def capture(ev: PhaseProgressEvent) -> None:
+        events.append(ev)
+
+    from aetherdialect._utils import pop_ask_phase_callback, pop_turn_timing, push_ask_phase_callback, push_turn_timing
+
+    callback_token = push_ask_phase_callback(capture)
+    timing_tokens = push_turn_timing()
+    try:
+        emit_ask_phase(ASK_PHASE_B)
+        emit_ask_phase(ASK_PHASE_B)
+    finally:
+        pop_turn_timing(*timing_tokens)
+        pop_ask_phase_callback(callback_token)
+
+    assert len(events) == 2
+    assert events[0].elapsed_ms is not None and events[0].elapsed_ms >= 0
+    assert events[1].elapsed_ms is not None and events[1].elapsed_ms >= 0
 
 
 @pytest.mark.fast
@@ -122,11 +146,11 @@ def test_build_schema_graph_emits_reflect_and_profile_phases(
         events.append(ev)
 
     dialect = _FullBuildDialect(schema_graph)
-    from aetherdialect._core_utils import pop_construction_phase_callback, push_construction_phase_callback
+    from aetherdialect._utils import pop_construction_phase_callback, push_construction_phase_callback
 
     token = push_construction_phase_callback(capture)
     try:
-        with patch("aetherdialect._schema_overrides.apply_column_roles_llm"):
+        with patch("aetherdialect._schema_finalize.apply_column_roles_llm"):
             build_schema_graph_with_diff(dialect, EngineContext(), notes_content="notes")
     finally:
         pop_construction_phase_callback(token)
@@ -139,16 +163,16 @@ def test_build_schema_graph_emits_reflect_and_profile_phases(
 
 
 @pytest.mark.fast
-def test_pipeline_session_wires_ask_phase_callback() -> None:
-    """An ask turn invokes the owner's ask-phase callback."""
+def test_pipeline_session_wires_phase_callback() -> None:
+    """An ask turn invokes the owner's phase callback."""
     events: list[PhaseProgressEvent] = []
-    engine = _make_aether_stub(_ask_phase_callback=lambda ev: events.append(ev))
+    engine = _make_aether_stub(_phase_callback=lambda ev: events.append(ev))
     session = PipelineSession(engine)
 
     def ask_side_effect(*_args: object, **_kwargs: object) -> None:
         emit_ask_phase(ASK_PHASE_B)
 
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once", side_effect=ask_side_effect):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once", side_effect=ask_side_effect):
         session.ask("how many rentals")
 
     assert any(ev.phase == ASK_PHASE_B for ev in events)

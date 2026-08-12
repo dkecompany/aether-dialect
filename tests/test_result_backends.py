@@ -21,7 +21,11 @@ from aetherdialect._dialect_sqlglot_engines import (
     SnowflakeArrowBackend,
     SQLiteNativeBackend,
 )
-from aetherdialect._dialect_sqlglot_helper import SqlAlchemyResultBackend, SqlServerResultBackend
+from aetherdialect._dialect_sqlglot_helper import (
+    OracleResultBackend,
+    SqlAlchemyResultBackend,
+    SqlServerResultBackend,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -65,6 +69,7 @@ def _drain_batches(backend: Any, batch_rows: int = 2) -> list[tuple[tuple[Any, .
     [
         lambda: SqlAlchemyResultBackend(_sqlalchemy_engine_mock([(1,), (2,), (3,)]), dialect_name="duckdb"),
         lambda: SqlServerResultBackend(_sqlalchemy_engine_mock([(4,)]), dialect_name="SQLServerDialect"),
+        lambda: OracleResultBackend(_sqlalchemy_engine_mock([(4,)]), dialect_name="OracleDialect"),
         lambda: DatabricksConnectorBackend(_connector_connection_mock([(5,), (6,)])),
         lambda: DatabricksSparkBackend(_spark_mock([(7,), (8,)])),
         lambda: DatabricksSqlAlchemyBackend(_sqlalchemy_engine_mock([(9,)]), dialect_name="DatabricksDialect"),
@@ -79,6 +84,7 @@ def _drain_batches(backend: Any, batch_rows: int = 2) -> list[tuple[tuple[Any, .
     ids=[
         "sqlalchemy",
         "sqlserver",
+        "oracle",
         "databricks_connector",
         "databricks_spark",
         "databricks_sqlalchemy",

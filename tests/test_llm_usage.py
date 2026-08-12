@@ -9,8 +9,9 @@ import pytest
 
 from aetherdialect._config import EngineConfig
 from aetherdialect._constants import DIAGNOSTIC_CODE_LLM_TURN_COST
-from aetherdialect._contracts_base import LlmUsageRecord
-from aetherdialect._core_utils import (
+from aetherdialect._contracts_core import LlmUsageRecord
+from aetherdialect._llm_provider import LLMProvider
+from aetherdialect._utils import (
     llm_call_audit_details,
     llm_call_cost_usd,
     llm_turn_cost_diagnostic,
@@ -23,7 +24,6 @@ from aetherdialect._core_utils import (
     set_llm_price_table_override,
     snapshot_llm_usage_records,
 )
-from aetherdialect._llm_provider import LLMProvider
 
 
 @pytest.fixture(autouse=True)
@@ -206,8 +206,8 @@ def test_llm_chat_records_usage_on_success() -> None:
             with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
                 with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
                     with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=mock_client):
-                        with patch("aetherdialect._core_utils.debug"):
-                            with patch("aetherdialect._core_utils.pipeline_trace"):
+                        with patch("aetherdialect._utils.debug"):
+                            with patch("aetherdialect._utils.pipeline_trace"):
                                 LLMProvider.chat("sys", "usr", max_retries=1, task="intent")
     finally:
         EngineConfig.LLM_PROVIDER = prev
@@ -218,10 +218,66 @@ def test_llm_chat_records_usage_on_success() -> None:
     assert record.input_tokens == 12
     assert record.cached_input_tokens == 4
     assert record.output_tokens == 3
+    assert record.cache_write_tokens == 0
+
+
+@pytest.mark.fast
+def test_llm_chat_records_cache_write_tokens_when_present() -> None:
+    usage = MagicMock()
+    usage.input_tokens = 20
+    usage.output_tokens = 2
+    usage.input_tokens_details = MagicMock(cached_tokens=5, cache_write_tokens=7)
+    mock_resp = MagicMock()
+    mock_resp.output_text = '{"ok": true}'
+    mock_resp.usage = usage
+    mock_client = MagicMock()
+    mock_client.responses.create.return_value = mock_resp
+
+    prev = EngineConfig.LLM_PROVIDER
+    EngineConfig.LLM_PROVIDER = "openai"
+    try:
+        with llm_usage_session_scope():
+            with patch("aetherdialect._llm_provider.LLMProvider._provider_order", return_value=["openai"]):
+                with patch("aetherdialect._llm_provider.LLMProvider._provider_is_configured", return_value=True):
+                    with patch("aetherdialect._llm_provider.LLMProvider._build_client", return_value=mock_client):
+                        with patch("aetherdialect._utils.debug"):
+                            with patch("aetherdialect._utils.pipeline_trace"):
+                                LLMProvider.chat("sys", "usr", max_retries=1, task="intent")
+    finally:
+        EngineConfig.LLM_PROVIDER = prev
+
+    record = snapshot_llm_usage_records()[-1]
+    assert record.cache_write_tokens == 7
+
+
+@pytest.mark.fast
+def test_record_llm_usage_sets_turn_id_when_active() -> None:
+    from aetherdialect._utils import pop_turn_id, push_turn_id
+
+    with llm_usage_session_scope():
+        turn_id = "turn-abc-123"
+        token = push_turn_id(turn_id)
+        try:
+            record_llm_usage(
+                task="intent",
+                logical_model="gpt-5.4-mini",
+                api_model="gpt-5.4-mini",
+                provider="openai",
+                input_tokens=1,
+                cached_input_tokens=0,
+                output_tokens=1,
+                cache_write_tokens=0,
+                attempt=1,
+                elapsed_ms=1,
+            )
+        finally:
+            pop_turn_id(token)
+    record = snapshot_llm_usage_records()[-1]
+    assert record.turn_id == turn_id
 
 
 def test_invoice_writer_groups_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from live_tests import _invoice
+    import sandbox_recording as _invoice
 
     invoice_file = tmp_path / "invoice.txt"
     monkeypatch.setattr(_invoice, "_INVOICE_PATH", invoice_file)
@@ -263,3 +319,52 @@ def test_invoice_writer_groups_blocks(tmp_path: Path, monkeypatch: pytest.Monkey
     assert "[run_total]" in text
     assert "questions=1" in text
     assert "note=reported totals are a floor" in text
+
+
+def test_nested_build_scope_wins_over_turn_question() -> None:
+    from aetherdialect._utils import reset_turn_llm_scope, set_turn_llm_scope
+
+    with llm_usage_session_scope():
+        tok = set_turn_llm_scope("question")
+        try:
+            with llm_usage_build_scope():
+                record_llm_usage(
+                    task="schema",
+                    logical_model="gpt-5-mini",
+                    api_model="gpt-5-mini",
+                    provider="openai",
+                    input_tokens=10,
+                    cached_input_tokens=0,
+                    output_tokens=1,
+                    cache_write_tokens=None,
+                    attempt=1,
+                    elapsed_ms=1,
+                )
+            record_llm_usage(
+                task="intent_compose",
+                logical_model="gpt-5.4-mini",
+                api_model="gpt-5.4-mini",
+                provider="openai",
+                input_tokens=20,
+                cached_input_tokens=0,
+                output_tokens=2,
+                cache_write_tokens=None,
+                attempt=1,
+                elapsed_ms=1,
+            )
+        finally:
+            reset_turn_llm_scope(tok)
+    rows = snapshot_llm_usage_records()
+    assert rows[0].scope == "build"
+    assert rows[1].scope == "question"
+
+
+def test_prompt_cache_key_always_emitted_and_stage_distinct() -> None:
+    intake = LLMProvider.resolve_prompt_cache_key("intake_validate")
+    compose = LLMProvider.resolve_prompt_cache_key("intent_compose")
+    interpret = LLMProvider.resolve_prompt_cache_key("intent_interpret")
+    assert intake is not None
+    assert compose is not None
+    assert interpret is not None
+    assert intake != compose
+    assert interpret != compose

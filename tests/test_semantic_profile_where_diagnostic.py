@@ -6,12 +6,12 @@ import pytest
 
 from aetherdialect._constants import DIAGNOSTIC_CODE_SEMANTIC_PROFILE_WHERE_EDGE
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._sql_gen import _join_edges_from_signature, emit_semantic_profile_where_diagnostics
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._sql_gen import _join_edges_from_signature, emit_semantic_profile_where_diagnostics
 
 _OVERLAP = ["open", "closed", "pending", "done", "hold"]
 

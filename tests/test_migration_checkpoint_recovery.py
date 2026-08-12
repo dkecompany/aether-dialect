@@ -1,4 +1,4 @@
-"""Leftover migration checkpoints restore on engine construction."""
+"""Incomplete migration checkpoints restore on engine construction."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import pytest
 from aetherdialect import _main_execution
 from aetherdialect._config import EngineConfig
 from aetherdialect._constants import TEMPLATE_STORE_SEGMENT
-from aetherdialect._contracts_base import EngineContext, MigrationTier
-from aetherdialect._contracts_core import ConcreteIntent, NormalizedExpr, SelectCol, Template, ValueHistory
+from aetherdialect._contracts_base import EngineContext, MigrationTier, NormalizedExpr
+from aetherdialect._contracts_core import ConcreteIntent, SelectCol, Template, ValueHistory
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     ColumnRole,
@@ -22,8 +22,8 @@ from aetherdialect._contracts_schema import (
     TableMetadata,
     TemplateStats,
 )
-from aetherdialect._core_utils import read_artifact_manifest, write_artifact_manifest
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import read_artifact_manifest, write_artifact_manifest
 
 
 def _col(name: str, *, pk: bool = False) -> ColumnMetadata:
@@ -106,7 +106,7 @@ def _seed_store(artifacts_dir: str, schema: SchemaGraph, templates: dict[str, Te
 
 
 @pytest.mark.fast
-def test_leftover_checkpoint_restored_on_init(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_incomplete_checkpoint_restored_on_init(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     artifacts_dir = str(tmp_path / "artifacts")
     schema = _schema()
     _seed_store(artifacts_dir, schema, {"T0001": _make_template("T0001")})
@@ -138,12 +138,12 @@ def test_leftover_checkpoint_restored_on_init(tmp_path: Path, monkeypatch: pytes
 
     with (
         patch(
-            "aetherdialect._main_execution.MainExecutionOps.compute_engine_storage_dir",
+            "aetherdialect._main_init.MainInitOps.compute_engine_storage_dir",
             return_value=artifacts_dir,
         ),
-        patch("aetherdialect._main_execution.DialectRegistry.get_dialect", return_value=MagicMock()),
+        patch("aetherdialect._dialect.DialectRegistry.get_dialect", return_value=MagicMock()),
         patch(
-            "aetherdialect._main_execution.build_schema_graph_with_diff",
+            "aetherdialect._main_init.build_schema_graph_with_diff",
             side_effect=init_error,
         ),
     ):

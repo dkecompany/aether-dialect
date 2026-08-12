@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import _coordinator_relation_column_types_from_names
+from aetherdialect._federation_execute import _coordinator_relation_column_types_from_names
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 

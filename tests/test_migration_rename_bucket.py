@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import ArtifactManifest, ColumnRole, MigrationTier
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import assess_rename_migration_plan, try_rename_migration_plan
-from aetherdialect._schema_graph import classify_migration_tier
+from aetherdialect._contracts_base import ArtifactManifest, MigrationTier
+from aetherdialect._contracts_schema import ColumnMetadata, ColumnRole, SchemaGraph, TableMetadata
+from aetherdialect._schema_graph import (
+    assess_rename_migration_plan,
+    classify_migration_tier,
+    try_rename_migration_plan,
+)
 
 
 def _col(

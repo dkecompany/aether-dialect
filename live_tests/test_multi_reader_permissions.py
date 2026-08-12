@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect import AetherEngine
-from aetherdialect._constants import PERMISSION_DENIED_USER_MESSAGE
+from aetherdialect._constants_runtime import PERMISSION_DENIED_USER_MESSAGE
 from live_tests.conftest import (
     _CONSUMER_CREDENTIALS_SKIP_REASON,
     _consumer_credentials_configured,

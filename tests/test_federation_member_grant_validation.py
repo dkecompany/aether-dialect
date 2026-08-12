@@ -7,17 +7,23 @@ from unittest.mock import MagicMock
 import pytest
 
 from aetherdialect._constants import FEDERATION_MAPPINGS_VERSION
-from aetherdialect._contracts_base import LogicalColumnMapping, MemberEffectiveGrants
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    FederationDeclarationError,
+from aetherdialect._contracts_base import FederationDeclarationError, MemberEffectiveGrants
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
     FederationMappings,
+    LogicalColumnMapping,
+    SchemaGraph,
+    TableMetadata,
+)
+from aetherdialect._federation_compose import (
     compose_composite_graph,
-    introspect_member_effective_grants,
     member_effective_grants_from_graph,
+    resolve_member_effective_grants,
+)
+from aetherdialect._federation_manifest import (
+    introspect_member_effective_grants,
     member_graphs_from_engines,
     parse_federation_manifest,
-    resolve_member_effective_grants,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi
 

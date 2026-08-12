@@ -1,4 +1,4 @@
-"""Unit tests for aetherdialect._validation_execute module."""
+"""Unit tests for aetherdialect._validation_sql module."""
 
 from types import SimpleNamespace
 from typing import Any
@@ -30,12 +30,12 @@ from aetherdialect._contracts_schema import (
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._core_utils import bind_params_for_sql
 from aetherdialect._dialect import Dialect
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._validation_execute import (
+from aetherdialect._utils import bind_params_for_sql
+from aetherdialect._validation_sql import (
     _enforce_select_only,
     _validate_case_branches_for_scope,
     _validate_cte_cardinality,
@@ -204,6 +204,19 @@ class TestEnforceSelectOnly:
         ok, reason = _enforce_select_only("SELECT title FROM film UNION SELECT title FROM film", _PG_ENFORCE)
         assert ok is False
         assert reason == "forbidden_sql"
+
+    def test_union_allowed_for_coordinator_glue(self):
+        """Coordinator glue may use UNION ALL while member SQL remains blocked."""
+        from aetherdialect._dialect import DialectRegistry
+
+        duckdb = DialectRegistry.get_dialect("duckdb")
+        sql = "SELECT id FROM a UNION ALL SELECT id FROM b"
+        ok, reason = _enforce_select_only(sql, duckdb, allow_union=True)
+        assert ok is True
+        assert reason == "ok"
+        blocked, blocked_reason = _enforce_select_only(sql, duckdb)
+        assert blocked is False
+        assert blocked_reason == "forbidden_sql"
 
     def test_case_insensitive_select(self):
         """Lowercase select passes."""
@@ -424,12 +437,12 @@ def _parent_child_schema() -> SchemaGraph:
 
 
 class TestValidateCteEmissionReclassification:
-    """Engine-owned CTE emission mismatches are errors."""
+    """Author-owned probe emission mismatches are errors; engine-checked kinds are not."""
 
-    def test_coerce_cte_emission_rejects_model_scalar_subquery(self):
+    def test_coerce_cte_emission_accepts_scalar_subquery(self):
         assert CteEmissionKind.coerce("scalar_subquery") == CteEmissionKind.SCALAR_SUBQUERY
 
-    def test_model_declared_scalar_subquery_is_forbidden(self):
+    def test_model_declared_scalar_subquery_is_allowed(self):
         cte = RuntimeCteStep(
             cte_name="avg_cte",
             tables=["parent"],
@@ -448,10 +461,10 @@ class TestValidateCteEmissionReclassification:
             cte_steps=[cte],
         )
         issues = validate_cte_emission_reclassification(intent, _parent_child_schema())
-        assert any(i.issue_id == "cte_emission_model_declared_scalar_subquery_avg_cte" for i in issues)
-        assert all(i.severity == "error" for i in issues)
+        assert not any("model_declared_scalar_subquery" in i.issue_id for i in issues)
+        assert not any(i.severity == "error" for i in issues)
 
-    def test_scalar_subquery_on_non_scalar_cte_errors(self):
+    def test_scalar_subquery_on_non_scalar_cte_does_not_hard_error_on_declaration(self):
         cte = RuntimeCteStep(
             cte_name="wide_cte",
             tables=["parent", "child"],
@@ -473,8 +486,11 @@ class TestValidateCteEmissionReclassification:
             cte_steps=[cte],
         )
         issues = validate_cte_emission_reclassification(intent, _parent_child_schema())
-        assert any(i.issue_id == "cte_emission_model_declared_scalar_subquery_wide_cte" for i in issues)
-        assert all(i.severity == "error" for i in issues)
+        assert not any("model_declared_scalar_subquery" in i.issue_id for i in issues)
+        from aetherdialect._sql_gen import classify_cte_emission
+
+        classified = classify_cte_emission(cte, intent, _parent_child_schema())
+        assert (classified.value if hasattr(classified, "value") else str(classified)) == "join_table"
 
     def test_wrongly_declared_semi_join_reclassified_to_join_table(self):
         semi = RuntimeCteStep(
@@ -852,8 +868,8 @@ class TestValidateSql:
         )
         ok, err, cat, _diags = validate_sql(mock_dialect, "SELECT * FROM missing")
         assert ok is False
-        assert err.startswith("[explain_schema]")
-        assert 'relation "missing" does not exist' in err
+        assert err == "[explain_schema] SQL references objects that are not available in this context."
+        assert 'relation "missing" does not exist' not in err
         assert cat == FailureCategory.EXECUTION_SCHEMA_ERROR
 
     def test_ast_none_error_stringified(self):
@@ -1079,9 +1095,7 @@ class TestValidateSemantics:
     def test_merge_cte_projection_columns_into_outputs_adds_missing_keys(self):
         """Sparse ``output_column_metadata`` is augmented from ``output_columns``."""
         from aetherdialect._contracts_schema import CteOutputColumnMeta
-        from aetherdialect._validation_execute import (
-            _merge_cte_projection_columns_into_outputs,
-        )
+        from aetherdialect._validation_sql import _merge_cte_projection_columns_into_outputs
 
         meta: dict[str, CteOutputColumnMeta] = {}
         _merge_cte_projection_columns_into_outputs(meta, ["orders.order_id", "total"])

@@ -83,7 +83,7 @@ def test_help_exits_zero() -> None:
 def test_valid_flag_combos_pass_argparse(sandbox_corpus, argv: list[str]) -> None:
     with (
         patch.object(sandbox_corpus, "_run_full_build") as build_mock,
-        patch.object(sandbox_corpus, "finalize_validate_and_pack") as pack_mock,
+        patch.object(sandbox_corpus, "finalize_validate") as pack_mock,
         patch.object(sandbox_corpus, "corpus_message"),
         patch("sys.argv", argv),
     ):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ._seed_helpers import run_isolated_scenario
+from .live_support import run_isolated_scenario
 from .mydb_scenarios import core_isolated_live_scenarios
 
 _CORE_ISOLATED = core_isolated_live_scenarios()

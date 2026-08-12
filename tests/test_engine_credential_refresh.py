@@ -25,7 +25,7 @@ def test_apply_connection_credentials_dict_accepts_redacted_names() -> None:
 
 
 @pytest.mark.fast
-def test_refresh_connection_preserves_schema_graph_and_store() -> None:
+def test_refresh_preserves_schema_graph_and_store() -> None:
     engine = _make_aether_stub()
     graph_before = engine._schema_graph
     store_before = engine._store
@@ -35,11 +35,23 @@ def test_refresh_connection_preserves_schema_graph_and_store() -> None:
     engine._dialect = old_dialect
     new_dialect = MagicMock(name="new_dialect")
 
-    with patch(
-        "aetherdialect.aetherdialect.refresh_engine_connection",
-        return_value=new_dialect,
-    ) as refresh_mock:
-        engine.refresh_connection(credentials={"PASSWORD": "rotated"})
+    with (
+        patch(
+            "aetherdialect.aetherdialect.refresh_engine_connection",
+            return_value=new_dialect,
+        ) as refresh_mock,
+        patch(
+            "aetherdialect.aetherdialect.MainExecutionOps.refresh_aether_engine",
+            return_value=MagicMock(
+                migration_tier=MagicMock(value="NO_CHANGE"),
+                schema_changed=False,
+                orphans_removed=0,
+                bytes_reclaimed=0,
+                diagnostics=(),
+            ),
+        ),
+    ):
+        engine.refresh(credentials={"PASSWORD": "rotated"})
 
     refresh_mock.assert_called_once()
     assert engine._schema_graph is graph_before
@@ -49,32 +61,56 @@ def test_refresh_connection_preserves_schema_graph_and_store() -> None:
 
 
 @pytest.mark.fast
-def test_refresh_connection_passes_existing_dialect_for_disposal() -> None:
+def test_refresh_passes_existing_dialect_for_disposal() -> None:
     engine = _make_aether_stub()
     old_dialect = MagicMock()
     engine._dialect = old_dialect
 
-    with patch(
-        "aetherdialect.aetherdialect.refresh_engine_connection",
-        return_value=MagicMock(),
-    ) as refresh_mock:
-        engine.refresh_connection(credentials="next-token")
+    with (
+        patch(
+            "aetherdialect.aetherdialect.refresh_engine_connection",
+            return_value=MagicMock(),
+        ) as refresh_mock,
+        patch(
+            "aetherdialect.aetherdialect.MainExecutionOps.refresh_aether_engine",
+            return_value=MagicMock(
+                migration_tier=MagicMock(value="NO_CHANGE"),
+                schema_changed=False,
+                orphans_removed=0,
+                bytes_reclaimed=0,
+                diagnostics=(),
+            ),
+        ),
+    ):
+        engine.refresh(credentials="next-token")
 
     assert refresh_mock.call_args.kwargs["dialect"] is old_dialect
 
 
 @pytest.mark.fast
-def test_refresh_connection_uses_token_provider_when_credentials_omitted() -> None:
+def test_refresh_uses_token_provider_when_credentials_omitted() -> None:
     engine = _make_aether_stub()
     provider = MagicMock(return_value={"PASSWORD": "from-provider"})
     engine._token_provider = provider
     new_dialect = MagicMock()
 
-    with patch(
-        "aetherdialect.aetherdialect.refresh_engine_connection",
-        return_value=new_dialect,
-    ) as refresh_mock:
-        engine.refresh_connection()
+    with (
+        patch(
+            "aetherdialect.aetherdialect.refresh_engine_connection",
+            return_value=new_dialect,
+        ) as refresh_mock,
+        patch(
+            "aetherdialect.aetherdialect.MainExecutionOps.refresh_aether_engine",
+            return_value=MagicMock(
+                migration_tier=MagicMock(value="NO_CHANGE"),
+                schema_changed=False,
+                orphans_removed=0,
+                bytes_reclaimed=0,
+                diagnostics=(),
+            ),
+        ),
+    ):
+        engine.refresh()
 
     refresh_mock.assert_called_once()
     assert refresh_mock.call_args.kwargs["credentials"] is None
@@ -92,12 +128,12 @@ def test_resolve_connection_credentials_consults_token_provider() -> None:
 
 
 @pytest.mark.fast
-def test_refresh_connection_requires_credentials_or_provider() -> None:
+def test_refresh_requires_credentials_or_provider() -> None:
     engine = _make_aether_stub()
     engine._token_provider = None
 
     with pytest.raises(ConfigError, match="credentials or a token_provider"):
-        engine.refresh_connection()
+        engine.refresh()
 
 
 @pytest.mark.fast

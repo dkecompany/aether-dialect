@@ -9,8 +9,8 @@ import pytest
 import duckdb
 from aetherdialect._config import FederationLimits
 from aetherdialect._constants import DIAGNOSTIC_CODE_COORDINATOR_LIMITS
-from aetherdialect._core_utils import pop_federation_limits, push_federation_limits
-from aetherdialect._federation import _configure_federation_coordinator_connection
+from aetherdialect._federation_execute import _configure_federation_coordinator_connection
+from aetherdialect._utils import pop_federation_limits, push_federation_limits
 
 
 @pytest.mark.fast
@@ -26,7 +26,7 @@ def test_memory_and_temp_directory_configured(tmp_path) -> None:
     token = push_federation_limits(limits)
     conn = duckdb.connect(":memory:")
     try:
-        with patch("aetherdialect._federation.notify") as notify_mock:
+        with patch("aetherdialect._federation_execute.notify") as notify_mock:
             memory_report, temp_directory, threads, owned_temp = _configure_federation_coordinator_connection(
                 conn,
                 federation_dir=str(tmp_path / "fed"),

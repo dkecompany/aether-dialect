@@ -10,12 +10,12 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect._config import EngineConfig
-from aetherdialect._contracts_base import DescriptionOwner, SpaceContext
+from aetherdialect._contracts_base import NormalizedExpr, SpaceContext
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import Dialect, _apply_coordinator_probe_joins
-from aetherdialect._intent_process import NormalizedExpr, build_intent_parse_prompt
+from aetherdialect._contracts_schema import ColumnMetadata, DescriptionOwner, SchemaGraph, TableMetadata
+from aetherdialect._dialect import Dialect, DialectRegistry
+from aetherdialect._federation_plan import _apply_coordinator_probe_joins
+from aetherdialect._intent_loop import build_intent_parse_prompt
 from aetherdialect._main_execution import MainExecutionOps
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from aetherdialect._sql_gen import build_deterministic_sql, inject_join_into_deterministic_sql
@@ -45,7 +45,7 @@ def _capture_llm_chat(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, s
             }
         )
 
-    monkeypatch.setattr("aetherdialect._schema_catalog.LLMProvider.chat", _fake)
+    monkeypatch.setattr("aetherdialect._schema_profile.LLMProvider.chat", _fake)
     return calls
 
 
@@ -154,11 +154,13 @@ def test_instruction_like_content_stays_in_data_not_system(
         snapshot = {"tables": ["orders"], "table_descriptions": {}, "column_meta": {}}
         space = SpaceContext(tables=frozenset({"orders"}), notes_file=str(notes))
         with patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True):
-            MainExecutionOps.enrich_space_snapshot_with_notes(snapshot, graph, space, str(notes))
+            out = MainExecutionOps.enrich_space_snapshot_with_notes(snapshot, graph, space, str(notes))
+        # Raw notes stay in snapshot data; scope/refine LLM payloads are classification-only.
+        assert INSTRUCTION_LIKE in (out.get("notes") or "")
         assert calls
-        refine_system, refine_user, _task = calls[-1]
-        assert INSTRUCTION_LIKE not in refine_system
-        assert INSTRUCTION_LIKE in refine_user
+        for system, _user, _task in calls:
+            assert INSTRUCTION_LIKE not in system
+        assert any(INSTRUCTION_LIKE in user for _, user, _ in calls)
         return
 
     graph = _orders_graph()

@@ -23,7 +23,7 @@ def test_instances_match_marker() -> None:
 
 
 def test_engine_connect_likely_transient_message_heuristic() -> None:
-    from aetherdialect._core_utils import engine_connect_likely_transient
+    from aetherdialect._utils import engine_connect_likely_transient
 
     assert engine_connect_likely_transient(Exception("connection reset by peer"))
     assert engine_connect_likely_transient(Exception("Error 503: temporarily unavailable"))

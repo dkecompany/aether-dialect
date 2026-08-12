@@ -6,8 +6,9 @@ import hashlib
 
 import pytest
 
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import FederationMappings, compose_composite_graph, parse_federation_manifest
+from aetherdialect._contracts_schema import ColumnMetadata, FederationMappings, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -46,7 +47,7 @@ def test_compose_sets_composite_notes_sha256_from_federation_notes() -> None:
     composite = compose_composite_graph(
         _members(),
         manifest,
-        FederationMappings(version="0.2.1"),
+        FederationMappings(version="0.2.3"),
         notes_content=notes,
     )
     assert composite.notes_sha256 == hashlib.sha256(notes.encode("utf-8")).hexdigest()

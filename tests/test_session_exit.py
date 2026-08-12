@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._main_execution import PipelineSession
-from aetherdialect._templates import TemplateOps
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _session_owner() -> MagicMock:
@@ -35,7 +35,7 @@ def test_exit_cancels_in_flight_statement() -> None:
 
     with (
         patch.object(session, "cancel", wraps=session.cancel) as cancel_mock,
-        patch("aetherdialect._main_execution.Dialect.cancel_in_flight_statement") as dialect_cancel,
+        patch("aetherdialect._dialect.Dialect.cancel_in_flight_statement") as dialect_cancel,
     ):
         session.__exit__(None, None, None)
 
@@ -48,7 +48,7 @@ def test_exit_leaves_engine_usable() -> None:
     owner = _session_owner()
     session = PipelineSession(owner, mode="reader")
 
-    with patch("aetherdialect._main_execution.MainExecutionOps.interactive_run_once"):
+    with patch("aetherdialect._main_init.MainInitOps.interactive_run_once"):
         with session:
             session.ask("first question")
         session.ask("second question after exit")

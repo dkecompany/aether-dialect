@@ -12,7 +12,8 @@ import sqlglot
 from aetherdialect._contracts_base import ConfigError, NormalizedExpr, SpaceContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._validation_execute import _enforce_select_only, _pg_parsed_has_forbidden_sql
+from aetherdialect._schema_profile import NotesExtractionLedger, NotesExtractionResult
+from aetherdialect._validation_sql import _enforce_select_only, _pg_parsed_has_forbidden_sql
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "src" / "aetherdialect"
@@ -82,14 +83,19 @@ def test_named_handlers_report() -> None:
     notes.write_text("notes", encoding="utf-8")
     snapshot = {"tables": ["orders"], "table_descriptions": {}, "column_meta": {}}
     space = SpaceContext(tables=frozenset({"orders"}), notes_file=str(notes))
+    sk_fact = __import__("aetherdialect._contracts_base", fromlist=["StructuralKnowledgeFact"]).StructuralKnowledgeFact(
+        kind="relation",
+        text="order rows",
+        referenced_entities=frozenset({"orders"}),
+    )
     with (
         patch("aetherdialect._config.EngineConfig.llm_credentials_configured", return_value=True),
         patch(
-            "aetherdialect._main_execution.extract_business_knowledge_from_notes",
-            return_value=(),
+            "aetherdialect._main_spaces.extract_knowledge_from_notes",
+            return_value=NotesExtractionResult((), (sk_fact,), NotesExtractionLedger(())),
         ),
         patch(
-            "aetherdialect._main_execution.llm_classify_schema",
+            "aetherdialect._main_spaces.llm_enrich_schema_from_structural_knowledge",
             side_effect=RuntimeError("model unavailable"),
         ),
         pytest.raises(RuntimeError, match="model unavailable"),

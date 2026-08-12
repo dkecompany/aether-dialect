@@ -7,12 +7,12 @@ import pytest
 from aetherdialect._constants import DIAGNOSTIC_CODE_JOIN_NULLABLE_KEY
 from aetherdialect._contracts_base import SchemaInvariantError
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import (
+from aetherdialect._sql_gen import _join_edges_from_signature
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
-from aetherdialect._sql_gen import _join_edges_from_signature
 
 
 def _col(

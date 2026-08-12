@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import copy
 import glob
-import json
 import os
 import re
 import shutil
+import sys
 import tempfile
-from collections.abc import Mapping
+import types
 from pathlib import Path
 from typing import Any
 
@@ -24,53 +24,114 @@ from aetherdialect._config import (
 )
 from aetherdialect._contracts_base import EngineContext, SensitivityClassification
 from aetherdialect._contracts_core import LiveTestRunner
-from aetherdialect._core_utils import (
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._schema_finalize import (
+    apply_structure_to_graph,
+    load_structure_document_file,
+)
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils import (
     StepResult,
-    append_failure_trace,
     llm_usage_build_scope,
     llm_usage_question_scope,
     llm_usage_session_scope,
 )
-from aetherdialect._main_execution import MainExecutionOps
-from aetherdialect._schema_overrides import (
-    apply_schema_overrides_to_graph,
-    load_schema_overrides_file,
+from sandbox_recording import (
+    allocate_run_artifact_path,
+    append_live_failure_trace,
+    append_results_summary_line,
+    append_run_total_invoice,
+    flush_invoice_file,
+    init_invoice_file,
+    results_file,
+    set_invoice_path,
+    set_results_file,
+    write_live_env_file_to_temp_config_toml,
 )
-from aetherdialect._templates import (
-    TemplateOps,
+from sandbox_recording import (
+    init_results_file as _init_results_file,
+)
+from sandbox_recording import (
+    parse_live_env_file as _parse_live_env_file,
 )
 
-from ._invoice import clear_invoice_file, write_invoice_file
+from .mydb_profile import (
+    PROFILE_CONSUMER_ALLOW_OBJECTS,
+    PROFILE_DATABASE_NAME_DEFAULT,
+    PROFILE_NOTES_DEFAULT,
+    PROFILE_OVERRIDES_PATH,
+    PROFILE_SQL_DEFAULT,
+)
 
-_RENTAL_SHOP_OVERRIDES = Path(__file__).resolve().parent.parent / "scripts" / "data" / "rental_shop_overrides.json"
-
-_RESULTS_FILE = Path(__file__).parent / "results.txt"
+_RESULTS_BASE = Path(__file__).parent / "results.txt"
+_INVOICE_BASE = Path(__file__).parent / "invoice.txt"
+_LIVE_ARTIFACTS_ROOT = Path(__file__).parent / "_run_artifacts"
+set_results_file(_RESULTS_BASE)
+set_invoice_path(_INVOICE_BASE)
 
 _step_results: dict[str, StepResult] = {}
 _NODEID_SCENARIO_IDS: dict[str, list[str]] = {}
 _CURRENT_TEST_NODEID: str | None = None
 _results_trace_pending_sep = False
 
-
-def _clear_results_file() -> None:
-    _RESULTS_FILE.write_text("", encoding="utf-8")
+_append_failure_trace = append_live_failure_trace
 
 
-def _append_failure_trace(step: StepResult | list[StepResult] | object | None) -> None:
-    append_failure_trace(step, _RESULTS_FILE)
+class _ConftestModule(types.ModuleType):
+    """Keep ``_RESULTS_FILE`` assignments synced with ``sandbox_recording``."""
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "_RESULTS_FILE":
+            return results_file()
+        raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_RESULTS_FILE":
+            set_results_file(Path(value))
+            return
+        super().__setattr__(name, value)
 
 
-def pytest_sessionstart(session: pytest.Session) -> None:
-    global _results_trace_pending_sep
-    _ = session
+sys.modules[__name__].__class__ = _ConftestModule
+
+
+def _session_includes_live_tests(session: pytest.Session) -> bool:
+    """True when at least one selected item lives under ``live_tests/``."""
+    for item in getattr(session, "items", []) or []:
+        path = str(getattr(item, "path", "") or getattr(item, "fspath", "") or "")
+        if "live_tests" in path.replace("\\", "/"):
+            return True
+    return False
+
+
+_LIVE_RUN_ARTIFACTS_READY = False
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Allocate live invoice/results only when selected items are under ``live_tests/``."""
+    global _results_trace_pending_sep, _LIVE_RUN_ARTIFACTS_READY
+    if not _session_includes_live_tests(session):
+        _LIVE_RUN_ARTIFACTS_READY = False
+        return
     _results_trace_pending_sep = False
-    _clear_results_file()
-    clear_invoice_file()
+    chosen = allocate_run_artifact_path(_RESULTS_BASE)
+    set_results_file(chosen)
+    _init_results_file()
+    invoice = allocate_run_artifact_path(_INVOICE_BASE)
+    set_invoice_path(invoice)
+    init_invoice_file()
+    _LIVE_RUN_ARTIFACTS_READY = True
+    print(f"Live tests results: {chosen.resolve()}", flush=True)
+    print(f"Live tests invoice: {invoice.resolve()}", flush=True)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     _ = session, exitstatus
-    write_invoice_file()
+    global _LIVE_RUN_ARTIFACTS_READY
+    if not _LIVE_RUN_ARTIFACTS_READY:
+        return
+    append_run_total_invoice()
+    _LIVE_RUN_ARTIFACTS_READY = False
 
 
 def _is_databricks_live_nodeid(nodeid: str) -> bool:
@@ -81,7 +142,7 @@ def _is_databricks_live_nodeid(nodeid: str) -> bool:
 
 def _is_engine_specific_nodeid(nodeid: str) -> bool:
     """Return True when the test lives under a non-PostgreSQL engine- specific live module."""
-    from ._engine_live import ENGINE_MODULE_FRAGMENTS
+    from .live_support import ENGINE_MODULE_FRAGMENTS
 
     path = nodeid.replace("\\", "/")
     return any(f"{fragment}" in path for fragment in ENGINE_MODULE_FRAGMENTS)
@@ -125,321 +186,6 @@ def _relax_rental_shop_selectability(schema: Any, database_name: str) -> None:
             column.mode_frequency_ratio = 0.0
 
 
-def _parse_live_env_file(path: str) -> dict[str, str]:
-    """Parse a UTF-8 ``KEY=value`` environment file into a flat mapping of configuration keys."""
-    raw = Path(path).read_text(encoding="utf-8")
-    if raw.startswith("\ufeff"):
-        raw = raw[1:]
-    out: dict[str, str] = {}
-    for line in raw.splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        if s.lower().startswith("export "):
-            s = s[7:].strip()
-        if "=" not in s:
-            continue
-        key, value = s.split("=", 1)
-        key = key.strip()
-        if not key:
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        out[key] = value
-    return out
-
-
-def _toml_emit_section(full_name: str, table: Mapping[str, Any], lines: list[str]) -> None:
-    scalars = {k: v for k, v in table.items() if not isinstance(v, dict)}
-    nested = {k: v for k, v in table.items() if isinstance(v, dict)}
-    if scalars:
-        lines.append(f"[{full_name}]")
-        for k, v in scalars.items():
-            lines.append(f"{k} = {json.dumps(str(v))}")
-    for child_name, child_table in nested.items():
-        _toml_emit_section(f"{full_name}.{child_name}", child_table, lines)
-
-
-def _flat_live_env_to_nested_document(flat: dict[str, str]) -> dict[str, Any]:
-    doc: dict[str, Any] = {}
-    openai: dict[str, str] = {}
-    if v := flat.get("OPENAI_API_KEY"):
-        openai["api_key"] = v
-    if v := flat.get("OPENAI_BASE_URL"):
-        openai["base_url"] = v
-    if openai:
-        doc["openai"] = openai
-    azure: dict[str, Any] = {}
-    if v := flat.get("AZURE_OPENAI_ENDPOINT"):
-        azure["endpoint"] = v
-    if v := flat.get("AZURE_OPENAI_API_KEY"):
-        azure["api_key"] = v
-    if v := flat.get("AZURE_OPENAI_API_VERSION"):
-        azure["api_version"] = v
-    if v := flat.get("AZURE_OPENAI_BASE_URL"):
-        azure["base_url"] = v
-    deployments: dict[str, str] = {}
-    if v := flat.get("AZURE_OPENAI_DEPLOYMENT_LIGHT"):
-        deployments["light"] = v
-    if v := flat.get("AZURE_OPENAI_DEPLOYMENT_HEAVY"):
-        deployments["heavy"] = v
-    if deployments:
-        azure["deployments"] = deployments
-    if azure:
-        doc["azure_openai"] = azure
-
-    def _first_nonempty(*keys: str) -> str:
-        for k in keys:
-            raw = flat.get(k)
-            if raw is None:
-                continue
-            t = str(raw).strip()
-            if t:
-                return t
-        return ""
-
-    pg: dict[str, str] = {}
-    if v := _first_nonempty("POSTGRES_HOST", "PGHOST", "PGHOSTADDR"):
-        pg["host"] = v
-    if v := _first_nonempty("POSTGRES_PORT", "PGPORT"):
-        pg["port"] = v
-    if v := _first_nonempty("POSTGRES_DB", "PGDATABASE"):
-        pg["database"] = v
-    if v := _first_nonempty("POSTGRES_SCHEMA", "PGSCHEMA"):
-        pg["schema"] = v
-    if v := _first_nonempty("POSTGRES_USER", "PGUSER"):
-        pg["user"] = v
-    if v := _first_nonempty("POSTGRES_PASSWORD", "PGPASSWORD"):
-        pg["password"] = v
-    if pg:
-        doc["postgresql"] = pg
-    dbx: dict[str, str] = {}
-    if v := flat.get("DATABRICKS_HOST"):
-        dbx["host"] = v
-    if v := flat.get("DATABRICKS_HTTP_PATH"):
-        dbx["http_path"] = v
-    if v := _first_nonempty("DATABRICKS_ACCESS_TOKEN", "DATABRICKS_TOKEN"):
-        dbx["access_token"] = v
-    if v := flat.get("DATABRICKS_CATALOG"):
-        dbx["catalog"] = v
-    if v := flat.get("DATABRICKS_SCHEMA"):
-        dbx["schema"] = v
-    if dbx:
-        doc["databricks"] = dbx
-    mysql: dict[str, str] = {}
-    if v := _first_nonempty("MYSQL_HOST", "MYSQL_SERVER", "MYSQL_HOSTNAME"):
-        mysql["host"] = v
-    if v := _first_nonempty("MYSQL_PORT"):
-        mysql["port"] = v
-    if v := _first_nonempty("MYSQL_USER"):
-        mysql["user"] = v
-    if v := _first_nonempty("MYSQL_PASSWORD"):
-        mysql["password"] = v
-    if v := _first_nonempty("MYSQL_DATABASE"):
-        mysql["database"] = v
-    if mysql:
-        doc["mysql"] = mysql
-    mariadb: dict[str, str] = {}
-    if v := _first_nonempty("MARIADB_HOST", "MARIADB_SERVER"):
-        mariadb["host"] = v
-    if v := _first_nonempty("MARIADB_PORT"):
-        mariadb["port"] = v
-    if v := _first_nonempty("MARIADB_USER", "MARIADB_USERNAME"):
-        mariadb["user"] = v
-    if v := _first_nonempty("MARIADB_PASSWORD", "MARIADB_PWD"):
-        mariadb["password"] = v
-    if v := _first_nonempty("MARIADB_DATABASE", "MARIADB_DB"):
-        mariadb["database"] = v
-    if mariadb:
-        doc["mariadb"] = mariadb
-    duckdb_doc: dict[str, str] = {}
-    if v := _first_nonempty(
-        "DUCKDB_PATH",
-        "DUCKDB_DATABASE",
-        "DUCKDB_DATABASE_PATH",
-        "DUCKDB_FILE",
-        "DUCKDB_DB",
-        "DUCKDB_DSN",
-    ):
-        duckdb_doc["path"] = v
-    if v := _first_nonempty("DUCKDB_SCHEMA", "DUCKDB_DEFAULT_SCHEMA"):
-        duckdb_doc["schema"] = v
-    if duckdb_doc:
-        doc["duckdb"] = duckdb_doc
-    sqlite_doc: dict[str, str] = {}
-    if v := _first_nonempty(
-        "SQLITE_PATH",
-        "SQLITE_DATABASE",
-        "SQLITE_DATABASE_PATH",
-        "SQLITE_FILE",
-        "SQLITE_DB",
-        "SQLITE_DSN",
-        "SQLITE3_DATABASE",
-    ):
-        sqlite_doc["path"] = v
-    if sqlite_doc:
-        doc["sqlite"] = sqlite_doc
-    sqlserver: dict[str, str] = {}
-    if v := _first_nonempty("SQLSERVER_HOST", "MSSQL_HOST"):
-        sqlserver["host"] = v
-    if v := _first_nonempty("SQLSERVER_PORT", "MSSQL_PORT"):
-        sqlserver["port"] = v
-    if v := _first_nonempty("SQLSERVER_USER", "MSSQL_USER"):
-        sqlserver["user"] = v
-    if v := _first_nonempty("SQLSERVER_PASSWORD", "MSSQL_PASSWORD"):
-        sqlserver["password"] = v
-    if v := _first_nonempty("SQLSERVER_DATABASE", "MSSQL_DATABASE"):
-        sqlserver["database"] = v
-    if v := _first_nonempty("SQLSERVER_SCHEMA", "MSSQL_SCHEMA"):
-        sqlserver["schema"] = v
-    if v := _first_nonempty("SQLSERVER_DRIVER", "MSSQL_DRIVER"):
-        sqlserver["driver"] = v
-    if v := _first_nonempty("SQLSERVER_AUTH_MODE", "MSSQL_AUTH_MODE"):
-        sqlserver["auth_mode"] = v
-    if v := flat.get("SQLSERVER_TENANT_ID"):
-        sqlserver["tenant_id"] = v
-    if v := flat.get("SQLSERVER_CLIENT_ID"):
-        sqlserver["client_id"] = v
-    if v := flat.get("SQLSERVER_CLIENT_SECRET"):
-        sqlserver["client_secret"] = v
-    if sqlserver:
-        doc["sqlserver"] = sqlserver
-    snowflake: dict[str, str] = {}
-    if v := flat.get("SNOWFLAKE_ACCOUNT"):
-        snowflake["account"] = v
-    if v := flat.get("SNOWFLAKE_USER"):
-        snowflake["user"] = v
-    if v := flat.get("SNOWFLAKE_PASSWORD"):
-        snowflake["password"] = v
-    if v := flat.get("SNOWFLAKE_DATABASE"):
-        snowflake["database"] = v
-    if v := flat.get("SNOWFLAKE_SCHEMA"):
-        snowflake["schema"] = v
-    if v := flat.get("SNOWFLAKE_WAREHOUSE"):
-        snowflake["warehouse"] = v
-    if v := flat.get("SNOWFLAKE_ROLE"):
-        snowflake["role"] = v
-    if v := flat.get("SNOWFLAKE_PRIVATE_KEY_PATH"):
-        snowflake["private_key_path"] = v
-    if v := flat.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE"):
-        snowflake["private_key_passphrase"] = v
-    if v := flat.get("SNOWFLAKE_AUTHENTICATOR"):
-        snowflake["authenticator"] = v
-    if v := flat.get("SNOWFLAKE_OAUTH_TOKEN"):
-        snowflake["oauth_token"] = v
-    if snowflake:
-        doc["snowflake"] = snowflake
-    bigquery: dict[str, str] = {}
-    if v := _first_nonempty("BIGQUERY_PROJECT", "GOOGLE_CLOUD_PROJECT", "GCP_PROJECT"):
-        bigquery["project"] = v
-    if v := flat.get("BIGQUERY_DATASET"):
-        bigquery["dataset"] = v
-    if v := _first_nonempty("BIGQUERY_CREDENTIALS_PATH", "GOOGLE_APPLICATION_CREDENTIALS"):
-        bigquery["credentials_path"] = v
-    if v := flat.get("BIGQUERY_LOCATION"):
-        bigquery["location"] = v
-    if bigquery:
-        doc["bigquery"] = bigquery
-    redshift: dict[str, str] = {}
-    if v := _first_nonempty("REDSHIFT_HOST", "REDSHIFT_SERVER"):
-        redshift["host"] = v
-    if v := _first_nonempty("REDSHIFT_PORT", "REDSHIFT_TCP_PORT"):
-        redshift["port"] = v
-    if v := _first_nonempty("REDSHIFT_USER", "REDSHIFT_USERNAME"):
-        redshift["user"] = v
-    if v := _first_nonempty("REDSHIFT_PASSWORD", "REDSHIFT_PWD"):
-        redshift["password"] = v
-    if v := _first_nonempty("REDSHIFT_DATABASE", "REDSHIFT_DB"):
-        redshift["database"] = v
-    if v := _first_nonempty("REDSHIFT_SCHEMA"):
-        redshift["schema"] = v
-    if v := _first_nonempty("REDSHIFT_USE_IAM", "REDSHIFT_IAM"):
-        redshift["use_iam"] = v
-    if v := _first_nonempty("REDSHIFT_CLUSTER_IDENTIFIER", "REDSHIFT_CLUSTER_ID"):
-        redshift["cluster_identifier"] = v
-    if v := _first_nonempty("REDSHIFT_WORKGROUP", "REDSHIFT_SERVERLESS_WORKGROUP"):
-        redshift["workgroup"] = v
-    if v := _first_nonempty("REDSHIFT_REGION", "REDSHIFT_AWS_REGION"):
-        redshift["region"] = v
-    if redshift:
-        doc["redshift"] = redshift
-    engine: dict[str, str] = {}
-    if v := flat.get("AETHERDIALECT_ENGINE"):
-        engine["selected"] = v
-    if engine:
-        doc["engine"] = engine
-    execution: dict[str, str] = {}
-    if v := flat.get("AETHERDIALECT_MAX_QUERY_COST_ROWS"):
-        execution["max_query_cost_rows"] = v
-    if v := flat.get("AETHERDIALECT_MAX_QUERY_COST_BYTES"):
-        execution["max_query_cost_bytes"] = v
-    if v := flat.get("AETHERDIALECT_STATEMENT_TIMEOUT_MS"):
-        execution["statement_timeout_ms"] = v
-    if v := flat.get("AETHERDIALECT_LLM_TIMEOUT_MS"):
-        execution["llm_timeout_ms"] = v
-    if v := flat.get("AETHERDIALECT_PROFILE_TIMEOUT_MS"):
-        execution["profile_timeout_ms"] = v
-    if v := flat.get("AETHERDIALECT_EXPLAIN_TIMEOUT_MS"):
-        execution["explain_timeout_ms"] = v
-    llm_flat: dict[str, str] = {}
-    if v := flat.get("AETHERDIALECT_LLM_PROVIDER"):
-        llm_flat["provider"] = v
-    if llm_flat:
-        doc["llm"] = llm_flat
-    return doc
-
-
-def _nested_document_to_toml_str(doc: Mapping[str, Any]) -> str:
-    lines: list[str] = []
-    for name in (
-        "openai",
-        "azure_openai",
-        "postgresql",
-        "databricks",
-        "mysql",
-        "mariadb",
-        "duckdb",
-        "sqlite",
-        "sqlserver",
-        "snowflake",
-        "bigquery",
-        "redshift",
-        "engine",
-        "llm",
-        "execution",
-    ):
-        if name not in doc:
-            continue
-        _toml_emit_section(name, doc[name], lines)
-    return "\n".join(lines) + ("\n" if lines else "")
-
-
-def write_live_env_file_to_temp_config_toml(env_path: str, extra_flat: dict[str, str] | None = None) -> str:
-    """Materialise a ``KEY=value`` live env file as a temporary TOML file understood by :func:`_load_config_file`. Callers must delete the returned path when finished."""
-    flat = _parse_live_env_file(env_path)
-    if extra_flat:
-        flat = {**flat, **extra_flat}
-    doc = _flat_live_env_to_nested_document(flat)
-    fd, path = tempfile.mkstemp(prefix="live_aetherdialect_", suffix=".toml")
-    os.close(fd)
-    Path(path).write_text(_nested_document_to_toml_str(doc), encoding="utf-8")
-    return path
-
-
-def write_sandbox_recording_toml(env_path: str) -> str:
-    """Materialise sandbox corpus recording config: LLM creds from *env_path*, in-memory DuckDB."""
-    return write_live_env_file_to_temp_config_toml(
-        env_path,
-        {
-            "AETHERDIALECT_ENGINE": "duckdb",
-            "AETHERDIALECT_LLM_PROVIDER": "openai",
-            "DUCKDB_PATH": ":memory:",
-            "DUCKDB_SCHEMA": "main",
-        },
-    )
-
-
 def _env_file() -> str:
     raw = os.environ.get("LIVE_ENV_FILE", "env.env")
     p = Path(raw)
@@ -449,40 +195,19 @@ def _env_file() -> str:
 
 
 def _domain_notes_path() -> Path | None:
-    """Schema-graph domain notes (``scripts/data/rental_shop_notes.txt`` by default)."""
-    raw = os.environ.get(
-        "LIVE_DOMAIN_NOTES_FILE",
-        os.path.join("scripts", "data", "rental_shop_notes.txt"),
-    )
-    p = Path(raw)
-    if not p.is_absolute():
-        p = Path(__file__).resolve().parent.parent / raw
-    return p if p.is_file() else None
+    """Schema-graph domain notes (profile notes path by default)."""
+    raw = os.environ.get("LIVE_DOMAIN_NOTES_FILE")
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parent.parent / raw
+        return p if p.is_file() else None
+    return PROFILE_NOTES_DEFAULT if PROFILE_NOTES_DEFAULT.is_file() else None
 
 
 def _pg_param(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
-
-_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS = frozenset(
-    {
-        "actor",
-        "address",
-        "category",
-        "city",
-        "country",
-        "customer",
-        "film",
-        "film_actor",
-        "item",
-        "item_category",
-        "inventory",
-        "language",
-        "payment",
-        "rental",
-        "store",
-    }
-)
 
 _CONSUMER_CREDENTIALS_SKIP_REASON = "Set PGUSER2 and PGPASSWORD2 in the live env file for permission live tests."
 _POSTGRES_SKIP_REASON = "Set PGHOST, PGUSER, PGPASSWORD, and PGDATABASE in the live env file for PostgreSQL live tests."
@@ -523,7 +248,7 @@ def _owner_engine_context(
     notes = _domain_notes_path()
     kwargs: dict[str, Any] = {
         "notes_file": str(notes) if notes else None,
-        "sql_file": _pg_param("SQL_FILE", os.path.join("scripts", "data", "rental_shop.sql")),
+        "sql_file": _pg_param("SQL_FILE", str(PROFILE_SQL_DEFAULT)),
     }
     if allow_objects is not None:
         kwargs["allow_objects"] = allow_objects
@@ -534,7 +259,7 @@ def _owner_engine_context(
 
 def _consumer_engine_context() -> EngineContext:
     """Build the restricted EngineContext aligned with pguser2 database grants."""
-    return _owner_engine_context(allow_objects=_RENTAL_SHOP_CONSUMER_ALLOW_OBJECTS)
+    return _owner_engine_context(allow_objects=PROFILE_CONSUMER_ALLOW_OBJECTS)
 
 
 def _copy_session_schema_cache(source_artifacts_dir: str, dest_artifacts_dir: str) -> None:
@@ -572,7 +297,7 @@ def _build_rbac_owner_engine(
         )
     seed_cache = schema_cache_source is not None
     try:
-        artifacts_dir = tempfile.mkdtemp(prefix="live_rbac_owner_")
+        artifacts_dir = tempfile.mkdtemp(prefix="live_rbac_owner_", dir=str(_LIVE_ARTIFACTS_ROOT))
         if seed_cache:
             _copy_session_schema_cache(schema_cache_source, artifacts_dir)
         prev_regen_graph = PolicyConfig.REGENERATE_SCHEMA_GRAPH
@@ -594,7 +319,7 @@ def _build_rbac_owner_engine(
         if relax_sensitivity:
             _relax_rental_shop_selectability(
                 instance._schema_graph,
-                _pg_param("PGDATABASE", "rental_shop"),
+                _pg_param("PGDATABASE", PROFILE_DATABASE_NAME_DEFAULT),
             )
         return instance
     finally:
@@ -620,7 +345,13 @@ def _build_rbac_consumer_engine(
                 "PGPASSWORD": pgpassword2,
             },
         )
-    ctx = engine_context if engine_context is not None else _consumer_engine_context()
+    # Consumers must not pass an EngineContext object (owner-only definition).
+    # Default None loads the owner's cached master and scopes via DB GRANTs.
+    ctx: EngineContext | str | None
+    if engine_context is None:
+        ctx = None
+    else:
+        ctx = engine_context
     try:
         instance = AetherEngine(
             ctx,
@@ -630,7 +361,7 @@ def _build_rbac_consumer_engine(
         )
         _relax_rental_shop_selectability(
             instance._schema_graph,
-            _pg_param("PGDATABASE", "rental_shop"),
+            _pg_param("PGDATABASE", PROFILE_DATABASE_NAME_DEFAULT),
         )
         return instance
     finally:
@@ -698,13 +429,14 @@ def _build_live_aether_engine(*, relax_sensitivity: bool) -> AetherEngine:
     notes = _domain_notes_path()
     cfg_path = write_live_env_file_to_temp_config_toml(_env_file(), {"AETHERDIALECT_ENGINE": "postgresql"})
     try:
+        _LIVE_ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
         with llm_usage_build_scope():
             instance = AetherEngine(
                 EngineContext(
                     notes_file=str(notes) if notes else None,
-                    sql_file=_pg_param("SQL_FILE", os.path.join("scripts", "data", "rental_shop.sql")),
+                    sql_file=_pg_param("SQL_FILE", str(PROFILE_SQL_DEFAULT)),
                 ),
-                artifacts_dir=tempfile.mkdtemp(prefix="live_pg_artifacts_"),
+                artifacts_dir=tempfile.mkdtemp(prefix="live_pg_artifacts_", dir=str(_LIVE_ARTIFACTS_ROOT)),
                 config_file=cfg_path,
             )
 
@@ -736,13 +468,16 @@ def _build_live_aether_engine(*, relax_sensitivity: bool) -> AetherEngine:
             instance._rejected = {}
 
             if relax_sensitivity:
-                _relax_rental_shop_selectability(instance._schema_graph, _pg_param("PGDATABASE", "rental_shop"))
-            elif _RENTAL_SHOP_OVERRIDES.is_file():
-                apply_schema_overrides_to_graph(
+                _relax_rental_shop_selectability(
+                    instance._schema_graph, _pg_param("PGDATABASE", PROFILE_DATABASE_NAME_DEFAULT)
+                )
+            elif PROFILE_OVERRIDES_PATH.is_file():
+                apply_structure_to_graph(
                     instance._schema_graph,
-                    load_schema_overrides_file(_RENTAL_SHOP_OVERRIDES),
+                    load_structure_document_file(PROFILE_OVERRIDES_PATH),
                 )
 
+            flush_invoice_file()
             return instance
     finally:
         Path(cfg_path).unlink(missing_ok=True)
@@ -757,10 +492,10 @@ def t2s() -> AetherEngine:
 def _derive_enforce_sensitivity_engine(t2s: AetherEngine) -> AetherEngine:
     """Derive a session engine with bundled sensitivity overrides from the primary ``t2s`` build."""
     enforced_graph = copy.deepcopy(t2s._schema_graph)
-    if _RENTAL_SHOP_OVERRIDES.is_file():
-        apply_schema_overrides_to_graph(
+    if PROFILE_OVERRIDES_PATH.is_file():
+        apply_structure_to_graph(
             enforced_graph,
-            load_schema_overrides_file(_RENTAL_SHOP_OVERRIDES),
+            load_structure_document_file(PROFILE_OVERRIDES_PATH),
         )
     derived = object.__new__(AetherEngine)
     for slot in AetherEngine.__slots__:
@@ -781,7 +516,7 @@ def t2s_enforce_sensitivity(t2s: AetherEngine) -> AetherEngine:
 @pytest.fixture(autouse=True)
 def _enforce_postgresql_dialect(request: pytest.FixtureRequest) -> None:
     """Restore PostgreSQL engine config and owner credentials before each non-engine-module test."""
-    from ._engine_live import ENGINE_MODULE_FRAGMENTS
+    from .live_support import ENGINE_MODULE_FRAGMENTS
 
     if any(fragment in request.node.nodeid for fragment in ENGINE_MODULE_FRAGMENTS):
         return
@@ -1039,6 +774,10 @@ def _resolve_scenario_ids(nodeid: str) -> list[str]:
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
+    if report.when == "call":
+        flush_invoice_file()
+        status = "OK" if report.outcome == "passed" else "FAIL"
+        append_results_summary_line(f"{status} {report.nodeid}")
     if report.when != "call" or report.outcome != "failed":
         return
     scenario_ids = _resolve_scenario_ids(report.nodeid)
@@ -1059,4 +798,4 @@ def pytest_runtest_makereport(item, call):
             step = ordered_steps[0]
         elif len(ordered_steps) > 1:
             step = ordered_steps
-    _append_failure_trace(step)
+    append_live_failure_trace(step)

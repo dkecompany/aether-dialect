@@ -7,7 +7,7 @@ import json
 import jsonschema
 import pytest
 
-from aetherdialect._constants import INTENT_SCHEMA
+from aetherdialect._constants_runtime import INTENT_SCHEMA
 from aetherdialect._intent_expr import parse_intent_response
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import jsonschema
 import pytest
 
-from aetherdialect._constants import INTENT_SCHEMA
+from aetherdialect._constants_runtime import INTENT_SCHEMA
 from aetherdialect._contracts_core import RuntimeIntent
 
 
@@ -21,8 +21,8 @@ def test_grain_property_validates() -> None:
         "select_cols": [{"expr": "customer.customer_id"}],
         "group_by_cols": [],
         "order_by_cols": [],
-        "where": [],
-        "having": [],
+        "where": None,
+        "having": None,
         "limit": None,
         "natural_language": "list",
         "cte_steps": [],

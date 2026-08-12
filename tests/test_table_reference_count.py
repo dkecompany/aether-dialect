@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
+from aetherdialect._contracts_base import NormalizedExpr
+from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._validation_schema import validate_table_reference_counts
+from aetherdialect._validation_shape import validate_table_reference_counts
 
 
 def _schema() -> SchemaGraph:
@@ -46,7 +47,7 @@ def test_table_referenced_twice_is_allowed() -> None:
 
 @pytest.mark.fast
 def test_triple_reference_surfaces_through_semantic_validation() -> None:
-    from aetherdialect._validation_execute import validate_semantics
+    from aetherdialect._validation_sql import validate_semantics
 
     intent = RuntimeIntent(
         tables=["staff", "staff", "staff"],

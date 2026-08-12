@@ -10,27 +10,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherEngine
-from aetherdialect._contracts_base import (
-    EngineContext,
-    NormalizedExpr,
-    OwnerOnlyOperationError,
-    WriteQueueEvent,
-)
+from aetherdialect._contracts_base import EngineContext, NormalizedExpr, OwnerOnlyOperationError
 from aetherdialect._contracts_core import (
     RuntimeIntent,
     SelectCol,
+    WriteQueueEvent,
 )
 from aetherdialect._contracts_schema import (
     ColumnMetadata,
     SchemaGraph,
     TableMetadata,
 )
-from aetherdialect._main_execution import (
-    MainExecutionOps,
-    PipelineSession,
-)
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_session import PipelineSession
 from aetherdialect._schema_graph import assert_consumer_intent_in_scope
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 def _make_engine(*, role: str = "owner", graph_id: str = "sg_test000000000001__abcd1234") -> AetherEngine:
@@ -67,44 +61,60 @@ class TestOwnerConsumerGate:
             assert sess.execution_visible_objects == frozenset({"a"})
 
     def test_apply_migration_map_requires_owner(self) -> None:
+        t = _make_engine(role="consumer")
         with pytest.raises(OwnerOnlyOperationError):
-            AetherEngine.apply_migration_map(
-                engine_context=EngineContext(),
-                artifacts_dir="/tmp/x",
-                role="consumer",
-            )
+            t.apply_migration_map({"version": 1, "tables": []})
 
     def test_clear_template_store_requires_owner(self) -> None:
         t = _make_engine(role="consumer")
         with pytest.raises(OwnerOnlyOperationError):
             t.clear_template_store()
 
-    def test_export_overrides_requires_owner(self) -> None:
+    def test_export_structure_allowed_for_consumer(self) -> None:
         t = _make_engine(role="consumer")
-        with pytest.raises(OwnerOnlyOperationError):
-            t.export_overrides()
+        t._schema_graph = SchemaGraph(
+            tables={
+                "a": TableMetadata(
+                    name="a",
+                    columns={"id": ColumnMetadata(name="id", data_type="integer")},
+                    primary_key=["id"],
+                    foreign_keys=[],
+                )
+            },
+            join_paths_multi={},
+            effective_structural_hash="eff",
+            schema_graph_id="sg",
+        )
+        t._context_name = "master"
+        with patch("aetherdialect.aetherdialect.dump_structure_edits", return_value={}):
+            with patch(
+                "aetherdialect.aetherdialect.build_public_structure_document",
+                return_value={"tables": [], "table_count": 0, "relationships": []},
+            ):
+                doc = t.export_structure()
+        assert isinstance(doc, dict)
 
-    def test_consumer_apply_overrides_enqueues_proposal(self, tmp_path, monkeypatch) -> None:
+    def test_consumer_apply_structure_requires_owner(self, tmp_path, monkeypatch) -> None:
         monkeypatch.chdir(tmp_path)
-        doc = {"tables": {}}
-        (tmp_path / "schema_overrides.json").write_text(json.dumps(doc), encoding="utf-8")
         t = _make_engine(role="consumer")
         t._artifacts_dir = tmp_path
-        emitted: list[WriteQueueEvent] = []
-
-        def _capture(_adir: str, ev: WriteQueueEvent) -> None:
-            emitted.append(ev)
-
-        monkeypatch.setattr("aetherdialect.aetherdialect.emit_write_queue_event", _capture)
-        t.apply_overrides()
-        assert len(emitted) == 1
-        assert emitted[0].kind == "override_proposal"
-        assert emitted[0].schema_graph_id == "sg_test000000000001__abcd1234"
+        with pytest.raises(OwnerOnlyOperationError, match="apply_structure"):
+            t.apply_structure(
+                {
+                    "tables": {},
+                    "foreign_keys_add": [],
+                    "foreign_keys_remove": [],
+                    "primary_keys_add": [],
+                    "primary_keys_remove": [],
+                    "relationships": [],
+                    "table_count": 0,
+                }
+            )
 
     def test_owner_drain_applies_override_proposal(self, tmp_path, monkeypatch) -> None:
         from datetime import datetime
 
-        from aetherdialect._core_utils import emit_write_queue_event
+        from aetherdialect._utils_artifacts import emit_write_queue_event
 
         graph_id = "sg_drain000000000001__abcd1234"
         owner = _make_engine(role="owner", graph_id=graph_id)
@@ -119,9 +129,9 @@ class TestOwnerConsumerGate:
             produced_at=datetime.now(UTC).isoformat(),
             payload=(("document_json", json.dumps(doc)),),
         )
-        emit_write_queue_event(str(tmp_path), ev)
+        emit_write_queue_event(str(tmp_path), ev, space_name="master")
         with patch(
-            "aetherdialect._main_execution.apply_overrides_and_persist",
+            "aetherdialect._main_spaces.apply_structure_from_path",
             return_value=MagicMock(),
         ) as apply_mock:
             n = MainExecutionOps.drain_write_queue(owner, str(tmp_path))

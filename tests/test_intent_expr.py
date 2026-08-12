@@ -8,7 +8,6 @@ from dataclasses import replace
 import pytest
 
 from aetherdialect._contracts_base import (
-    ColumnRole,
     ExprValue,
     HavingParam,
     MulGroup,
@@ -27,11 +26,11 @@ from aetherdialect._contracts_schema import (
     CaseWhenBranch,
     CaseWhenExpr,
     ColumnMetadata,
+    ColumnRole,
     SchemaGraph,
     TableMetadata,
     WindowRegistryStep,
 )
-from aetherdialect._core_utils import substitute_params
 from aetherdialect._intent_expr import (
     _assign_structural_expr,
     _assign_structural_group,
@@ -68,6 +67,7 @@ from aetherdialect._intent_expr import (
     tag_expr_numeric,
 )
 from aetherdialect._sql_gen import classify_cte_emission, render_select_col_sql
+from aetherdialect._utils import substitute_params
 
 
 class TestParseExprString:
@@ -1768,16 +1768,48 @@ class TestParseIntentResponse:
         assert parse_intent_response("", "q") is None
 
     def test_parses_filters(self):
-        """Parses filters_param with left_expr and op."""
-        raw = '{"tables": ["orders"], "select_cols": ["orders.order_id"], "where": [{"left_expr": "orders.status", "op": "=", "value": "shipped", "value_type": "string"}]}'
+        """Parses where PredicateGroup with left_expr and op."""
+        raw = json.dumps(
+            {
+                "tables": ["orders"],
+                "select_cols": ["orders.order_id"],
+                "where": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "orders.status",
+                            "op": "=",
+                            "value": "shipped",
+                            "value_type": "string",
+                        }
+                    ],
+                },
+            }
+        )
         result = parse_intent_response(raw, "q")
         assert result is not None
         assert len(result.where.leaves() if result.where else []) == 1
         assert result.where.leaves()[0].op == "="
 
     def test_parses_having(self):
-        """Parses having_param with left_expr and op."""
-        raw = '{"tables": ["orders"], "select_cols": ["orders.order_id"], "having_param": [{"left_expr": "count(orders.order_id)", "op": ">", "value": 5, "value_type": "integer"}]}'
+        """Parses having PredicateGroup with left_expr and op."""
+        raw = json.dumps(
+            {
+                "tables": ["orders"],
+                "select_cols": ["orders.order_id"],
+                "having": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "count(orders.order_id)",
+                            "op": ">",
+                            "value": 5,
+                            "value_type": "integer",
+                        }
+                    ],
+                },
+            }
+        )
         result = parse_intent_response(raw, "q")
         assert result is not None
         assert len(result.having.leaves() if result.having else []) == 1
@@ -1818,8 +1850,14 @@ class TestParseIntentResponse:
         assert result.tables == ["orders"]
 
     def test_skips_filter_without_left_expr(self):
-        """Legacy filters_param without left_expr migrate with an empty left side."""
-        raw = '{"tables": ["t"], "select_cols": ["t.x"], "where": [{"op": "=", "value": "a"}]}'
+        """Predicate leaf without left_expr still deserializes with an empty left side."""
+        raw = json.dumps(
+            {
+                "tables": ["t"],
+                "select_cols": ["t.x"],
+                "where": {"op": "and", "predicates": [{"op": "=", "value": "a"}]},
+            }
+        )
         result = parse_intent_response(raw, "q")
         assert result is not None
         assert result.where is not None
@@ -1832,21 +1870,33 @@ class TestParseIntentResponse:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "where": [
-                    {
-                        "left_expr": "t.a",
-                        "op": "=",
-                        "value": "1",
-                        "value_type": "integer",
-                    },
-                    {
-                        "left_expr": "t.b",
-                        "op": ">",
-                        "value": "2",
-                        "value_type": "integer",
-                        "bool_op": "OR",
-                    },
-                ],
+                "where": {
+                    "op": "or",
+                    "groups": [
+                        {
+                            "op": "and",
+                            "predicates": [
+                                {
+                                    "left_expr": "t.a",
+                                    "op": "=",
+                                    "value": "1",
+                                    "value_type": "integer",
+                                }
+                            ],
+                        },
+                        {
+                            "op": "and",
+                            "predicates": [
+                                {
+                                    "left_expr": "t.b",
+                                    "op": ">",
+                                    "value": "2",
+                                    "value_type": "integer",
+                                }
+                            ],
+                        },
+                    ],
+                },
             }
         )
         result = parse_intent_response(raw, "q")
@@ -1861,14 +1911,17 @@ class TestParseIntentResponse:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "where": [
-                    {
-                        "left_expr": "t.a",
-                        "op": "=",
-                        "value": "1",
-                        "value_type": "integer",
-                    },
-                ],
+                "where": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "t.a",
+                            "op": "=",
+                            "value": "1",
+                            "value_type": "integer",
+                        },
+                    ],
+                },
             }
         )
         result = parse_intent_response(raw, "q")
@@ -1882,22 +1935,23 @@ class TestParseIntentResponse:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "where": [
-                    {
-                        "left_expr": "t.a",
-                        "op": "=",
-                        "value": "1",
-                        "value_type": "integer",
-                        "where_group": 1,
-                    },
-                    {
-                        "left_expr": "t.b",
-                        "op": ">",
-                        "value": "2",
-                        "value_type": "integer",
-                        "where_group": 1,
-                    },
-                ],
+                "where": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "t.a",
+                            "op": "=",
+                            "value": "1",
+                            "value_type": "integer",
+                        },
+                        {
+                            "left_expr": "t.b",
+                            "op": ">",
+                            "value": "2",
+                            "value_type": "integer",
+                        },
+                    ],
+                },
             }
         )
         result = parse_intent_response(raw, "q")
@@ -1912,14 +1966,17 @@ class TestParseIntentResponse:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "where": [
-                    {
-                        "left_expr": "t.a",
-                        "op": "=",
-                        "value": "1",
-                        "value_type": "integer",
-                    },
-                ],
+                "where": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "t.a",
+                            "op": "=",
+                            "value": "1",
+                            "value_type": "integer",
+                        },
+                    ],
+                },
             }
         )
         result = parse_intent_response(raw, "q")
@@ -1933,21 +1990,33 @@ class TestParseIntentResponse:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "having_param": [
-                    {
-                        "left_expr": "count(t.x)",
-                        "op": ">",
-                        "value": 5,
-                        "value_type": "integer",
-                    },
-                    {
-                        "left_expr": "sum(t.y)",
-                        "op": "<",
-                        "value": 10,
-                        "value_type": "integer",
-                        "bool_op": "OR",
-                    },
-                ],
+                "having": {
+                    "op": "or",
+                    "groups": [
+                        {
+                            "op": "and",
+                            "predicates": [
+                                {
+                                    "left_expr": "count(t.x)",
+                                    "op": ">",
+                                    "value": 5,
+                                    "value_type": "integer",
+                                }
+                            ],
+                        },
+                        {
+                            "op": "and",
+                            "predicates": [
+                                {
+                                    "left_expr": "sum(t.y)",
+                                    "op": "<",
+                                    "value": 10,
+                                    "value_type": "integer",
+                                }
+                            ],
+                        },
+                    ],
+                },
             }
         )
         result = parse_intent_response(raw, "q")
@@ -1962,15 +2031,17 @@ class TestParseIntentResponse:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "having_param": [
-                    {
-                        "left_expr": "count(t.x)",
-                        "op": ">",
-                        "value": 5,
-                        "value_type": "integer",
-                        "where_group": 2,
-                    },
-                ],
+                "having": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "count(t.x)",
+                            "op": ">",
+                            "value": 5,
+                            "value_type": "integer",
+                        },
+                    ],
+                },
             }
         )
         result = parse_intent_response(raw, "q")
@@ -1987,14 +2058,17 @@ class TestParseIntentResponse:
                 "select_cols": [{"expr": "rental.rental_id"}],
                 "group_by_cols": [],
                 "order_by_cols": [],
-                "where": [
-                    {
-                        "left_expr": "rental.rental_date",
-                        "op": ">=",
-                        "right_expr": "CURRENT_DATE - INTERVAL '90 days'",
-                    }
-                ],
-                "having_param": [],
+                "where": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "rental.rental_date",
+                            "op": ">=",
+                            "right_expr": "CURRENT_DATE - INTERVAL '90 days'",
+                        }
+                    ],
+                },
+                "having": None,
                 "limit": None,
                 "cte_steps": [],
                 "natural_language": "rentals in last 90 days",
@@ -2007,21 +2081,24 @@ class TestParseIntentResponse:
         assert fp.right_expr is not None
 
     def test_filter_clears_plain_literal_right_expr(self):
-        """Legacy filters_param preserves right_expr via WhereParam.from_dict migration."""
+        """Where predicate preserves right_expr via WhereParam.from_dict migration."""
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": [{"expr": "t.x"}],
                 "group_by_cols": [],
                 "order_by_cols": [],
-                "where": [
-                    {
-                        "left_expr": "t.a",
-                        "op": "=",
-                        "right_expr": "42",
-                    }
-                ],
-                "having_param": [],
+                "where": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "t.a",
+                            "op": "=",
+                            "right_expr": "42",
+                        }
+                    ],
+                },
+                "having": None,
                 "limit": None,
                 "cte_steps": [],
                 "natural_language": "test",
@@ -2030,8 +2107,9 @@ class TestParseIntentResponse:
         result = parse_intent_response(raw, "test")
         assert result is not None
         assert len(result.where.leaves() if result.where else []) == 1
-        assert result.where.leaves()[0].right_expr is not None
-        assert result.where.leaves()[0].right_expr.column_ref == "42"
+        right = result.where.leaves()[0].right_expr
+        assert right is not None
+        assert right.add_values and float(right.add_values[0].value) == 42.0
 
     def test_parse_window_spec_on_select_col(self):
         """LLM JSON with ``window_registry`` and bare ``w01`` ref is parsed into select and registry."""
@@ -2052,8 +2130,8 @@ class TestParseIntentResponse:
                 ],
                 "group_by_cols": [],
                 "order_by_cols": [],
-                "where": [],
-                "having_param": [],
+                "where": None,
+                "having": None,
                 "limit": None,
                 "cte_steps": [],
                 "natural_language": "test",
@@ -2096,8 +2174,8 @@ class TestParseIntentResponse:
                 ],
                 "group_by_cols": [],
                 "order_by_cols": [],
-                "where": [],
-                "having_param": [],
+                "where": None,
+                "having": None,
                 "limit": None,
                 "cte_steps": [],
                 "natural_language": "test",
@@ -2789,15 +2867,18 @@ class TestParseIntentResponseExtended:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "where": [
-                    {
-                        "left_expr": "t.y",
-                        "op": "=",
-                        "right_expr": None,
-                        "value": "a",
-                        "value_type": "string",
-                    }
-                ],
+                "where": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "t.y",
+                            "op": "=",
+                            "right_expr": None,
+                            "value": "a",
+                            "value_type": "string",
+                        }
+                    ],
+                },
             }
         )
         r = parse_intent_response(raw, "q")
@@ -2806,7 +2887,7 @@ class TestParseIntentResponseExtended:
         assert r.where.leaves()[0].right_expr is None
 
     def test_where_group_list_rejected_by_schema(self):
-        """Legacy where_group list coerces to first element during PredicateGroup migration."""
+        """Flat where arrays are rejected by INTENT_SCHEMA."""
         raw = json.dumps(
             {
                 "tables": ["t"],
@@ -2822,12 +2903,11 @@ class TestParseIntentResponseExtended:
                 ],
             }
         )
-        r = parse_intent_response(raw, "q")
-        assert r is not None
-        assert r.where is not None
-        assert r.where.op == "and"
-        assert len(r.where.leaves()) == 1
-        assert r.where.leaves()[0].left_expr.primary_column == "t.y"
+        buf: list[str] = []
+        r = parse_intent_response(raw, "q", parse_detail_out=buf)
+        assert r is None
+        assert buf
+        assert "INTENT_SCHEMA validation" in buf[0]
 
     def test_natural_language_fallback_to_question(self):
         raw = '{"tables": ["t"], "select_cols": ["t.x"]}'
@@ -2942,16 +3022,21 @@ class TestParseIntentResponseExtended:
         assert r.having is not None
         assert len(r.having.leaves()) == 1
         hp = r.having.leaves()[0]
-        assert hp.left_expr.column_ref == "count(t.x)"
+        assert hp.left_expr.add_groups and hp.left_expr.add_groups[0].agg_func == "count"
+        assert hp.left_expr.add_groups[0].multiply[0].column_ref == "t.x"
         assert hp.right_expr is not None
-        assert hp.right_expr.column_ref == "count(t.y)"
+        assert hp.right_expr.add_groups and hp.right_expr.add_groups[0].agg_func == "count"
+        assert hp.right_expr.add_groups[0].multiply[0].column_ref == "t.y"
 
     def test_filter_preserves_qualified_right_expr(self):
         raw = json.dumps(
             {
                 "tables": ["t"],
                 "select_cols": [{"expr": "t.x"}],
-                "where": [{"left_expr": "t.a", "op": "=", "right_expr": "t.b"}],
+                "where": {
+                    "op": "and",
+                    "predicates": [{"left_expr": "t.a", "op": "=", "right_expr": "t.b"}],
+                },
             }
         )
         r = parse_intent_response(raw, "q")
@@ -3125,7 +3210,7 @@ class TestBuildCteOutputMetadataExtended:
 
 
 class TestIsExprNumericExtended:
-    """Branches in _is_expr_numeric not covered elsewhere."""
+    """Additional ``_is_expr_numeric`` branches."""
 
     @pytest.fixture
     def schema_no_unknown(self):
@@ -3537,15 +3622,17 @@ class TestParseIntentResponseLikely:
             {
                 "tables": ["t"],
                 "select_cols": ["t.x"],
-                "where": [
-                    {
-                        "left_expr": "t.a",
-                        "op": "=",
-                        "value_type": "string",
-                        "value": "x",
-                        "where_group": None,
-                    }
-                ],
+                "where": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "t.a",
+                            "op": "=",
+                            "value_type": "string",
+                            "value": "x",
+                        }
+                    ],
+                },
             }
         )
         r = parse_intent_response(raw, "q")
@@ -3555,7 +3642,7 @@ class TestParseIntentResponseLikely:
         assert len(r.where.predicates) == 1
 
     def test_string_filter_item_skipped_in_legacy_where_array(self):
-        """Legacy flat ``where`` arrays skip non-object entries instead of failing schema validation."""
+        """Flat ``where`` arrays fail INTENT_SCHEMA validation."""
         raw = json.dumps(
             {
                 "tables": ["t"],
@@ -3573,11 +3660,9 @@ class TestParseIntentResponseLikely:
         )
         buf: list[str] = []
         r = parse_intent_response(raw, "q", parse_detail_out=buf)
-        assert r is not None
-        assert r.where is not None
-        assert len(r.where.leaves()) == 1
-        assert r.where.leaves()[0].left_expr.primary_column == "t.ok"
-        assert not buf
+        assert r is None
+        assert buf
+        assert "INTENT_SCHEMA validation" in buf[0]
 
     def test_mixed_string_and_object_select_cols(self):
         raw = json.dumps(
@@ -3729,15 +3814,17 @@ class TestSanitizeComposeIntentJson:
             {
                 "tables": ["orders"],
                 "select_cols": ["orders.order_id"],
-                "having_param": [
-                    {
-                        "left_expr": "COUNT(other_table.other_column)",
-                        "op": ">",
-                        "value": 3,
-                        "value_type": "integer",
-                        "bool_op": None,
-                    }
-                ],
+                "having": {
+                    "op": "and",
+                    "predicates": [
+                        {
+                            "left_expr": "COUNT(other_table.other_column)",
+                            "op": ">",
+                            "value": 3,
+                            "value_type": "integer",
+                        }
+                    ],
+                },
             }
         )
         result = parse_intent_response(raw, "q")
@@ -3745,7 +3832,9 @@ class TestSanitizeComposeIntentJson:
         assert result.having is not None
         assert result.having.op == "and"
         assert len(result.having.leaves()) == 1
-        assert result.having.leaves()[0].left_expr.column_ref == "COUNT(other_table.other_column)"
+        left = result.having.leaves()[0].left_expr
+        assert left.add_groups and left.add_groups[0].agg_func == "count"
+        assert left.add_groups[0].multiply[0].column_ref == "other_table.other_column"
 
 
 class TestTagExprNumericLikely:
@@ -3999,7 +4088,7 @@ class TestNormalizeInLikely:
 
 
 class TestStripOrderDirectionLikely:
-    """Whitespace after DESC is not stripped by suffix logic (LLM slop)."""
+    """Whitespace after DESC is not stripped by suffix logic."""
 
     def test_desc_with_trailing_space_keeps_suffix_in_expr(self):
         expr, direction = _strip_order_direction("orders.amount DESC ")
@@ -4164,7 +4253,7 @@ class TestClassifyCteEmission:
 class TestGenerationPathDistinctGate:
     def test_distinct_blocks_template_only_extra_widen(self) -> None:
         from aetherdialect._contracts_core import GenerationPath, UnionSelectColumnDelta
-        from aetherdialect._intent_process import generation_path_for_eligible_union
+        from aetherdialect._intent_loop import generation_path_for_eligible_union
 
         path = generation_path_for_eligible_union(
             cols_changed=False,
@@ -4177,7 +4266,7 @@ class TestGenerationPathDistinctGate:
 
 class TestNaturalLanguageRefusalValidator:
     def test_runtime_intent_has_refusal_natural_language(self) -> None:
-        from aetherdialect._intent_process import runtime_intent_has_refusal_natural_language
+        from aetherdialect._intent_expr import runtime_intent_has_refusal_natural_language
 
         intent = RuntimeIntent(
             tables=["customer"],
@@ -4193,7 +4282,7 @@ class TestNaturalLanguageRefusalValidator:
 
 class TestDateDiffNormalizationGuards:
     def test_date_diff_filter_survives_normalize_where_predicates_havings(self) -> None:
-        from aetherdialect._intent_resolve import normalize_where_havings
+        from aetherdialect._intent_bind import normalize_where_havings
 
         right = NormalizedExpr.from_column("rental.return_date")
         left = NormalizedExpr.from_column("rental.rental_date")

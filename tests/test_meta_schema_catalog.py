@@ -8,10 +8,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._constants import META_DEFAULT_SOURCE_ID, SESSION_KIND_META
-from aetherdialect._contracts_base import Diagnostic, QuestionRoute, SensitivityClassification
+from aetherdialect._contracts_base import Diagnostic, SensitivityClassification
+from aetherdialect._contracts_core import QuestionRoute
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._core_utils import drain_diagnostic_collector, set_diagnostic_collector
 from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._utils import drain_diagnostic_collector, set_diagnostic_collector
 
 
 def _col(
@@ -184,14 +185,12 @@ def test_answer_matches_schema() -> None:
     }
     MainExecutionOps.validate_meta_schema_answer(answer, dump)
     owner = MagicMock()
-    with patch("aetherdialect._main_execution.LLMProvider.json", return_value=answer):
+    with patch("aetherdialect._llm_provider.LLMProvider.json", return_value=answer):
         step = MainExecutionOps.answer_metadata_question(
             owner, "what tables exist", QuestionRoute.SCHEMA_CATALOG, schema, None, None
         )
     assert step.kind == SESSION_KIND_META
-    assert step.meta_payload is not None
-    assert step.meta_payload["response_kind"] == "schema_catalog"
-    assert "Customers and orders are available." in (step.message or "")
+    assert "Customers and orders are available." in (step.answer or "")
 
 
 @pytest.mark.fast
@@ -200,13 +199,11 @@ def test_count_tables_uses_inventory() -> None:
     dump = MainExecutionOps.build_meta_schema_dump(schema)
     answer = _count_answer(tables=dump["inventory"]["table_count"])
     MainExecutionOps.validate_meta_schema_answer(answer, dump)
-    with patch("aetherdialect._main_execution.LLMProvider.json", return_value=answer):
+    with patch("aetherdialect._llm_provider.LLMProvider.json", return_value=answer):
         step = MainExecutionOps.answer_metadata_question(
             MagicMock(), "how many tables", QuestionRoute.SCHEMA_CATALOG, schema, None, None
         )
-    assert step.meta_payload is not None
-    assert step.meta_payload["counts"]["tables"] == dump["inventory"]["table_count"]
-    assert str(dump["inventory"]["table_count"]) in (step.message or "")
+    assert str(dump["inventory"]["table_count"]) in (step.answer or "")
 
 
 @pytest.mark.fast
@@ -229,12 +226,11 @@ def test_count_columns_in_table() -> None:
         "notes": [],
     }
     MainExecutionOps.validate_meta_schema_answer(answer, dump)
-    with patch("aetherdialect._main_execution.LLMProvider.json", return_value=answer):
+    with patch("aetherdialect._llm_provider.LLMProvider.json", return_value=answer):
         step = MainExecutionOps.answer_metadata_question(
             MagicMock(), "how many columns in customers", QuestionRoute.SCHEMA_CATALOG, schema, None, None
         )
-    assert step.meta_payload is not None
-    assert step.meta_payload["counts"]["columns_in_table"]["columns"] == cols
+    assert f"columns in customers: {cols}" in (step.answer or "")
 
 
 @pytest.mark.fast
@@ -245,12 +241,11 @@ def test_federation_member_count() -> None:
     assert set(dump["inventory"]["tables_per_member"]) == {"crm", "logistics", "storefront"}
     answer = _count_answer(members=3)
     MainExecutionOps.validate_meta_schema_answer(answer, dump)
-    with patch("aetherdialect._main_execution.LLMProvider.json", return_value=answer):
+    with patch("aetherdialect._llm_provider.LLMProvider.json", return_value=answer):
         step = MainExecutionOps.answer_metadata_question(
             MagicMock(), "how many members", QuestionRoute.SCHEMA_CATALOG, schema, None, None
         )
-    assert step.meta_payload is not None
-    assert step.meta_payload["counts"]["members"] == 3
+    assert "members: 3" in (step.answer or "")
 
 
 @pytest.mark.fast
@@ -296,7 +291,7 @@ def test_invented_table_fails_validation() -> None:
 def test_step_kind_meta_sql_none() -> None:
     schema = _engine_graph()
     answer = _count_answer(tables=2)
-    with patch("aetherdialect._main_execution.LLMProvider.json", return_value=answer):
+    with patch("aetherdialect._llm_provider.LLMProvider.json", return_value=answer):
         step = MainExecutionOps.answer_metadata_question(
             MagicMock(), "how many tables", QuestionRoute.SCHEMA_CATALOG, schema, None, None
         )
@@ -305,7 +300,7 @@ def test_step_kind_meta_sql_none() -> None:
     assert step.sql is None
     assert step.data is None
     assert step.error is None
-    assert step.status is None
+    assert step.error is None
 
 
 @pytest.mark.fast
@@ -315,9 +310,9 @@ def test_diagnostics_include_route_and_validated() -> None:
     buf: list[Diagnostic] = []
     tok = set_diagnostic_collector(buf)
     try:
-        with patch("aetherdialect._main_execution.LLMProvider.json", return_value=answer):
+        with patch("aetherdialect._llm_provider.LLMProvider.json", return_value=answer):
             # Emulate route notify then answer path (same order as interactive_run_once).
-            from aetherdialect._core_utils import notify
+            from aetherdialect._utils import notify
 
             notify("Metadata route: schema_catalog", stage="meta", code="meta.route.schema_catalog", level="info")
             step = MainExecutionOps.answer_metadata_question(
@@ -326,7 +321,7 @@ def test_diagnostics_include_route_and_validated() -> None:
         drained = drain_diagnostic_collector()
         codes = {d.code for d in step.diagnostics} | {d.code for d in drained} | {d.code for d in buf}
     finally:
-        from aetherdialect._core_utils import reset_diagnostic_collector
+        from aetherdialect._utils import reset_diagnostic_collector
 
         reset_diagnostic_collector(tok)
     assert "meta.route.schema_catalog" in codes

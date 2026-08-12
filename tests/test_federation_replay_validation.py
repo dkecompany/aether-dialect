@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import FederationPlanTemplate
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
     ConcreteIntent,
     FederatedPlan,
@@ -17,21 +17,26 @@ from aetherdialect._contracts_core import (
     SourceStep,
     SqlGenerationOutcome,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import (
+    ColumnMetadata,
+    FederationPlanTemplate,
+    SchemaGraph,
+    SQLShape,
+    TableMetadata,
+    TemplateStats,
+)
+from aetherdialect._federation_execute import (
     federation_plan_combine_hash,
     federation_plan_matches_template,
     federation_plan_step_fingerprints,
     lookup_federation_plan_template,
-    parse_federation_manifest,
 )
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._pipeline import replay_federated_prepare_from_plan_template
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._pipeline_execute import replay_federated_prepare_from_plan_template
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._utils import intent_key
+from aetherdialect._utils_intent import intent_key
 
 
 def _graph(table: str, *, source_id: str) -> SchemaGraph:
@@ -115,7 +120,7 @@ def test_replay_calls_generate_and_validate_sql_match_gate() -> None:
         tmpl,
     )
     with patch(
-        "aetherdialect._pipeline.generate_and_validate_sql",
+        "aetherdialect._pipeline_execute.generate_and_validate_sql",
         return_value=gen_out,
     ) as mock_gen:
         outcome = replay_federated_prepare_from_plan_template(
@@ -147,7 +152,7 @@ def test_replay_pins_member_schema_graph_ids() -> None:
     )
     dialect = MagicMock()
     gen_out = SqlGenerationOutcome("SELECT id FROM left_t", True, None, tmpl)
-    with patch("aetherdialect._pipeline.generate_and_validate_sql", return_value=gen_out):
+    with patch("aetherdialect._pipeline_execute.generate_and_validate_sql", return_value=gen_out):
         outcome = replay_federated_prepare_from_plan_template(
             plan,
             cached,
@@ -255,7 +260,7 @@ def test_topology_hash_missing_on_template_side_is_miss() -> None:
 def test_lookup_rejects_template_when_current_topology_hash_missing() -> None:
     import tempfile
 
-    from aetherdialect._federation import save_federation_plan_template
+    from aetherdialect._federation_execute import save_federation_plan_template
 
     composite = _graph("left_t", source_id="a")
     plan = _simple_plan()
@@ -283,7 +288,7 @@ def test_lookup_rejects_template_when_current_topology_hash_missing() -> None:
 
 @pytest.mark.fast
 def test_question_reuse_passes_topology_hashes_to_match_gate() -> None:
-    from aetherdialect._pipeline import _try_federation_plan_question_reuse
+    from aetherdialect._pipeline_execute import _try_federation_plan_question_reuse
 
     composite = _graph("left_t", source_id="a")
     tmpl = _member_template()
@@ -308,20 +313,20 @@ def test_question_reuse_passes_topology_hashes_to_match_gate() -> None:
     )
     with (
         patch(
-            "aetherdialect._pipeline._resolve_federation_plan_template_for_reuse",
+            "aetherdialect._pipeline_execute._resolve_federation_plan_template_for_reuse",
             return_value=cached,
         ),
-        patch("aetherdialect._pipeline.plan_federated_intent") as mock_plan,
+        patch("aetherdialect._pipeline_execute.plan_federated_intent") as mock_plan,
         patch(
-            "aetherdialect._pipeline.federation_plan_topology_identity",
+            "aetherdialect._pipeline_execute.federation_plan_topology_identity",
             return_value=("live_mh", "live_mth"),
         ),
         patch(
-            "aetherdialect._pipeline.federation_plan_matches_template",
+            "aetherdialect._pipeline_execute.federation_plan_matches_template",
             return_value=False,
         ) as mock_match,
         patch(
-            "aetherdialect._pipeline.replay_federated_prepare_from_plan_template",
+            "aetherdialect._pipeline_execute.replay_federated_prepare_from_plan_template",
         ),
     ):
         mock_plan.return_value = _simple_plan()

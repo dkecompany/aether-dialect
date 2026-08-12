@@ -10,14 +10,14 @@ import pytest
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._schema_catalog import (
+from aetherdialect._schema_graph import assign_schema_graph_hashes, recompute_join_paths_multi
+from aetherdialect._schema_profile import (
     _load_schema_classification_cache,
     _save_schema_classification_cache,
     llm_classification_column_scope,
     llm_classify_schema,
     schema_classification_content_hash,
 )
-from aetherdialect._schema_graph import assign_schema_graph_hashes, recompute_join_paths_multi
 
 
 def _graph() -> SchemaGraph:
@@ -73,7 +73,7 @@ def test_llm_classify_schema_reuses_disk_cache_for_unchanged_inputs(
         calls["count"] += 1
         return payload
 
-    with patch("aetherdialect._schema_catalog.LLMProvider.chat", side_effect=_llm_chat):
+    with patch("aetherdialect._schema_profile.LLMProvider.chat", side_effect=_llm_chat):
         scope = llm_classification_column_scope(graph)
         cache_holder: list[dict] = []
         first = llm_classify_schema(graph, notes, column_scope=scope, cache_payload_out=cache_holder)
@@ -90,7 +90,7 @@ def test_llm_classify_schema_reuses_disk_cache_for_unchanged_inputs(
 
 @pytest.mark.fast
 def test_schema_classification_cache_round_trips_by_content_hash(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from aetherdialect._schema_catalog import _normalize_llm_classification_payload
+    from aetherdialect._schema_profile import _normalize_llm_classification_payload
 
     cache_path = tmp_path / "schema_graph.json.gz"
     monkeypatch.setattr(EngineConfig, "SCHEMA_JSON_PATH", str(cache_path))

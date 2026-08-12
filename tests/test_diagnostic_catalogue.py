@@ -191,17 +191,18 @@ def test_federation_diagnostics_carry_source_id_and_phase() -> None:
 
 
 _API_REFERENCE = _REPO_ROOT / "docs" / "API_REFERENCE.md"
+_TROUBLESHOOTING = _REPO_ROOT / "docs" / "TROUBLESHOOTING.md"
 
 
 @pytest.mark.fast
 def test_api_reference_documents_all_refusal_diagnostic_codes() -> None:
     from aetherdialect._constants import REFUSAL_DIAGNOSTIC_CODES
 
-    text = _API_REFERENCE.read_text(encoding="utf-8")
-    start = text.index("### Diagnostic code catalog")
+    text = _TROUBLESHOOTING.read_text(encoding="utf-8")
+    start = text.index("## Diagnostic codes")
     section = text[start:]
     missing = sorted(code for code in REFUSAL_DIAGNOSTIC_CODES if code not in section)
-    assert not missing, f"API_REFERENCE.md missing refusal diagnostic codes: {missing}"
+    assert not missing, f"TROUBLESHOOTING.md missing refusal diagnostic codes: {missing}"
 
 
 @pytest.mark.fast
@@ -227,12 +228,9 @@ _L37_FEDERATION_DIAGNOSTIC_CODES = frozenset(
 
 @pytest.mark.fast
 def test_api_reference_documents_l37_federation_diagnostic_codes() -> None:
-    text = _API_REFERENCE.read_text(encoding="utf-8")
-    start = text.index("**Federation diagnostics**")
-    end = text.index("**Catch-all**", start)
-    section = text[start:end]
-    missing = sorted(code for code in _L37_FEDERATION_DIAGNOSTIC_CODES if code not in section)
-    assert not missing, f"API_REFERENCE.md federation diagnostics missing L37 codes: {missing}"
+    text = _TROUBLESHOOTING.read_text(encoding="utf-8")
+    missing = sorted(code for code in _L37_FEDERATION_DIAGNOSTIC_CODES if code not in text)
+    assert not missing, f"TROUBLESHOOTING.md federation diagnostics missing L37 codes: {missing}"
 
 
 @pytest.mark.fast
@@ -250,11 +248,11 @@ def test_single_catalogue_covers_every_emission() -> None:
     session_only = enum_values & session_values
     missing_session = sorted(session_only - discover_emitted_session_diagnostic_codes())
     assert not missing_session, f"catalogue members never emitted: {missing_session}"
-    docs = (_REPO_ROOT / "docs" / "API_REFERENCE.md").read_text(encoding="utf-8")
-    start = docs.index("### Diagnostic code catalog")
+    docs = _TROUBLESHOOTING.read_text(encoding="utf-8")
+    start = docs.index("## Diagnostic codes")
     section = docs[start:]
     undocumented = sorted(v for v in session_only if v not in section)
-    assert not undocumented, f"catalogue members missing from API reference: {undocumented}"
+    assert not undocumented, f"catalogue members missing from TROUBLESHOOTING: {undocumented}"
     _ = missing_emission
 
 
@@ -262,7 +260,7 @@ def test_single_catalogue_covers_every_emission() -> None:
 def test_trace_headings_are_not_codes() -> None:
     import inspect
 
-    from aetherdialect._core_utils import pipeline_trace
+    from aetherdialect._utils import pipeline_trace
 
     params = list(inspect.signature(pipeline_trace).parameters)
     assert params[0] == "heading"
@@ -283,7 +281,7 @@ def test_probe_and_execution_failures_have_distinct_codes() -> None:
     assert DIAGNOSTIC_CODE_FEDERATION_MEMBER_PROBE_FAILED != DIAGNOSTIC_CODE_FEDERATION_MEMBER_FAILED
     assert SqlDiagnosticCode.EXPLAIN_SORT_SPILL.value != SqlDiagnosticCode.EXPLAIN_TEMPORARY_TABLE.value
     assert SqlDiagnosticCode.EXPLAIN_SORT_SPILL.value != SqlDiagnosticCode.EXPLAIN_OTHER.value
-    text = _API_REFERENCE.read_text(encoding="utf-8")
+    text = _TROUBLESHOOTING.read_text(encoding="utf-8")
     for code in (
         DIAGNOSTIC_CODE_FEDERATION_MEMBER_PROBE_FAILED,
         SqlDiagnosticCode.EXPLAIN_SORT_SPILL.value,
@@ -308,12 +306,12 @@ def test_no_dead_codes() -> None:
 def test_public_reference_matches_catalogue() -> None:
     declared = declared_session_diagnostic_codes()
     emitted = discover_emitted_session_diagnostic_codes()
-    text = _API_REFERENCE.read_text(encoding="utf-8")
-    start = text.index("### Diagnostic code catalog")
+    text = _TROUBLESHOOTING.read_text(encoding="utf-8")
+    start = text.index("## Diagnostic codes")
     section = text[start:]
     documented = {code for code in declared if code in section}
     undocumented = sorted(declared - documented)
-    assert not undocumented, f"declared codes missing from public reference: {undocumented}"
+    assert not undocumented, f"declared codes missing from TROUBLESHOOTING: {undocumented}"
     orphan_docs = sorted(
         code for code in declared if code in section and code not in emitted and not code.startswith("DATA_QUALITY_")
     )

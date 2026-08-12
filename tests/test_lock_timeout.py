@@ -13,12 +13,12 @@ import pytest
 
 from aetherdialect._constants import ARTIFACT_LOCK_FILENAME, DIAGNOSTIC_CODE_STALE_ARTIFACT_LOCK
 from aetherdialect._contracts_base import ArtifactLockTimeoutError, RetryableError
-from aetherdialect._core_utils import (
-    artifact_lock,
+from aetherdialect._utils import (
     drain_diagnostic_collector,
     reset_diagnostic_collector,
     set_diagnostic_collector,
 )
+from aetherdialect._utils_artifacts import artifact_lock
 
 
 @pytest.mark.fast
@@ -66,7 +66,7 @@ def test_stale_lock_from_dead_process_recovered(tmp_path, monkeypatch) -> None:
             fh.write(payload)
 
     monkeypatch.setattr(
-        "aetherdialect._core_utils._process_exists",
+        "aetherdialect._utils_artifacts._process_exists",
         lambda pid: pid != dead_pid,
     )
 

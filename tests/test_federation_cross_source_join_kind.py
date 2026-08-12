@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._constants import FEDERATION_CROSS_SOURCE_JOIN_KINDS
-from aetherdialect._federation import (
-    FederationDeclarationError,
+from aetherdialect._contracts_base import FederationDeclarationError
+from aetherdialect._federation_manifest import (
     parse_federation_manifest,
     validate_federation_cross_source_join_kind,
 )

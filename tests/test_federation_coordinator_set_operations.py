@@ -5,14 +5,10 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from aetherdialect._contracts_base import FederationCapExceededError
+from aetherdialect._contracts_base import FederationCapExceededError, NormalizedExpr
 from aetherdialect._contracts_core import FederatedPlan, JoinSpec, RuntimeCteStep, RuntimeIntent, SelectCol, SourceStep
-from aetherdialect._federation import (
-    _apply_coordinator_probe_joins,
-    execute_federation_coordinator,
-    render_federation_glue,
-)
-from aetherdialect._intent_process import NormalizedExpr
+from aetherdialect._federation_execute import execute_federation_coordinator
+from aetherdialect._federation_plan import _apply_coordinator_probe_joins, render_federation_glue
 from aetherdialect._sql_gen import anti_join_presence_column
 
 

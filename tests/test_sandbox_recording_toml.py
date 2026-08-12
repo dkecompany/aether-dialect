@@ -6,9 +6,9 @@ import os
 from pathlib import Path
 
 import pytest
-from live_tests.conftest import _parse_live_env_file, write_sandbox_recording_toml
 
 from aetherdialect._main_execution import MainExecutionOps
+from sandbox_recording import _parse_live_env_file, write_sandbox_recording_toml
 
 
 def test_write_sandbox_recording_toml_forces_memory_duckdb_and_keeps_llm_creds(tmp_path: Path) -> None:

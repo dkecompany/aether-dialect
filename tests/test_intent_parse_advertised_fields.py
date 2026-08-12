@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from aetherdialect._contracts_core import CteEmissionKind
+from aetherdialect._contracts_base import CteEmissionKind
 from aetherdialect._intent_expr import parse_intent_response
 
 
@@ -17,8 +17,8 @@ def test_distinct_on_preserve_tables_emission_round_trip_from_llm_json() -> None
         "select_cols": ["orders.id"],
         "group_by_cols": [],
         "order_by_cols": [],
-        "where": [],
-        "having": [],
+        "where": None,
+        "having": None,
         "limit": None,
         "natural_language": "show ids",
         "distinct_on": ["orders.id"],
@@ -30,8 +30,8 @@ def test_distinct_on_preserve_tables_emission_round_trip_from_llm_json() -> None
                 "select_cols": ["orders.id"],
                 "group_by_cols": [],
                 "order_by_cols": [],
-                "where": [],
-                "having": [],
+                "where": None,
+                "having": None,
                 "output_columns": ["id"],
                 "emission": "semi_join",
                 "preserve_tables": ["orders"],

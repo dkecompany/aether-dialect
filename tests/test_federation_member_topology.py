@@ -10,14 +10,13 @@ from unittest.mock import patch
 import pytest
 
 from aetherdialect import AetherFederation
-from aetherdialect._contracts_base import FederationMappings
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    parse_federation_manifest,
+from aetherdialect._contracts_schema import ColumnMetadata, FederationMappings, SchemaGraph, TableMetadata
+from aetherdialect._federation_execute import (
     prune_federation_aliases,
     reconcile_authored_declaration_for_members,
     reconcile_federation_member_graphs,
 )
+from aetherdialect._federation_manifest import parse_federation_manifest
 from aetherdialect._schema_graph import recompute_join_paths_multi
 from tests.federation_helpers import write_federation_declaration_file
 from tests.test_aether_federation_public_surface import _init_bundle, _minimal_member
@@ -68,7 +67,7 @@ def test_reconcile_authored_declaration_prunes_aliases_for_removed_member() -> N
             ],
         },
     )
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     pruned_manifest, pruned_mappings = reconcile_authored_declaration_for_members(
         manifest,
         mappings,
@@ -94,7 +93,7 @@ def test_prune_federation_aliases_drops_removed_sources() -> None:
 
 @pytest.mark.fast
 def test_remove_engine_succeeds_when_declaration_names_removed_alias(tmp_path: Path) -> None:
-    declaration_path = write_federation_declaration_file(tmp_path, _three_member_manifest(), {"version": "0.2.1"})
+    declaration_path = write_federation_declaration_file(tmp_path, _three_member_manifest(), {"version": "0.2.3"})
     members = {
         "a": _graph("t_a", source_id="a"),
         "b": _graph("t_b", source_id="b"),
@@ -118,8 +117,8 @@ def test_remove_engine_succeeds_when_declaration_names_removed_alias(tmp_path: P
     with patch("aetherdialect.aetherdialect.initialize_aether_federation", side_effect=_capture_init):
         fed = AetherFederation(
             "fed_members",
-            members={"a": member_a, "b": member_b, "c": member_c},
-            declaration_file=str(declaration_path),
+            members=(member_a, member_b, member_c),
+            declaration=str(declaration_path),
             artifacts_dir=str(tmp_path),
         )
     fed._members = {"a": member_a, "b": member_b, "c": member_c}
@@ -136,7 +135,7 @@ def test_remove_engine_succeeds_when_declaration_names_removed_alias(tmp_path: P
 
 @pytest.mark.fast
 def test_remove_engine_rewrites_declaration_file_on_disk(tmp_path: Path) -> None:
-    declaration_path = write_federation_declaration_file(tmp_path, _three_member_manifest(), {"version": "0.2.1"})
+    declaration_path = write_federation_declaration_file(tmp_path, _three_member_manifest(), {"version": "0.2.3"})
     members = {
         "a": _graph("t_a", source_id="a"),
         "b": _graph("t_b", source_id="b"),
@@ -168,8 +167,8 @@ def test_remove_engine_rewrites_declaration_file_on_disk(tmp_path: Path) -> None
     with patch("aetherdialect.aetherdialect.initialize_aether_federation", side_effect=_capture_init):
         fed = AetherFederation(
             "fed_members",
-            members={"a": member_a, "b": member_b, "c": member_c},
-            declaration_file=str(declaration_path),
+            members=(member_a, member_b, member_c),
+            declaration=str(declaration_path),
             artifacts_dir=str(tmp_path),
         )
     fed._members = {"a": member_a, "b": member_b, "c": member_c}

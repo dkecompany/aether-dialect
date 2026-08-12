@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from aetherdialect._config import (
     BigQueryRuntimeConfig,
     MySQLRuntimeConfig,
+    OracleRuntimeConfig,
     RedshiftRuntimeConfig,
     SnowflakeRuntimeConfig,
     SQLServerRuntimeConfig,
@@ -103,6 +104,44 @@ class TestSQLServerRuntimeConfigParity:
         finally:
             for key, value in orig.items():
                 setattr(SQLServerRuntimeConfig, key, value)
+
+
+class TestOracleRuntimeConfigParity:
+    """Oracle env alias parity."""
+
+    def test_apply_environment_resolves_oracle_server_alias(self) -> None:
+        orig = {
+            "HOST": OracleRuntimeConfig.HOST,
+            "PORT": OracleRuntimeConfig.PORT,
+            "USER": OracleRuntimeConfig.USER,
+            "PASSWORD": OracleRuntimeConfig.PASSWORD,
+            "SERVICE_NAME": OracleRuntimeConfig.SERVICE_NAME,
+            "SID": OracleRuntimeConfig.SID,
+            "SCHEMA": OracleRuntimeConfig.SCHEMA,
+            "AUTH_MODE": OracleRuntimeConfig.AUTH_MODE,
+        }
+        try:
+            OracleRuntimeConfig.apply_environment(
+                {
+                    "ORACLE_SERVER": "ora.internal",
+                    "ORACLE_PORT": "1522",
+                    "ORACLE_USERNAME": "app",
+                    "ORACLE_PWD": "pw",
+                    "ORACLE_SERVICE": "FREEPDB1",
+                    "ORACLE_DEFAULT_SCHEMA": "APP",
+                    "ORACLE_AUTH_MODE": "password",
+                },
+            )
+            assert OracleRuntimeConfig.HOST == "ora.internal"
+            assert OracleRuntimeConfig.PORT == 1522
+            assert OracleRuntimeConfig.USER == "app"
+            assert OracleRuntimeConfig.PASSWORD == "pw"
+            assert OracleRuntimeConfig.SERVICE_NAME == "FREEPDB1"
+            assert OracleRuntimeConfig.SCHEMA == "APP"
+            assert OracleRuntimeConfig.AUTH_MODE == "password"
+        finally:
+            for key, value in orig.items():
+                setattr(OracleRuntimeConfig, key, value)
 
 
 class TestSnowflakeRuntimeConfigParity:
@@ -246,7 +285,7 @@ class TestRedshiftRuntimeConfigParity:
         }
         assert RedshiftRuntimeConfig.env_complete(env) is False
 
-    def test_apply_environment_ignores_removed_libpq_host_alias(self) -> None:
+    def test_apply_environment_ignores_libpq_host_alias(self) -> None:
         orig = {
             "HOST": RedshiftRuntimeConfig.HOST,
             "PORT": RedshiftRuntimeConfig.PORT,
@@ -290,6 +329,15 @@ class TestSevenEngineTomlParsing:
                     'schema = "custom"',
                     'auth_mode = "sql"',
                     "",
+                    "[oracle]",
+                    'host = "oh"',
+                    "port = 1522",
+                    'user = "ou"',
+                    'password = "op"',
+                    'service_name = "FREEPDB1"',
+                    'schema = "RENTAL_SHOP"',
+                    'auth_mode = "password"',
+                    "",
                     "[snowflake]",
                     'account = "acct"',
                     'user = "sfu"',
@@ -330,6 +378,13 @@ class TestSevenEngineTomlParsing:
             "SQLSERVER_DATABASE": "sdb",
             "SQLSERVER_SCHEMA": "custom",
             "SQLSERVER_AUTH_MODE": "sql",
+            "ORACLE_HOST": "oh",
+            "ORACLE_PORT": "1522",
+            "ORACLE_USER": "ou",
+            "ORACLE_PASSWORD": "op",
+            "ORACLE_SERVICE_NAME": "FREEPDB1",
+            "ORACLE_SCHEMA": "RENTAL_SHOP",
+            "ORACLE_AUTH_MODE": "password",
             "SNOWFLAKE_ACCOUNT": "acct",
             "SNOWFLAKE_USER": "sfu",
             "SNOWFLAKE_PASSWORD": "sfp",
@@ -458,7 +513,7 @@ class TestDuckDBRuntimeConfigParity:
         orig_path = DuckDBRuntimeConfig.DATABASE_PATH
         orig_connection = DuckDBRuntimeConfig.NATIVE_CONNECTION
         try:
-            DuckDBRuntimeConfig.attach_connection(sentinel)
+            DuckDBRuntimeConfig.NATIVE_CONNECTION = sentinel
             DuckDBRuntimeConfig.apply_environment({"DUCKDB_FILE": "/data/other.duckdb"})
             assert DuckDBRuntimeConfig.NATIVE_CONNECTION is sentinel
             assert DuckDBRuntimeConfig.DATABASE_PATH == "/data/other.duckdb"
@@ -471,8 +526,8 @@ class TestDuckDBRuntimeConfigParity:
 
         orig_connection = DuckDBRuntimeConfig.NATIVE_CONNECTION
         try:
-            DuckDBRuntimeConfig.attach_connection(object())
-            DuckDBRuntimeConfig.clear_attached_connection()
+            DuckDBRuntimeConfig.NATIVE_CONNECTION = object()
+            DuckDBRuntimeConfig.NATIVE_CONNECTION = None
             assert DuckDBRuntimeConfig.NATIVE_CONNECTION is None
         finally:
             DuckDBRuntimeConfig.NATIVE_CONNECTION = orig_connection
@@ -498,7 +553,7 @@ class TestSQLiteRuntimeConfigParity:
         orig_path = SQLiteRuntimeConfig.DATABASE_PATH
         orig_connection = SQLiteRuntimeConfig.NATIVE_CONNECTION
         try:
-            SQLiteRuntimeConfig.attach_connection(sentinel)
+            SQLiteRuntimeConfig.NATIVE_CONNECTION = sentinel
             SQLiteRuntimeConfig.apply_environment({"SQLITE3_DATABASE": "/data/other.sqlite"})
             assert SQLiteRuntimeConfig.NATIVE_CONNECTION is sentinel
             assert SQLiteRuntimeConfig.DATABASE_PATH == "/data/other.sqlite"
@@ -511,8 +566,8 @@ class TestSQLiteRuntimeConfigParity:
 
         orig_connection = SQLiteRuntimeConfig.NATIVE_CONNECTION
         try:
-            SQLiteRuntimeConfig.attach_connection(object())
-            SQLiteRuntimeConfig.clear_attached_connection()
+            SQLiteRuntimeConfig.NATIVE_CONNECTION = object()
+            SQLiteRuntimeConfig.NATIVE_CONNECTION = None
             assert SQLiteRuntimeConfig.NATIVE_CONNECTION is None
         finally:
             SQLiteRuntimeConfig.NATIVE_CONNECTION = orig_connection

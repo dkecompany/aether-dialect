@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import pytest
 
-from aetherdialect._contracts_base import FederationDeclarationError, InferenceTag
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._contracts_base import FederationDeclarationError
+from aetherdialect._contracts_schema import ColumnMetadata, InferenceTag, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import (
     _materialize_cross_source_edges,
-    _types_compatible,
     compose_composite_graph,
+    validate_cross_source_keys_on_graph,
+)
+from aetherdialect._federation_manifest import (
+    _types_compatible,
     parse_federation_manifest,
     parse_federation_mappings,
-    validate_cross_source_keys_on_graph,
 )
 from aetherdialect._schema_graph import recompute_join_paths_multi, table_pair_has_structural_fk
 
@@ -63,7 +65,7 @@ def _n_member_fixture(n: int) -> tuple[object, object, dict[str, SchemaGraph]]:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_columns": [
                 {
                     "logical": "shared_id",
@@ -311,7 +313,7 @@ def _two_member_join_manifest() -> tuple[object, object]:
         },
         include_derived_roster=True,
     )
-    mappings = parse_federation_mappings({"version": "0.2.1", "logical_columns": []})
+    mappings = parse_federation_mappings({"version": "0.2.3", "logical_columns": []})
     return manifest, mappings
 
 

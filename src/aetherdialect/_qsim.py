@@ -1,4 +1,4 @@
-"""QSim: skeleton cache, schema context, value sampling, and LLM-backed intent generation. When ``QSimSkeleton`` fields or enumeration rules change, invalidate the on-disk cache (``QSimConfig.SKELETONS_JSON_PATH``) or set ``PolicyConfig.REGENERATE_SKELETON_CACHE`` so loaded skeletons match the current code."""
+"""QSim: skeleton cache, schema context, value sampling, and LLM-backed intent generation."""
 
 from __future__ import annotations
 
@@ -20,6 +20,14 @@ from ._constants import (
     HAVING_COUNT_VALUES,
     HAVING_MIN_MAX_VALUES,
     HAVING_SUM_AVG_VALUES,
+    MASTER_AETHERSPACE_NAME,
+    MASTER_AETHERSPACE_UID,
+    TABLE_COL_PATTERN,
+    VALID_HAVING_OPS,
+    VALID_HAVING_VALUE_TYPES,
+    VALID_WHERE_VALUE_TYPES,
+)
+from ._constants_runtime import (
     QSIM_FILL_SYSTEM,
     QSIM_PHASE_B,
     QSIM_PHASE_C,
@@ -29,21 +37,16 @@ from ._constants import (
     QSIM_PHASE_G,
     QSIM_PHASE_H,
     QSIM_PHASE_J,
-    TABLE_COL_PATTERN,
-    VALID_HAVING_OPS,
-    VALID_HAVING_VALUE_TYPES,
-    VALID_WHERE_VALUE_TYPES,
 )
 from ._contracts_base import (
     QSIM_COMPLEXITY_TIER_SPECS,
     QSIM_SUPPORTED_ADVANCED_FEATURES,
-    ColumnRole,
     ComplexityTier,
     DatabaseFeatureCapability,
-    LlmJsonExhausted,
 )
-from ._contracts_core import PipelineFeatureSpec
+from ._contracts_core import LlmJsonExhausted, PipelineFeatureSpec
 from ._contracts_schema import (
+    ColumnRole,
     QSimHaving,
     QSimIntent,
     QSimSkeleton,
@@ -54,12 +57,23 @@ from ._contracts_schema import (
     SkeletonPool,
     ValueDomain,
 )
-from ._core_utils import artifact_lock, debug, intent_id, read_gzip_json, stable_bucket, write_gzip_json_atomic
 from ._llm_provider import LLMProvider
+from ._main_spaces import MainSpaceOps
+from ._utils import (
+    debug,
+    get_aggregatable_columns,
+    get_groupable_columns,
+    intent_id,
+    qsim_skeletons_filename,
+    simulation_artifact_partition_fp,
+    stable_bucket,
+)
+from ._utils_artifacts import artifact_lock, read_gzip_json, write_gzip_json_atomic
 
 _active_qsim_engine_owner: ContextVar[object | None] = ContextVar("aetherdialect_qsim_engine_owner", default=None)
-_skeleton_cache: dict[tuple[str, frozenset[str]], list[QSimSkeleton]] = {}
-_engine_skeleton_caches: dict[int, dict[tuple[str, frozenset[str]], list[QSimSkeleton]]] = {0: _skeleton_cache}
+_active_simulation_partition_fp: ContextVar[str] = ContextVar("aetherdialect_simulation_partition_fp", default="")
+_skeleton_cache: dict[tuple[str, str, frozenset[str]], list[QSimSkeleton]] = {}
+_engine_skeleton_caches: dict[int, dict[tuple[str, str, frozenset[str]], list[QSimSkeleton]]] = {0: _skeleton_cache}
 
 
 def register_engine_skeleton_cache_owner(owner: object) -> None:
@@ -82,7 +96,62 @@ def pop_qsim_engine_owner(token: Token[object | None]) -> None:
     _active_qsim_engine_owner.reset(token)
 
 
-def engine_skeleton_cache() -> dict[tuple[str, frozenset[str]], list[QSimSkeleton]]:
+def push_simulation_artifact_partition(partition_fp: str) -> Token[str]:
+    """Bind *partition_fp* for nested warmup/QSim artifact reads and writes."""
+    return _active_simulation_partition_fp.set(str(partition_fp or ""))
+
+
+def pop_simulation_artifact_partition(token: Token[str]) -> None:
+    """Restore the prior simulation partition after :func:`push_simulation_artifact_partition`."""
+    _active_simulation_partition_fp.reset(token)
+
+
+def active_simulation_artifact_partition_fp() -> str:
+    """Return the active warmup/QSim scope partition fingerprint (empty for owner default)."""
+    return str(_active_simulation_partition_fp.get() or "")
+
+
+def resolve_simulation_artifact_partition_from_owner(owner: object | None) -> str:
+    """Derive the simulation artifact partition for an engine owner."""
+    if owner is None:
+        return ""
+
+    space_uid = ""
+    space_tables: set[str] | None = None
+    context_name = str(getattr(owner, "_context_name", MASTER_AETHERSPACE_NAME) or MASTER_AETHERSPACE_NAME)
+    norm_context = context_name.strip().lower()
+    if norm_context not in (MASTER_AETHERSPACE_NAME, MASTER_AETHERSPACE_UID.lower()):
+        artifacts_dir = getattr(owner, "_artifacts_dir", None)
+        if artifacts_dir is not None:
+            try:
+                resolved_uid = MainSpaceOps.resolve_aetherspace_identity(str(artifacts_dir), norm_context)
+            except (AttributeError, TypeError, ValueError):
+                resolved_uid = None
+            if resolved_uid and resolved_uid not in (MASTER_AETHERSPACE_UID, MASTER_AETHERSPACE_NAME):
+                space_uid = resolved_uid
+                snap = MainSpaceOps.load_aetherspace_snapshot(str(artifacts_dir), resolved_uid)
+                if isinstance(snap, dict):
+                    raw_tables = snap.get("tables")
+                    if isinstance(raw_tables, (list, tuple)):
+                        space_tables = {str(t) for t in raw_tables}
+    scope_ctx = MainSpaceOps.resolve_preview_scope_context(owner)
+    visible = getattr(owner, "_consumer_visible_objects", None)
+    if visible is not None and not isinstance(visible, frozenset):
+        visible = frozenset(str(v) for v in visible)
+    return simulation_artifact_partition_fp(
+        space_uid=space_uid,
+        scope_ctx=scope_ctx,
+        visible_objects=visible,
+        space_tables=space_tables,
+    )
+
+
+def push_simulation_artifact_scope_from_owner(owner: object | None) -> Token[str]:
+    """Bind the simulation artifact partition derived from *owner*."""
+    return push_simulation_artifact_partition(resolve_simulation_artifact_partition_from_owner(owner))
+
+
+def engine_skeleton_cache() -> dict[tuple[str, str, frozenset[str]], list[QSimSkeleton]]:
     """Return the skeleton cache for the active engine owner (or process default)."""
     owner = _active_qsim_engine_owner.get()
     if owner is None:
@@ -166,18 +235,23 @@ def _skeleton_schema_key(schema: SchemaGraph) -> str:
     return str(schema.effective_structural_hash or "")
 
 
-def _skeleton_cache_key(schema: SchemaGraph, tables: list[str]) -> tuple[str, frozenset[str]]:
-    """Build the in-memory skeleton cache key for a schema graph and table set."""
-    return (_skeleton_schema_key(schema), frozenset(tables))
+def _skeleton_cache_key(schema: SchemaGraph, tables: list[str]) -> tuple[str, str, frozenset[str]]:
+    """Build the in-memory skeleton cache key for a schema graph, scope partition, and table set."""
+    return (
+        _skeleton_schema_key(schema),
+        active_simulation_artifact_partition_fp(),
+        frozenset(tables),
+    )
 
 
 def _skeleton_cache_for_schema(schema: SchemaGraph) -> dict[frozenset[str], list[QSimSkeleton]]:
-    """Return cached skeleton lists keyed by table set for one schema graph."""
+    """Return cached skeleton lists keyed by table set for one schema graph and active partition."""
     schema_key = _skeleton_schema_key(schema)
+    partition_fp = active_simulation_artifact_partition_fp()
     return {
         table_key: skeletons
-        for (cached_schema_key, table_key), skeletons in engine_skeleton_cache().items()
-        if cached_schema_key == schema_key
+        for (cached_schema_key, cached_partition_fp, table_key), skeletons in engine_skeleton_cache().items()
+        if cached_schema_key == schema_key and cached_partition_fp == partition_fp
     }
 
 
@@ -228,7 +302,7 @@ def build_fk_adjacency(schema: SchemaGraph) -> dict[str, set[str]]:
 
 
 def is_connected(tables: list[str], adj: dict[str, set[str]]) -> bool:
-    """Return whether all given tables are mutually reachable via FK. edges."""
+    """Return whether all given tables are mutually reachable via FK edges."""
     if len(tables) <= 1:
         return True
 
@@ -250,7 +324,7 @@ def is_connected(tables: list[str], adj: dict[str, set[str]]) -> bool:
 
 
 def enumerate_table_sets(schema: SchemaGraph, max_tables: int | None = None) -> list[list[str]]:
-    """Enumerate all valid FK-connected table combinations up to. max_tables tables."""
+    """Enumerate all valid FK-connected table combinations up to max_tables tables."""
     if max_tables is None:
         max_tables = QSimConfig.MAX_TABLES_PER_INTENT
 
@@ -271,23 +345,15 @@ def enumerate_table_sets(schema: SchemaGraph, max_tables: int | None = None) -> 
     return valid_sets
 
 
-def _is_excluded_where_column(col_name: str) -> bool:
-    """Return whether a column name matches any excluded filter pattern."""
-    for pattern in QSimConfig.EXCLUDED_WHERE_PATTERNS:
-        if pattern in col_name.lower():
-            return True
-    return False
-
-
 def get_filterable_columns(table: str, schema: SchemaGraph, column_roles: dict[str, str]) -> list[tuple[str, str]]:
-    """Return filterable columns for a table, excluding audit and. system. columns."""
+    """Return filterable columns for a table, excluding denied and sensitive columns."""
     result: list[tuple[str, str]] = []
     table_ir = schema.tables.get(table)
     if not table_ir:
         return result
 
     for col_name, col_meta in table_ir.columns.items():
-        if not col_meta.is_filterable or _is_excluded_where_column(col_name):
+        if not col_meta.is_filterable or not col_meta.is_selectable:
             continue
         col_key = f"{table}.{col_name}"
         role = column_roles.get(col_key, col_meta.role or "unknown")
@@ -296,42 +362,10 @@ def get_filterable_columns(table: str, schema: SchemaGraph, column_roles: dict[s
     return result
 
 
-def get_aggregatable_columns(table: str, schema: SchemaGraph, column_roles: dict[str, str]) -> list[str]:
-    """Return column keys that can be aggregated with SUM, AVG, MIN, or. MAX."""
-    result: list[str] = []
-    table_ir = schema.tables.get(table)
-    if not table_ir:
-        return result
-
-    for col_name, col_meta in table_ir.columns.items():
-        col_key = f"{table}.{col_name}"
-        role = column_roles.get(col_key, col_meta.role or "unknown")
-        if role == ColumnRole.NUMERIC_MEASURE.value:
-            result.append(col_key)
-
-    return result
-
-
-def get_groupable_columns(table: str, schema: SchemaGraph, column_roles: dict[str, str]) -> list[str]:
-    """Return column keys usable in GROUP BY clauses."""
-    result: list[str] = []
-    table_ir = schema.tables.get(table)
-    if not table_ir:
-        return result
-
-    for col_name, col_meta in table_ir.columns.items():
-        col_key = f"{table}.{col_name}"
-        role = column_roles.get(col_key, col_meta.role or "unknown")
-        if role in (ColumnRole.CATEGORICAL.value, ColumnRole.TEMPORAL.value, ColumnRole.NUMERIC_CATEGORICAL.value):
-            result.append(col_key)
-
-    return result
-
-
 def get_comparable_column_pairs(
     table_set: list[str], schema: SchemaGraph, column_roles: dict[str, str]
 ) -> list[tuple[str, str, str, str, str]]:
-    """Return cross-table column pairs that can be semantically. compared."""
+    """Return cross-table column pairs that can be semantically compared."""
     comparable_pairs = []
 
     numeric_roles = {
@@ -395,7 +429,7 @@ def compute_intent_id(intent_dict: dict[str, Any]) -> str:
         "select_cols": sorted(intent_dict.get("select_cols", [])),
         "group_by_cols": sorted(intent_dict.get("group_by_cols", [])),
         "where": sorted(
-            intent_dict.get("where", intent_dict.get("where_param", [])),
+            intent_dict.get("where", []),
             key=lambda x: str(x.get("column", "")) if isinstance(x, dict) else "",
         ),
         "having_param": sorted(
@@ -407,7 +441,7 @@ def compute_intent_id(intent_dict: dict[str, Any]) -> str:
 
 
 def generate_all_skeletons(tables: list[str], schema: SchemaGraph, column_roles: dict[str, str]) -> list[QSimSkeleton]:
-    """Generate all valid structural `QSimSkeleton` instances for a. table set."""
+    """Generate all valid structural `QSimSkeleton` instances for a table set."""
     cache_key = _skeleton_cache_key(schema, tables)
     if cache_key in engine_skeleton_cache():
         debug(f"[{QSIM_PHASE_B}]  cache_hit: {len(engine_skeleton_cache()[cache_key])} skeletons")
@@ -460,11 +494,31 @@ def generate_all_skeletons(tables: list[str], schema: SchemaGraph, column_roles:
     return skeletons
 
 
+def _skeleton_cache_payload(
+    schema: SchemaGraph, schema_cache: dict[frozenset[str], list[QSimSkeleton]]
+) -> dict[str, Any]:
+    """Build the on-disk skeleton cache document for one schema graph and active partition."""
+    return {
+        "schema_graph_id": str(schema.schema_graph_id or ""),
+        "structural_hash": schema.structural_hash,
+        "partition_fp": active_simulation_artifact_partition_fp(),
+        "num_table_sets": len(schema_cache),
+        "skeletons": _serialize_skeleton_cache(schema),
+    }
+
+
+def resolve_qsim_skeletons_path(partition_fp: str | None = None) -> str:
+    """Return the on-disk skeleton cache path for the active or explicit scope partition."""
+    fp = active_simulation_artifact_partition_fp() if partition_fp is None else str(partition_fp or "")
+    artifacts_dir = os.path.dirname(os.path.abspath(QSimConfig.SKELETONS_JSON_PATH))
+    return os.path.join(artifacts_dir, qsim_skeletons_filename(fp))
+
+
 def load_or_create_skeletons(
     schema: SchemaGraph, column_roles: dict[str, str]
 ) -> dict[frozenset[str], list[QSimSkeleton]]:
     """Load the skeleton cache from disk or generate and persist it."""
-    skeleton_path = QSimConfig.SKELETONS_JSON_PATH
+    skeleton_path = resolve_qsim_skeletons_path()
     adir = os.path.dirname(os.path.abspath(skeleton_path))
     with artifact_lock(adir):
         return _load_or_create_skeletons_locked(schema, column_roles, skeleton_path)
@@ -478,7 +532,7 @@ def _load_or_create_skeletons_locked(
         try:
             cache_data = read_gzip_json(skeleton_path)
 
-            cached_hash = cache_data.get("structural_hash", cache_data.get("schema_hash", ""))
+            cached_hash = cache_data.get("structural_hash", "")
             if cached_hash != schema.structural_hash:
                 debug(
                     f"[{QSIM_PHASE_B}]  structural_hash mismatch: {cached_hash} != {schema.structural_hash}, attempting surgical prune"
@@ -493,11 +547,7 @@ def _load_or_create_skeletons_locked(
                 if pruned:
                     _store_skeleton_cache_entries(schema, pruned)
                     schema_cache = _skeleton_cache_for_schema(schema)
-                    cache_data = {
-                        "structural_hash": schema.structural_hash,
-                        "num_table_sets": len(schema_cache),
-                        "skeletons": _serialize_skeleton_cache(schema),
-                    }
+                    cache_data = _skeleton_cache_payload(schema, schema_cache)
                     debug(f"[{QSIM_PHASE_B}]  surgical prune retained {len(schema_cache)} table sets; rewriting cache")
                     write_gzip_json_atomic(skeleton_path, cache_data, sort_keys=True)
                     return schema_cache
@@ -518,11 +568,7 @@ def _load_or_create_skeletons_locked(
         generate_all_skeletons(table_set, schema, column_roles)
 
     schema_cache = _skeleton_cache_for_schema(schema)
-    cache_data = {
-        "structural_hash": schema.structural_hash,
-        "num_table_sets": len(schema_cache),
-        "skeletons": _serialize_skeleton_cache(schema),
-    }
+    cache_data = _skeleton_cache_payload(schema, schema_cache)
 
     debug(f"[{QSIM_PHASE_B}]  saving {len(schema_cache)} table sets to cache")
     write_gzip_json_atomic(skeleton_path, cache_data, sort_keys=True)
@@ -581,7 +627,7 @@ def _domain_prefers_integer_samples(domain: ValueDomain) -> bool:
 
 
 def validate_column_exists(col_ref: str, tables: list[str], schema: SchemaGraph) -> bool:
-    """Return whether a `table.column` reference is valid for the given. tables."""
+    """Return whether a `table.column` reference is valid for the given tables."""
     if "." not in col_ref:
         return False
     table, col = col_ref.split(".", 1)
@@ -1223,7 +1269,7 @@ def instantiate_all(
 
 
 def _allocate_tier_int_quotas(weights: dict[str, float], total: int) -> dict[str, int]:
-    """Convert fractional tier weights into nonnegative integers. summing. to *total*."""
+    """Convert fractional tier weights into nonnegative integers summing to *total*."""
     keys = [
         ComplexityTier.SIMPLE.value,
         ComplexityTier.MODERATE.value,
@@ -1260,7 +1306,7 @@ def _advanced_feature_allowed(feature_id: str, cap: DatabaseFeatureCapability) -
 
 
 def _advanced_feature_prompt_block(cap: DatabaseFeatureCapability) -> str:
-    """Format capability-filtered advanced feature bullets for the. skeleton-fill prompt."""
+    """Format capability-filtered advanced feature bullets for the skeleton-fill prompt."""
     lines: list[str] = []
     for spec in QSIM_SUPPORTED_ADVANCED_FEATURES:
         if not _advanced_feature_allowed(spec.feature_id, cap):
@@ -1339,7 +1385,7 @@ def _qsim_advanced_slot_detected(intent: QSimIntent, feature_id: str) -> bool:
 def _build_merged_tier_buckets(
     schema: SchemaGraph, column_roles: dict[str, str]
 ) -> dict[str, list[tuple[QSimSkeleton, list[str]]]]:
-    """Flatten A/B/C skeleton tiers into complexity buckets for. weighted. sampling."""
+    """Flatten A/B/C skeleton tiers into complexity buckets for weighted sampling."""
     merged: dict[str, list[tuple[QSimSkeleton, list[str]]]] = {
         ComplexityTier.SIMPLE.value: [],
         ComplexityTier.MODERATE.value: [],
@@ -1362,7 +1408,7 @@ def _build_merged_tier_buckets(
 def _pop_matching_skeleton(
     bucket: list[tuple[QSimSkeleton, list[str]]], need_where: bool, need_having: bool
 ) -> tuple[QSimSkeleton, list[str]] | None:
-    """Pop the next skeleton from *bucket* honoring filter and HAVING. coverage needs."""
+    """Pop the next skeleton from *bucket* honoring filter and HAVING coverage needs."""
     for i, (sk, ts) in enumerate(bucket):
         if need_where and sk.num_where == 0:
             continue
@@ -1374,7 +1420,7 @@ def _pop_matching_skeleton(
 
 
 def _pick_weighted_tier(tier_remaining: dict[str, int], rng: random.Random) -> str | None:
-    """Sample the next tier to fill using remaining quota counts as. weights."""
+    """Sample the next tier to fill using remaining quota counts as weights."""
     active = [(k, v) for k, v in tier_remaining.items() if v > 0]
     if not active:
         return None
@@ -1384,12 +1430,12 @@ def _pick_weighted_tier(tier_remaining: dict[str, int], rng: random.Random) -> s
 
 
 def _has_aggregation(select_cols: list[str]) -> bool:
-    """Return True if any select column string matches an aggregation. pattern."""
+    """Return True if any select column string matches an aggregation pattern."""
     return any(AGG_PATTERN.match(sc) for sc in select_cols)
 
 
 def _extract_agg_info(expr: str) -> tuple[str, str] | None:
-    """Extract aggregation function and inner column from a SQL. aggregation expression."""
+    """Extract aggregation function and inner column from a SQL aggregation expression."""
     m = AGG_PATTERN.match(expr.strip())
     if m:
         return (m.group(1).lower(), m.group(2).strip())
@@ -1402,7 +1448,7 @@ def _extract_tables_from_expr(expr: str) -> set[str]:
 
 
 def _validate_skeleton_constraints(response: dict[str, Any], skeleton: QSimSkeleton) -> tuple[bool, list[str]]:
-    """Validate an LLM response dict against structural skeleton. constraints."""
+    """Validate an LLM response dict against structural skeleton constraints."""
     violations = []
     select_cols_raw = response.get("select_cols", [])
     has_agg = any(AGG_PATTERN.match(sc) for sc in select_cols_raw if isinstance(sc, str))
@@ -1446,7 +1492,7 @@ def _validate_skeleton_constraints(response: dict[str, Any], skeleton: QSimSkele
 
 
 def _build_retry_guidance(failure_ctx: RetryFailureContext, schema: SchemaGraph, column_roles: dict[str, str]) -> str:
-    """Build retry guidance text for the LLM from a previous failure. context."""
+    """Build retry guidance text for the LLM from a previous failure context."""
     guidance_parts = []
     guidance_parts.append(f"\n\n    RETRY GUIDANCE (Attempt {failure_ctx.attempt_number + 2}):")
     guidance_parts.append(f"    Previous attempt failed: {failure_ctx.failure_type}")
@@ -1476,7 +1522,7 @@ def _llm_fill_intent(
     select_col_target: int | None = None,
     advanced_feature_lines: str | None = None,
 ) -> QSimIntent | None:
-    """Fill a structural skeleton via the LLM; validate and retry with. guidance on failure."""
+    """Fill a structural skeleton via the LLM; validate and retry with guidance on failure."""
     context = build_schema_context(skeleton.tables, schema)
 
     all_filterable = []
@@ -1679,7 +1725,7 @@ def _llm_fill_intent(
 def _parse_llm_response(
     response: dict[str, Any], skeleton: QSimSkeleton, schema: SchemaGraph, column_roles: dict[str, str]
 ) -> QSimIntent | tuple[str, set[str], set[str]] | None:
-    """Parse and validate LLM JSON into a `QSimIntent` or retry context. tuple."""
+    """Parse and validate LLM JSON into a `QSimIntent` or retry context tuple."""
     select_cols_raw = response.get("select_cols", [])
     where_dicts = response.get("filters", [])
     groupby_cols = response.get("groupby_cols", [])
@@ -2035,7 +2081,7 @@ def _generate_question_from_intent(intent: QSimIntent, schema: SchemaGraph) -> s
             cond = f"{h.op} {intent.param_values.get(f'h{hidx}', '?')}"
         having_descriptions.append({"expression": h.expression, "condition": cond})
 
-    generate_question = importlib.import_module("aetherdialect._utils").generate_question
+    generate_question = importlib.import_module("aetherdialect._utils_intent").generate_question
     return cast(
         str | None,
         generate_question(
@@ -2056,7 +2102,7 @@ def generate_all_questions(
     trace_rows: list[dict[str, Any]] | None = None,
     trace_summary: dict[str, Any] | None = None,
 ) -> list[QSimIntent]:
-    """Return intents with generated NL `question` fields where. generation succeeds."""
+    """Return intents with generated NL `question` fields where generation succeeds."""
     debug(f"[{QSIM_PHASE_J}] generating: {len(intents)} questions")
 
     results: list[QSimIntent] = []
@@ -2122,12 +2168,12 @@ def generate_all_questions(
 
 
 def _is_no_variance_skeleton(skeleton: QSimSkeleton) -> bool:
-    """Return True if the skeleton has no filters and no HAVING (no. value-sampling variance)."""
+    """Return True if the skeleton has no filters and no HAVING (no value-sampling variance)."""
     return skeleton.num_where == 0 and skeleton.num_having == 0
 
 
 def _compute_skeleton_complexity_tier(skeleton: QSimSkeleton) -> str:
-    """Assign complexity tier A, B, or C from skeleton features for. stratified pools."""
+    """Assign complexity tier A, B, or C from skeleton features for stratified pools."""
     score = 0
     score += skeleton.num_where * 2
     score += 3 if skeleton.has_aggregation else 0
@@ -2146,7 +2192,7 @@ def _compute_skeleton_complexity_tier(skeleton: QSimSkeleton) -> str:
 
 
 def _compute_table_set_richness(tables: list[str], schema: SchemaGraph, column_roles: dict[str, str]) -> int:
-    """Score a table set from filterable, aggregatable, groupable, and. comparable-column counts."""
+    """Score a table set from filterable, aggregatable, groupable, and comparable-column counts."""
     filterable_count = 0
     aggregatable_count = 0
     groupable_count = 0
@@ -2164,7 +2210,7 @@ def _compute_table_set_richness(tables: list[str], schema: SchemaGraph, column_r
 def _build_skeleton_pool(
     schema: SchemaGraph, column_roles: dict[str, str], num_tables: int | None = None
 ) -> SkeletonPool:
-    """Build a tiered `SkeletonPool` from enumerated table sets and. generated skeletons."""
+    """Build a tiered `SkeletonPool` from enumerated table sets and generated skeletons."""
     table_sets = enumerate_table_sets(schema)
 
     if num_tables is not None:
@@ -2221,7 +2267,7 @@ def _build_skeleton_pool(
 
 
 def _normalize_qsim_intent(intent: QSimIntent, schema: SchemaGraph) -> QSimIntent:
-    """Return a canonical `QSimIntent`: grain, deduped columns, pruned. tables, new `intent_id`."""
+    """Return a canonical `QSimIntent`: grain, deduped columns, pruned tables, new `intent_id`."""
     grain = intent.grain
     has_agg = _has_aggregation(intent.select_cols)
 
@@ -2303,7 +2349,7 @@ def generate_all_intents(
     trace_rows: list[dict[str, Any]] | None = None,
     trace_summary: dict[str, Any] | None = None,
 ) -> list[QSimIntent]:
-    """Generate diverse ``QSimIntent`` rows using tier-balanced. skeleton. sampling and coverage targets."""
+    """Generate diverse ``QSimIntent`` rows using tier-balanced skeleton sampling and coverage targets."""
     seed_val = rng_seed if rng_seed is not None else QSimConfig.RANDOM_SEED
     random.seed(seed_val)
     rng = random.Random(seed_val)
@@ -2557,7 +2603,7 @@ def generate_all_intents(
 
 
 def greedy_cover_indices_by_atoms(atoms_per_row: list[frozenset[str]], universe: frozenset[str]) -> list[int]:
-    """Greedy set-cover ordering of row indices over a discrete atom. universe."""
+    """Greedy set-cover ordering of row indices over a discrete atom universe."""
     uncovered = set(universe)
     picked: list[int] = []
     available = list(range(len(atoms_per_row)))

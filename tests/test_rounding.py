@@ -11,10 +11,10 @@ from aetherdialect._contracts_base import MulGroup, NormalizedExpr
 from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import DialectRegistry
-from aetherdialect._federation import (
-    compose_composite_graph,
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import (
     emit_federation_rounding_mode_mixed_diagnostics,
-    parse_federation_manifest,
     plan_federated_intent,
     render_federation_residual_sql,
 )
@@ -129,7 +129,7 @@ def test_mixed_rounding_modes_emit_diagnostic() -> None:
     plan = plan_federated_intent(intent, composite, manifest)
     assert plan.ineligible_reason is None
 
-    with patch("aetherdialect._federation.notify") as notify_mock:
+    with patch("aetherdialect._federation_plan.notify") as notify_mock:
         emit_federation_rounding_mode_mixed_diagnostics(manifest, plan, intent, schema=composite)
 
     codes = [call.kwargs.get("code") for call in notify_mock.call_args_list]

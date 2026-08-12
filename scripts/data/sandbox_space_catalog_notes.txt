@@ -1,3 +1,0 @@
-The catalog inventory focuses on our core sellable media assets and their organization. We track individual items and their specific attributes across different formats, primarily films.
-
-Classification is handled through a category system that allows us to group items for better discovery. Each item can belong to one or more categories. When analyzing this part of the business, we prioritize descriptive category names and media titles over internal numeric identifiers. This domain is concerned with the attributes and grouping of the media itself, rather than transaction history, revenue, or store-specific logistics.

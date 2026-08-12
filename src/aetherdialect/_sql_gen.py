@@ -29,47 +29,58 @@ from ._constants import (
     DIAGNOSTIC_CODE_SEMANTIC_PROFILE_WHERE_EDGE,
     DISTINCT_ON_CTE_NAME_PREFIX,
     DISTINCT_ON_RANK_COLUMN,
-    JOIN_CHOICE_PROMPT_KEY_ORDER,
     JOIN_CHOICE_SCOPE_MAIN,
     JOIN_EDGE_KIND_RANK,
     JOIN_ORPHAN_RATE_DIAGNOSTIC_FLOOR,
     JOIN_PATH_EDGE_KIND_WHERE_BUCKET,
     JOIN_PATH_EDGE_KINDS,
-    JOIN_PRIOR_FEEDBACK_HEADING,
-    REFUSAL_AMBIGUOUS_DATE_LITERAL_MESSAGE,
-    REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE,
-    REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN_MESSAGE,
+    LIKE_ESCAPE_CHAR,
     SCALAR_FUNCTIONS_LEADING_ARG,
     SQL_WINDOW_FUNCTION_UPPER,
     TIMESTAMP_COLUMN_DATA_TYPES,
 )
+from ._constants_runtime import (
+    JOIN_CHOICE_PROMPT_KEY_ORDER,
+    JOIN_PRIOR_FEEDBACK_HEADING,
+    REFUSAL_AMBIGUOUS_DATE_LITERAL_MESSAGE,
+    REFUSAL_NULL_IN_NEGATED_LIST_MESSAGE,
+    REFUSAL_SUBDAY_DATE_WINDOW_ON_DATE_COLUMN_MESSAGE,
+)
 from ._contracts_base import (
     PROBE_CTE_EMISSION_KINDS,
-    AmbiguousDateLiteralError,
-    ClauseWidenedRowsetError,
+    ConfigError,
     CteEmissionKind,
     HavingParam,
+    JoinEdge,
+    MulGroup,
+    NormalizedExpr,
+    OrderByCol,
+    PredicateGroup,
+    ScalarArg,
+    SchemaInvariantError,
+    StructuralKnowledgeFact,
+    StructuralKnowledgeKind,
+    WhereParam,
+)
+from ._contracts_core import (
+    AmbiguousDateLiteralError,
+    ClauseWidenedRowsetError,
     JoinCandidateCapExceededError,
     JoinColumnCountMismatchError,
-    JoinEdge,
     JoinInjectionAlignmentError,
     JoinInjectionFailedError,
     JoinPathTieCapExceededError,
     JoinProbeEdgeKindMismatchError,
     LlmJsonExhausted,
-    MulGroup,
     NoJoinPathError,
-    NormalizedExpr,
     NullInNegatedListError,
-    OrderByCol,
-    PredicateGroup,
     RegistryRenderError,
-    ScalarArg,
-    SchemaInvariantError,
+    RuntimeCteStep,
+    RuntimeIntent,
+    ScopeClass,
+    SelectCol,
     SubdayDateWindowOnDateColumnError,
-    WhereParam,
 )
-from ._contracts_core import RuntimeCteStep, RuntimeIntent, ScopeClass, SelectCol
 from ._contracts_schema import (
     CaseRegistryStep,
     CaseWhenExpr,
@@ -78,7 +89,18 @@ from ._contracts_schema import (
     WindowRegistryStep,
     WindowSpec,
 )
-from ._core_utils import (
+from ._dialect import Dialect, DialectRegistry
+from ._dialect_postgres import PostgresDialect
+from ._intent_expr import (
+    extract_columns_from_expr,
+    get_col_meta,
+    get_col_type,
+)
+from ._knowledge_join import merge_preserve_tables_with_notes_defaults
+from ._llm_provider import LLMProvider
+from ._schema_graph import stored_join_paths_for_pair
+from ._schema_profile import value_overlap_stats_for_columns
+from ._utils import (
     active_federation_execution_context,
     debug,
     escape_like_wildcards,
@@ -93,19 +115,11 @@ from ._core_utils import (
     schema_prompt_cache_id,
     stable_json,
 )
-from ._dialect import Dialect, DialectRegistry
-from ._dialect_postgres import PostgresDialect
-from ._intent_expr import extract_columns_from_expr
-from ._llm_provider import LLMProvider
-from ._schema_catalog import value_overlap_stats_for_columns
-from ._schema_graph import join_path_pair_tie_count, stored_join_paths_for_pair
-from ._validation_schema import (
-    collect_fan_out_sensitive_aggregates,
-    get_col_meta,
-    get_col_type,
+from ._validation_rules import collect_fan_out_sensitive_aggregates, validate_clause_widened_rowset
+from ._validation_shape import (
     multiplying_edges_for_table,
     qualifies_as_semi_join_probe,
-    validate_clause_widened_rowset,
+    runtime_scope_registry_error_messages,
 )
 
 
@@ -173,6 +187,49 @@ def _refuse_join_path_tie_ceiling(
     raise JoinPathTieCapExceededError(source_table, target_table, path_count, ceiling)
 
 
+def _declared_pin_matches_path_signature(
+    path_sig: tuple[str, ...],
+    pinned_sigs: frozenset[tuple[str, ...]],
+) -> bool:
+    """True when *path_sig* equals or prefixes a declared pinned join path."""
+    if path_sig in pinned_sigs:
+        return True
+    return any(len(path_sig) <= len(pinned) and pinned[: len(path_sig)] == path_sig for pinned in pinned_sigs)
+
+
+def _paths_after_declared_pinning(
+    schema: SchemaGraph,
+    raw_paths: list[list[dict[str, Any]]],
+) -> list[list[dict[str, Any]]]:
+    """Collapse stored pair paths to declared signatures before tie/cross-product caps."""
+    pinned_sigs: frozenset[tuple[str, ...]] = getattr(schema, "_pinned_join_path_signatures", frozenset())
+    if not pinned_sigs or not raw_paths:
+        return raw_paths
+    filtered = [
+        path
+        for path in raw_paths
+        if _declared_pin_matches_path_signature(tuple(_join_path_signature_for_path(path, schema)), pinned_sigs)
+    ]
+    return filtered if filtered else raw_paths
+
+
+def _usable_paths_for_pair(
+    schema: SchemaGraph,
+    source_table: str,
+    target_table: str,
+) -> tuple[list[list[dict[str, Any]]], int]:
+    """Return pair paths after declared-pin filtering and the count used for tie-cap checks."""
+    raw_paths, overflow = stored_join_paths_for_pair(schema.join_paths_multi, source_table, target_table)
+    if overflow is not None and not raw_paths:
+        return [], overflow
+    filtered = _paths_after_declared_pinning(schema, raw_paths)
+    if filtered:
+        return filtered, len(filtered)
+    if overflow is not None:
+        return raw_paths, overflow
+    return raw_paths, len(raw_paths)
+
+
 def _enforce_join_path_pair_tie_ceiling(
     schema: SchemaGraph,
     source_table: str,
@@ -181,7 +238,7 @@ def _enforce_join_path_pair_tie_ceiling(
     tie_cap: int | None,
 ) -> None:
     ceiling = _effective_join_path_tie_cap(tie_cap)
-    path_count = join_path_pair_tie_count(schema.join_paths_multi, source_table, target_table)
+    _paths, path_count = _usable_paths_for_pair(schema, source_table, target_table)
     if path_count > ceiling:
         _refuse_join_path_tie_ceiling(source_table, target_table, path_count, ceiling)
 
@@ -504,7 +561,7 @@ def _wrap_for_fixed_width_text(expr: str, dialect: Dialect, *, column_meta: Any 
 
 def _like_escape_suffix() -> str:
     """Return the SQL suffix that treats ``%`` and ``_`` as literal characters."""
-    return " ESCAPE '\\\\'"
+    return f" ESCAPE '{LIKE_ESCAPE_CHAR}'"
 
 
 def _finalize_like_predicate_sql(dialect: Dialect, sql: str) -> str:
@@ -1264,6 +1321,53 @@ def _join_path_signature_for_path(path: list[dict[str, Any]], schema: SchemaGrap
     return [_canonical_join_edge_string(schema, e) for e in path]
 
 
+def declared_join_path_signatures(facts: Sequence[StructuralKnowledgeFact]) -> tuple[tuple[str, ...], ...]:
+    """Return declared multi-hop path signatures from join structural facts."""
+    out: list[tuple[str, ...]] = []
+    for fact in facts:
+        if fact.kind != StructuralKnowledgeKind.JOIN.value:
+            continue
+        payload = fact.payload or {}
+        raw = payload.get("path_signature")
+        if not isinstance(raw, list) or not raw:
+            continue
+        sig = tuple(str(s).strip() for s in raw if str(s).strip())
+        if sig:
+            out.append(sig)
+    return tuple(out)
+
+
+def validate_declared_join_paths_or_raise(schema: SchemaGraph, facts: Sequence[StructuralKnowledgeFact]) -> None:
+    """Raise when a declared path signature is absent from the enumerated candidate set."""
+    for sig_tuple in declared_join_path_signatures(facts):
+        sig_list = list(sig_tuple)
+        tables: set[str] = set()
+        for seg in sig_list:
+            if "->" not in seg or "." not in seg:
+                raise ConfigError(f"declared join path segment malformed: {seg!r}")
+            left, right = seg.split("->", 1)
+            tables.add(left.split(".", 1)[0].strip())
+            tables.add(right.split(".", 1)[0].strip())
+        if len(tables) < 2:
+            raise ConfigError(f"declared join path does not name enough tables: {sig_list!r}")
+        table_list = sorted(tables)
+        candidates = _candidate_join_paths_for_tables(schema, table_list)
+        candidate_sigs = {tuple(_join_path_signature_for_path(path, schema)) for path in candidates if path}
+        if tuple(sig_list) not in candidate_sigs:
+            raise ConfigError(
+                f"declared join path {list(sig_list)!r} not found in enumerated candidates for tables {table_list!r}"
+            )
+
+
+def pin_join_paths_multi(schema: SchemaGraph, facts: Sequence[StructuralKnowledgeFact]) -> None:
+    """Record operator-declared path signatures for join candidate filtering."""
+    pinned: set[tuple[str, ...]] = set()
+    for sig_tuple in declared_join_path_signatures(facts):
+        pinned.add(tuple(sig_tuple))
+    if pinned:
+        object.__setattr__(schema, "_pinned_join_path_signatures", frozenset(pinned))
+
+
 def _candidate_join_paths_for_tables(
     schema: SchemaGraph, tables: list[str], *, cross_product_cap: int | None = None, tie_cap: int | None = None
 ) -> list[list[dict[str, Any]]]:
@@ -1314,7 +1418,7 @@ def _candidate_join_paths_for_tables(
         option_lists: list[list[list[dict[str, Any]]]] = []
         for target in others_sorted:
             _enforce_join_path_pair_tie_ceiling(schema, root, target, tie_cap=tie_cap)
-            raw_paths, _overflow = stored_join_paths_for_pair(schema.join_paths_multi, root, target)
+            raw_paths, _path_count = _usable_paths_for_pair(schema, root, target)
             valid: list[list[dict[str, Any]]] = []
             for p in raw_paths:
                 if not p:
@@ -1902,6 +2006,11 @@ def join_hints_multi(
     """Build ordered join candidates with ``edge_kinds`` and. ``candidate_tier`` labels."""
     _ = prepend_paths
     virtual_specs = virtual_specs or {}
+    facts = tuple(getattr(schema, "structural_knowledge", ()) or ())
+    if facts:
+        if declared_join_path_signatures(facts):
+            validate_declared_join_paths_or_raise(schema, facts)
+            pin_join_paths_multi(schema, facts)
     if len(tables) <= 1:
         debug("[sql_gen.join_hints_multi] single table, returning J00")
         return {
@@ -1928,11 +2037,16 @@ def join_hints_multi(
         merged_paths = [p for p in merged_paths if not _path_has_semantic_edge(p)]
     ordered = _order_join_candidates_stable(merged_paths, schema, intent)
     ordered_eff = [p for p in ordered if p]
+    pinned_sigs: frozenset[tuple[str, ...]] = getattr(schema, "_pinned_join_path_signatures", frozenset())
+    if pinned_sigs:
+        ordered_eff = [p for p in ordered_eff if tuple(_join_path_signature_for_path(p, schema)) in pinned_sigs]
     if not ordered_eff:
         merged_nonempty = [p for p in merged_paths if p]
         if merged_nonempty:
             ordered_eff = _order_join_candidates_stable(merged_nonempty, schema, intent)
             ordered_eff = [p for p in ordered_eff if p]
+            if pinned_sigs:
+                ordered_eff = [p for p in ordered_eff if tuple(_join_path_signature_for_path(p, schema)) in pinned_sigs]
     if not ordered_eff:
         debug("[sql_gen.join_hints_multi] no candidates, returning J00")
         return {
@@ -2605,14 +2719,12 @@ def render_expr_sql(expr: NormalizedExpr, dialect: Dialect | None = None) -> str
     """Render a NormalizedExpr as a SQL fragment for expression guide."""
     ref = expr.registry_ref() or ""
     if ref.startswith("w"):
-        win_by = {s.registry_id: s for s in WindowRegistryStep.current_steps()}
-        win_step = win_by.get(ref)
+        win_step = WindowRegistryStep.lookup(ref)
         if win_step is not None:
             return _render_window_over_sql(win_step.window_spec, dialect)
         raise RegistryRenderError(f"missing window registry id {ref!r}")
     if ref.startswith("c"):
-        case_by = {s.registry_id: s for s in CaseRegistryStep.current_steps()}
-        case_step = case_by.get(ref)
+        case_step = CaseRegistryStep.lookup(ref)
         if case_step is not None:
             return _render_case_when_sql(case_step.case_when, dialect)
         raise RegistryRenderError(f"missing case registry id {ref!r}")
@@ -2734,7 +2846,7 @@ def classify_cte_emission(cte: RuntimeCteStep, intent: RuntimeIntent, schema: Sc
     return CteEmissionKind.SCALAR_SUBQUERY
 
 
-def _render_case_branch_sql(
+def render_case_branch_sql(
     fp: WhereParam,
     dialect: Dialect | None = None,
     *,
@@ -2785,9 +2897,7 @@ def _render_case_when_sql(cw: CaseWhenExpr, dialect: Dialect | None = None) -> s
     """Render a CASE expression for SELECT."""
     parts: list[str] = ["CASE"]
     for br in cw.branches:
-        parts.append(
-            f"WHEN {_render_case_branch_sql(br.condition, dialect)} THEN {render_expr_sql(br.result, dialect)}"
-        )
+        parts.append(f"WHEN {render_case_branch_sql(br.condition, dialect)} THEN {render_expr_sql(br.result, dialect)}")
     if cw.else_result is not None:
         parts.append(f"ELSE {render_expr_sql(cw.else_result, dialect)}")
     parts.append("END")
@@ -3070,8 +3180,7 @@ def emit_semantic_profile_where_diagnostics(
                     f"Inferred relationship rendered as a WHERE filter: {left_tbl}.{lc} = "
                     f"{right_tbl}.{rc}. No foreign key joins these columns "
                     f"(overlap intersection {inter}, ratio {ratio:.0%}). "
-                    "Declare the relationship with foreign_keys_add when it is structural, "
-                    "or with a semantic override when it is intentional but not a foreign key."
+                    "Declare the relationship with foreign_keys_add when it is structural, or with a semantic override when it is intentional but not a foreign key."
                 ),
                 stage="join",
                 code=DIAGNOSTIC_CODE_SEMANTIC_PROFILE_WHERE_EDGE,
@@ -3228,6 +3337,43 @@ def build_deterministic_sql(
     cte_join_signatures_for_from_anchor: dict[str, list[str]] | None = None,
 ) -> str:
     """Build a rough deterministic SQL from a RuntimeIntent."""
+    registry_errors = runtime_scope_registry_error_messages(intent)
+    if registry_errors:
+        raise RegistryRenderError(registry_errors[0])
+    keep_cte = {s.cte_name.lower() for s in (intent.cte_steps or []) if s.cte_name}
+    if cte_join_hints:
+        cte_join_hints = {k: v for k, v in cte_join_hints.items() if str(k).strip().lower() in keep_cte}
+    if cte_join_signatures_for_from_anchor:
+        cte_join_signatures_for_from_anchor = {
+            k: v for k, v in cte_join_signatures_for_from_anchor.items() if str(k).strip().lower() in keep_cte
+        }
+    if dialect is None:
+        dialect = DialectRegistry.get_dialect()
+    fallback_windows: list[WindowRegistryStep] = list(intent.window_registry or [])
+    fallback_cases: list[CaseRegistryStep] = list(intent.case_registry or [])
+    for cte in intent.cte_steps or []:
+        fallback_windows.extend(cte.window_registry or [])
+        fallback_cases.extend(cte.case_registry or [])
+    with WindowRegistryStep.render_fallback_scope(fallback_windows, fallback_cases):
+        return _build_deterministic_sql_body(
+            intent,
+            cte_join_hints=cte_join_hints,
+            schema=schema,
+            dialect=dialect,
+            join_signature_for_from_anchor=join_signature_for_from_anchor,
+            cte_join_signatures_for_from_anchor=cte_join_signatures_for_from_anchor,
+        )
+
+
+def _build_deterministic_sql_body(
+    intent: RuntimeIntent,
+    cte_join_hints: dict[str, dict[str, Any]] | None = None,
+    schema: SchemaGraph | None = None,
+    dialect: Dialect | None = None,
+    join_signature_for_from_anchor: list[str] | None = None,
+    cte_join_signatures_for_from_anchor: dict[str, list[str]] | None = None,
+) -> str:
+    """Render deterministic SQL after registry fallbacks are bound."""
     keep_cte = {s.cte_name.lower() for s in (intent.cte_steps or []) if s.cte_name}
     if cte_join_hints:
         cte_join_hints = {k: v for k, v in cte_join_hints.items() if str(k).strip().lower() in keep_cte}
@@ -3296,6 +3442,11 @@ def build_deterministic_sql(
         if emission == "anti_join" and cte.cte_name:
             presence = anti_join_presence_column(cte.cte_name)
             append_select.append(f"1 AS {presence}")
+        cte_preserve_tables = merge_preserve_tables_with_notes_defaults(
+            cte.preserve_tables,
+            schema,
+            query_tables=cte.tables or [],
+        )
         with WindowRegistryStep.render_scope(cte.window_registry, cte.case_registry):
             cte_where = cte.where
             cte_having = cte.having
@@ -3309,7 +3460,7 @@ def build_deterministic_sql(
                 schema=schema,
                 for_cte=True,
                 append_select_sql=append_select or None,
-                preserve_tables=list(cte.preserve_tables or []),
+                preserve_tables=cte_preserve_tables,
             )
             cte_sql = _build_deterministic_select_block(
                 cte.select_cols or [],
@@ -3329,7 +3480,7 @@ def build_deterministic_sql(
                 distinct_select_index=distinct_idx,
                 param_values=cte.param_values,
                 append_select_sql=append_select or None,
-                preserve_tables=list(cte.preserve_tables or []),
+                preserve_tables=cte_preserve_tables,
             )
             if cte_distinct_on:
                 cte_sql = wrap_core_sql_with_distinct_on(
@@ -3368,6 +3519,11 @@ def build_deterministic_sql(
     main_distinct_on = list(intent.distinct_on or [])
     main_order = list(intent.order_by_cols or [])
     main_limit = intent.limit
+    main_preserve_tables = merge_preserve_tables_with_notes_defaults(
+        intent.preserve_tables,
+        schema,
+        query_tables=intent.tables or [],
+    )
     with WindowRegistryStep.render_scope(intent.window_registry, intent.case_registry):
         main_select_exprs = _render_select_column_exprs(
             intent.select_cols or [],
@@ -3375,7 +3531,7 @@ def build_deterministic_sql(
             None,
             schema=schema,
             for_cte=False,
-            preserve_tables=list(intent.preserve_tables or []),
+            preserve_tables=main_preserve_tables,
         )
         main_sql = _build_deterministic_select_block(
             intent.select_cols or [],
@@ -3393,11 +3549,11 @@ def build_deterministic_sql(
             extra_from_tables=main_extras or None,
             distinct_select_index=main_distinct_idx,
             param_values=intent.param_values,
-            preserve_tables=list(intent.preserve_tables or []),
+            preserve_tables=main_preserve_tables,
         )
         if main_distinct_on:
             reserved = {c.cte_name for c in cte_steps if c.cte_name}
-            reserved.update(intent.planner_cte_names or [])
+            reserved.update(intent.interpret_cte_names or [])
             don_name = _allocate_distinct_on_cte_name(reserved)
             don_body = append_distinct_on_rank_to_core_sql(
                 main_sql,
@@ -3555,14 +3711,6 @@ def _render_predicate_group_sql(group: PredicateGroup | None, render_leaf: Any, 
         return pieces[0]
     connector = "AND" if group.op == "and" else "OR"
     return _chain_bool_sql_fragments(pieces, [connector] * (len(pieces) - 1), sqlglot_dialect=sqlglot_dialect)
-
-
-def _legacy_render_predicate_group_sql(parts: list[tuple[str, str, int | None]]) -> str:
-    """Deprecated tuple renderer kept for transitional callers."""
-    if not parts:
-        return ""
-    flat = [(frag, bop) for frag, bop, _ in parts]
-    return _render_clause_chain(flat)
 
 
 def _join_clause_parts_with_bool_op(parts: list[tuple[str, str]]) -> str:
@@ -3770,7 +3918,6 @@ def _render_predicate_clause(
             core = f"{left} NOT BETWEEN :{pred.param_key} AND :{param_key_hi}"
             return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
     if pred.param_key:
-        val_needs_lower = case_insensitive and op.lower() in ("like", "not like")
         val_ref = f":{pred.param_key}"
         if (
             column_meta is not None
@@ -3794,8 +3941,9 @@ def _render_predicate_clause(
             if op_cmp == "not ilike":
                 return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
             return core
+        val_needs_lower = case_insensitive and op_cmp in ("like", "not like", "=", "!=", "<>")
         val_ref = f"LOWER(:{pred.param_key})" if val_needs_lower else val_ref
-        if val_needs_lower:
+        if val_needs_lower and op_cmp in ("like", "not like"):
             core = _finalize_like_predicate_sql(dialect, f"{left} {op} {val_ref}{_like_escape_suffix()}")
             if op_cmp == "not like":
                 return _wrap_negation_includes_unknown(core, left, pred, schema=schema, cte_outputs=cte_outputs)
@@ -4115,7 +4263,7 @@ def generate_col_alias(sc: SelectCol) -> str:
 
 
 def select_col_prefers_llm_display_alias(sc: SelectCol) -> bool:
-    """Whether. :func:`aetherdialect._pipeline.enriched_display_alias_map` should ask the LLM for a display header."""
+    """Whether. :func:`aetherdialect._pipeline_generate.enriched_display_alias_map` should ask the LLM for a display header."""
     parts = sc.effective_parts(None, None)
     if parts.case_when is not None:
         return True
@@ -4259,7 +4407,7 @@ def _render_date_window_predicate(
 
 
 def _serialize_join_candidate_row(c: dict[str, Any], *, schema: SchemaGraph | None = None) -> dict[str, Any]:
-    """Return a join-candidate row suitable for join-choice JSON payloads. When *schema* is supplied, asserts that no column in the rendered ``join_path_signature`` is hidden by visibility rules. This is a defensive guard against missed filter paths in :func:`enumerate_join_paths_base` / :func:`enumerate_semantic_paths`."""
+    """Return a join-candidate row suitable for join-choice JSON payloads. When *schema* is supplied, asserts that no column in the rendered ``join_path_signature`` is hidden by visibility rules from :func:`enumerate_join_paths_base` / :func:`enumerate_semantic_paths`."""
     if schema is not None:
         sigs = c.get("join_path_signature") or []
         for seg in sigs:
@@ -4311,14 +4459,8 @@ def build_join_choice_prompt(
     """Build minimal prompt for LLM to return per-scope join candidate. IDs."""
     system = (
         "You are a join selector for text-to-SQL. Output ONLY valid JSON. "
-        "Each scope lists its own join candidates; candidate ids are scoped and may repeat across "
-        "scopes. Return a single object ``choices`` mapping each scope string to a candidate id "
-        "(``J00``, ``J01``, …) or the string ``NA`` when none of the listed candidates fit that scope."
+        "Each scope lists its own join candidates; candidate ids are scoped and may repeat across scopes. Return a single object ``choices`` mapping each scope string to a candidate id (``J00``, ``J01``, …) or the string ``NA`` when none of the listed candidates fit that scope."
     )
-    if prior_join_feedback:
-        lines = "\n".join(f"- {x}" for x in prior_join_feedback if str(x).strip())
-        if lines:
-            system += "\n\n" + JOIN_PRIOR_FEEDBACK_HEADING + "\n" + lines
     scopes_payload = []
     for block in llm_scopes:
         cands = block.get("candidates") or []
@@ -4331,21 +4473,26 @@ def build_join_choice_prompt(
                 ],
             }
         )
-    user = prompt_json(
-        {
-            "task": (
-                "Given the question and the deterministic SQL template, choose one join candidate id "
-                "per scope. Return only the ids; do not modify the SQL."
-            ),
-            "question": q_norm,
-            "deterministic_sql": deterministic_sql,
-            "scopes": scopes_payload,
-            "output_format": {
-                "choices": ('Dict keyed by scope: {"main": "J01" | "NA", "cte:<cte_name>": "J01" | "NA", ...}'),
-            },
+    user_body: dict[str, Any] = {
+        "task": (
+            "Given the question and the deterministic SQL template, choose one join candidate id per scope. "
+            "Return only the ids; do not modify the SQL."
+        ),
+        "question": q_norm,
+        "deterministic_sql": deterministic_sql,
+        "scopes": scopes_payload,
+        "output_format": {
+            "choices": ('Dict keyed by scope: {"main": "J01" | "NA", "cte:<cte_name>": "J01" | "NA", ...}'),
         },
-        JOIN_CHOICE_PROMPT_KEY_ORDER,
-    )
+    }
+    if prior_join_feedback:
+        items = [x for x in prior_join_feedback if str(x).strip()]
+        if items:
+            user_body["prior_join_feedback"] = {
+                "heading": JOIN_PRIOR_FEEDBACK_HEADING,
+                "items": items,
+            }
+    user = prompt_json(user_body, JOIN_CHOICE_PROMPT_KEY_ORDER)
     return system, user
 
 
@@ -4381,13 +4528,13 @@ def _filter_llm_scopes_avoid_candidates(
 def _parse_join_choice_payload(parsed: dict[str, Any]) -> dict[str, str]:
     """Extract per-scope join choices from an LLM JSON object."""
     raw = parsed.get("choices")
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, str] = {}
-    for k, v in raw.items():
-        if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
-            out[k.strip()] = v.strip()
-    return out
+    if isinstance(raw, dict):
+        out: dict[str, str] = {}
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                out[k.strip()] = v.strip()
+        return out
+    raise ValueError(f"join choice LLM JSON missing dict 'choices'; got {type(raw).__name__}")
 
 
 def _scope_choice_valid_ids(candidates: list[dict[str, Any]], *, allow_na: bool) -> frozenset[str]:
@@ -4491,6 +4638,9 @@ def get_join_choice_from_llm(
                 return merged
     out = dict(preset)
     scope_rows = {str(s["scope"]): s for s in llm_scopes if s.get("scope") is not None}
+    declared_sigs = {
+        tuple(sig) for sig in declared_join_path_signatures(tuple(getattr(schema, "structural_knowledge", ()) or ()))
+    }
     for sk in required:
         cands = next((x.get("candidates") or [] for x in llm_scopes if str(x.get("scope")) == sk), [])
         valid = _scope_choice_valid_ids(cands, allow_na=False)
@@ -4500,11 +4650,25 @@ def get_join_choice_from_llm(
         if cur in valid and cur == "J00" and len(scope_rows.get(sk, {}).get("tables") or []) < 2:
             continue
         pick: str | None = None
-        for c in sorted(cands, key=lambda x: str(x.get("candidate_id", ""))):
-            cid = c.get("candidate_id")
-            if isinstance(cid, str) and cid != "J00" and cid in valid:
-                pick = cid
-                break
+        if declared_sigs:
+            for c in cands:
+                cid = c.get("candidate_id")
+                sig = c.get("join_path_signature")
+                if (
+                    isinstance(cid, str)
+                    and cid != "J00"
+                    and isinstance(sig, list)
+                    and tuple(sig) in declared_sigs
+                    and cid in valid
+                ):
+                    pick = cid
+                    break
+        if pick is None:
+            for c in sorted(cands, key=lambda x: str(x.get("candidate_id", ""))):
+                cid = c.get("candidate_id")
+                if isinstance(cid, str) and cid != "J00" and cid in valid:
+                    pick = cid
+                    break
         if pick:
             out[sk] = pick
             continue

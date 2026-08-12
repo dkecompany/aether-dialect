@@ -152,7 +152,7 @@ def sqlite_memory_dialect() -> SQLiteDialect:
     _seed_schema_graph_customers(connection)
     SQLiteRuntimeConfig.DATABASE_PATH = ":memory:"
     SQLiteRuntimeConfig.SCHEMA = "main"
-    SQLiteRuntimeConfig.attach_connection(connection)
+    SQLiteRuntimeConfig.NATIVE_CONNECTION = connection
     dialect = DialectRegistry.get("sqlite", SQLiteRuntimeConfig)
     yield dialect
     SQLiteRuntimeConfig.DATABASE_PATH = orig_path

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aetherdialect._constants import (
+from aetherdialect._constants_runtime import (
     DATA_QUALITY_DETAIL_CANDIDATE_HEADER_ROW,
     DATA_QUALITY_ISSUE_APPEND_HEADER_MISMATCH,
     DATA_QUALITY_ISSUE_APPENDABLE_REGIONS,
@@ -20,8 +20,8 @@ from aetherdialect._constants import (
     DATA_QUALITY_ISSUE_REPEATED_HEADER,
     DATA_QUALITY_ISSUE_SECTION_HEADING,
 )
+from aetherdialect._contracts_schema import CsvSourceSelection
 from aetherdialect._data_quality import (
-    CsvSourceSelection,
     apply_source_selection,
     detect_grid_issues,
     load_source_grids,
@@ -357,7 +357,9 @@ def test_llm_interpret_bad_proposal_rejected(tmp_path: Path) -> None:
             return {"summary": "ok"}
         if task == "upload_interpret":
             return {"header_row": 999}
-        return {}
+        if task == "upload_column_transforms":
+            return {"column_transforms": []}
+        return {"column_transforms": []}
 
     with patch("aetherdialect._data_quality.LLMProvider.json", side_effect=_bad_interpret):
         report = validate_upload_sources((path,), log_sink=lambda _msg: None)

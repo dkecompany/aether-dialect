@@ -12,21 +12,21 @@ from aetherdialect._constants import (
     TEMPLATE_STORE_HEADER_FILENAME,
     TEMPLATE_STORE_PARTITION_PREFIX,
 )
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import (
     ConcreteCteStep,
     ConcreteIntent,
     SelectCol,
     Template,
-    TemplateStats,
     ValueHistory,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, SQLShape, TableMetadata
-from aetherdialect._core_utils import read_artifact_manifest, read_gzip_json, write_gzip_json_atomic
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._templates import (
-    TemplateOps,
-    TemplateRefs,
-    TemplateStoreView,
+from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, SQLShape, TableMetadata, TemplateStats
+from aetherdialect._templates import TemplateRefs, TemplateStoreView
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import (
+    read_artifact_manifest,
+    read_gzip_json,
+    write_gzip_json_atomic,
 )
 
 
@@ -283,7 +283,7 @@ def test_prune_caps_template_count(tmp_path, monkeypatch) -> None:
     from aetherdialect._config import EngineLimits
 
     monkeypatch.setattr(
-        "aetherdialect._templates.TemplateOps._resolve_engine_limits",
+        "aetherdialect._templates.TemplateStoreLifecycleOps._resolve_engine_limits",
         lambda: EngineLimits(template_store_max_count=3),
     )
     store_dir = str(tmp_path / "intent_templates")
@@ -309,7 +309,7 @@ def test_prune_value_history_rows_caps_per_template(tmp_path, monkeypatch) -> No
     from aetherdialect._config import EngineLimits
 
     monkeypatch.setattr(
-        "aetherdialect._templates.TemplateOps._resolve_engine_limits",
+        "aetherdialect._templates.TemplateStoreLifecycleOps._resolve_engine_limits",
         lambda: EngineLimits(template_value_history_depth=4),
     )
     store_dir = str(tmp_path / "intent_templates")

@@ -8,22 +8,20 @@ import pytest
 
 from aetherdialect._config import PolicyConfig
 from aetherdialect._contracts_base import (
+    NormalizedExpr,
     PredicateGroup,
     WhereParam,
 )
 from aetherdialect._contracts_core import RuntimeIntent
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import Dialect
-from aetherdialect._federation import (
-    compose_composite_graph,
-    federation_plan_step_fingerprints,
-    parse_federation_manifest,
-    plan_federated_intent,
-)
-from aetherdialect._intent_process import NormalizedExpr
-from aetherdialect._pipeline import _run_sql_validation_cascade
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_execute import federation_plan_step_fingerprints
+from aetherdialect._federation_manifest import parse_federation_manifest
+from aetherdialect._federation_plan import plan_federated_intent
+from aetherdialect._pipeline_generate import run_sql_validation_cascade
 from aetherdialect._schema_graph import recompute_join_paths_multi
-from aetherdialect._utils import intent_key
+from aetherdialect._utils_intent import intent_key
 
 
 def _graph(table: str, *, source_id: str) -> SchemaGraph:
@@ -142,7 +140,7 @@ def test_federation_validation_cascade_applies_fingerprinted_member_cost_cap(mon
         order_by_cols=[],
         where=None,
     )
-    ok, err, _cat, _diags = _run_sql_validation_cascade(
+    ok, err, _cat, _diags = run_sql_validation_cascade(
         "SELECT 1",
         intent,
         dialect,

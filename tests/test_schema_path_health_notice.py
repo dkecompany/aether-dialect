@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_schema import ColumnMetadata, FKEdge, SchemaGraph, TableMetadata
-from aetherdialect._schema_overrides import (
+from aetherdialect._schema_graph import (
     _format_disconnected_components_message,
     notify_schema_path_health,
 )
@@ -52,7 +52,7 @@ def test_health_notice_emits_when_semantic_overlap_bridges_foreign_key_islands(m
     def capture_notify(msg: str, **kwargs: object) -> None:
         captured.append(msg)
 
-    monkeypatch.setattr("aetherdialect._schema_overrides.notify", capture_notify)
+    monkeypatch.setattr("aetherdialect._schema_graph.notify", capture_notify)
 
     orders = _table(
         "orders",
@@ -89,7 +89,7 @@ def test_health_notice_emits_when_only_semantic_overlap_connects_tables(monkeypa
     def capture_notify(msg: str, **kwargs: object) -> None:
         captured.append(msg)
 
-    monkeypatch.setattr("aetherdialect._schema_overrides.notify", capture_notify)
+    monkeypatch.setattr("aetherdialect._schema_graph.notify", capture_notify)
 
     orders = _table(
         "orders",
@@ -125,7 +125,7 @@ def test_health_notice_silent_when_fully_connected(monkeypatch) -> None:
     def capture_notify(msg: str, **kwargs: object) -> None:
         captured.append(msg)
 
-    monkeypatch.setattr("aetherdialect._schema_overrides.notify", capture_notify)
+    monkeypatch.setattr("aetherdialect._schema_graph.notify", capture_notify)
 
     customers = _table("customers", {"id": _col("id", is_primary_key=True)}, primary_key=["id"])
     orders = _table(

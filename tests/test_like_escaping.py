@@ -8,9 +8,9 @@ from aetherdialect._contracts_base import (
     NormalizedExpr,
     WhereParam,
 )
-from aetherdialect._core_utils import escape_like_wildcards
 from aetherdialect._dialect import DialectRegistry
 from aetherdialect._sql_gen import render_predicate_clause
+from aetherdialect._utils import escape_like_wildcards
 
 _LIKE_ESCAPE_SUFFIX = "ESCAPE"
 
@@ -32,9 +32,9 @@ def _ilike_predicate(*, param_key: str | None = "p", raw_value: str | None = Non
 
 @pytest.mark.fast
 def test_percent_in_value_is_literal() -> None:
-    assert escape_like_wildcards("50%") == "50\\%"
-    assert escape_like_wildcards("a_b") == "a\\_b"
-    assert escape_like_wildcards("back\\slash") == "back\\\\slash"
+    assert escape_like_wildcards("50%") == "50/%"
+    assert escape_like_wildcards("a_b") == "a/_b"
+    assert escape_like_wildcards("back/slash") == "back//slash"
 
     dialect = _uninit_dialect("postgresql")
     sql = render_predicate_clause(
@@ -42,7 +42,7 @@ def test_percent_in_value_is_literal() -> None:
         dialect,
     )
     assert _LIKE_ESCAPE_SUFFIX in sql.upper()
-    assert "50\\%" in sql or "50\\\\%" in sql
+    assert "50/%" in sql
 
     bound_sql = render_predicate_clause(
         _ilike_predicate(param_key="p"),
@@ -51,6 +51,7 @@ def test_percent_in_value_is_literal() -> None:
     )
     assert _LIKE_ESCAPE_SUFFIX in bound_sql.upper()
     assert ":p" in bound_sql
+    assert "ESCAPE '/'" in sql or "ESCAPE '/'" in bound_sql
 
 
 @pytest.mark.fast

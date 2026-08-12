@@ -10,7 +10,7 @@ from decimal import Decimal
 import pandas as pd
 import pytest
 
-from aetherdialect._contracts_base import SessionStep
+from aetherdialect._contracts_core import SessionStep
 from aetherdialect._main_execution import MainExecutionOps
 
 

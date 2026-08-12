@@ -6,17 +6,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aetherdialect._constants import (
-    DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE,
-    REPHRASE_HINT_MESSAGES,
-)
-from aetherdialect._contracts_base import FailureCategory
-from aetherdialect._contracts_core import NormalizedExpr, RuntimeIntent, SelectCol
+from aetherdialect._constants import DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
+from aetherdialect._constants_runtime import REPHRASE_HINT_MESSAGES
+from aetherdialect._contracts_base import FailureCategory, NormalizedExpr
+from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import IntentIssue
-from aetherdialect._core_utils import note_interactive_turn
-from aetherdialect._intent_process import _refuse_if_join_unreachable_repair_removed_tables
-from aetherdialect._intent_repair import refusal_for_join_unreachable_table_removal
-from aetherdialect._main_execution import PipelineSession
+from aetherdialect._intent_loop import _refuse_if_join_unreachable_repair_removed_tables
+from aetherdialect._intent_normalize import refusal_for_join_unreachable_table_removal
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._utils import note_interactive_turn
 
 
 def _join_unreachable_issue(*, root: str = "orders", target: str = "products") -> IntentIssue:
@@ -67,9 +65,9 @@ def test_unreachable_join_message_reaches_the_user() -> None:
     choice_port.note_turn_outcome.assert_called_once()
     recorded = choice_port.note_turn_outcome.call_args.kwargs
     assert recorded["outcome"] == "parse_failed"
-    assert recorded["error"] == expected
     assert recorded["refusal_diagnostic_code"] == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
-    assert "no foreign key or semantic edge" in recorded["error"]
+    assert recorded["error"] is not None
+    assert "could not be connected" in recorded["error"]
     assert "orders" in recorded["error"] and "products" in recorded["error"]
     assert recorded["error"] != "Intent parse failed."
     assert recorded["error"] != REPHRASE_HINT_MESSAGES["intent_parse_failed"]
@@ -122,7 +120,10 @@ def test_unreachable_join_refusal_survives_completed_step() -> None:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(session, "_emit_turn_llm_usage", lambda **_: ())
         step = session._completed_step()
-    assert step.error == crafted
-    assert step.message == crafted
+    assert step.error is not None
+    assert step.error.detail_code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
     codes = {d.code for d in step.diagnostics}
-    assert DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE in codes or step.error == crafted
+    assert (
+        DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE in codes
+        or step.error.detail_code == DIAGNOSTIC_CODE_REFUSAL_JOIN_PATH_UNAVAILABLE
+    )

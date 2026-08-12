@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from aetherdialect._contracts_core import Expected, GenerationPath, LiveTestRunner, RuntimeIntent, Scenario
-from aetherdialect._templates import TemplateOps
-from aetherdialect._utils import normalize_question
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_intent import normalize_question
 
-from ._seed_helpers import (
+from .live_support import (
     assert_new_template_forked,
     assert_template_unchanged,
     intent_store_manager,

@@ -5,7 +5,7 @@ from aetherdialect._contracts_core import RuntimeIntent, SelectCol
 from aetherdialect._contracts_schema import SchemaGraph, TableMetadata
 from aetherdialect._dialect_postgres import PostgresDialect
 from aetherdialect._dialect_sqlglot_engines import DuckDBDialect
-from aetherdialect._federation import _federation_ir_capability_reason, stamp_federation_member_graph
+from aetherdialect._federation_manifest import federation_ir_capability_reason, stamp_federation_member_graph
 from aetherdialect._schema_graph import compute_database_feature_capability
 from aetherdialect._sql_gen import _render_group_sql
 
@@ -67,4 +67,4 @@ class TestMedianCapability:
             order_by_cols=[],
             where=None,
         )
-        assert _federation_ir_capability_reason(intent, cap) == "median is not supported by all federation members"
+        assert federation_ir_capability_reason(intent, cap) == "median is not supported by all federation members"

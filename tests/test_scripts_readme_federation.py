@@ -40,10 +40,10 @@ def test_scripts_readme_documents_partition_namespace_names(readme_text: str) ->
 
 
 @pytest.mark.fast
-def test_scripts_readme_documents_drop_first_blast_radius(readme_text: str) -> None:
+def test_scripts_readme_documents_drop_first_scope(readme_text: str) -> None:
     lowered = readme_text.lower()
     assert "--drop-first" in readme_text
-    assert "blast radius" in lowered
+    assert "scope:" in lowered
     assert "full `rental_shop`" in readme_text or "full rental_shop" in lowered
     assert "not" in lowered
 
@@ -52,21 +52,25 @@ def test_scripts_readme_documents_drop_first_blast_radius(readme_text: str) -> N
 def test_scripts_readme_layout_lists_federation_artifacts(readme_text: str) -> None:
     assert "federation_declaration.json" in readme_text
     assert "federation_partition.json" in readme_text
-    for seed in (
-        "federation_storefront_seed.sql",
-        "federation_catalog_seed.sql",
-        "federation_logistics_seed.sql",
-        "federation_crm_seed.sql",
+    for schema in (
+        "federation_storefront_schema.sql",
+        "federation_catalog_schema.sql",
+        "federation_logistics_schema.sql",
+        "federation_crm_schema.sql",
     ):
-        assert seed in readme_text
+        assert schema in readme_text
+    assert "federation_storefront_seed.sql" not in readme_text
 
 
 @pytest.mark.fast
-def test_scripts_readme_documents_seed_placeholder_state(readme_text: str) -> None:
+def test_scripts_readme_documents_federation_export_pipeline(readme_text: str) -> None:
     lowered = readme_text.lower()
-    assert "placeholder" in lowered
-    assert "non-canonical" in lowered
-    assert "export_federation_partition_seeds" in readme_text
+    assert "export_sandbox_federation_partition_schemas" in readme_text
+    assert "export_sandbox_federation_partition_data_dirs" in readme_text
+    assert "export_federation_member_data_dirs_from_existing_csvs" in readme_text
+    assert "sandbox_staging" in lowered
+    assert "csv" in lowered
+    assert "seed sql" not in lowered or "no insert seed" in lowered or "ddl+csv" in lowered
 
 
 @pytest.mark.fast
@@ -78,7 +82,10 @@ def test_scripts_readme_sandbox_metadata_table_is_current(readme_text: str) -> N
         "sandbox_scenarios.json",
         "sandbox_handcrafted_fixtures.json",
         "sandbox_migration_demo.json",
-        "sandbox_overrides_demo.json",
-        "sandbox_space_catalog_notes.txt",
+        "sandbox_structure_demo.json",
+        "federation_storefront_notes.txt",
+        "federation_catalog_notes.txt",
+        "federation_logistics_notes.txt",
+        "federation_crm_notes.txt",
     ):
         assert name in readme_text

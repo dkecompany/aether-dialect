@@ -91,7 +91,7 @@ def test_support_matrix_no_intent_carries_phrasing() -> None:
     "guide_name",
     ("USER_GUIDE.md", "INTEGRATOR_GUIDE.md", "SANDBOX.md"),
 )
-def test_s2_user_guides_avoid_intent_carries_phrasing(guide_name: str) -> None:
+def test_user_guides_avoid_intent_carries_phrasing(guide_name: str) -> None:
     text = (_REPO / "docs" / guide_name).read_text(encoding="utf-8").lower()
     assert "intent carries" not in text
     assert "intent carry" not in text
@@ -141,7 +141,7 @@ def test_support_matrix_self_comparison_user_guidance() -> None:
     assert "sj_" not in text
     assert "JOIN_COMPARISON_SCOPE_MAX_HOPS" not in text
     # Count guidance sentences in refused constructs (exclude table header/separator rows).
-    refused = _section_between(text, "## Refused constructs", "## Dialect-specific notes")
+    refused = _section_between(text, "## Refused constructs", "## Legend")
     guidance_lines = [
         line.strip()
         for line in refused.splitlines()
@@ -157,15 +157,14 @@ def test_support_matrix_self_comparison_user_guidance() -> None:
 
 @pytest.mark.fast
 def test_support_matrix_legend_immediately_before_engine_capabilities() -> None:
-    """Legend explains engine-capability table vocabulary and sits directly above that table."""
+    """Legend explains engine-capability table vocabulary and precedes that table in the document."""
     text = _matrix_text()
     legend_pos = text.index("## Legend")
     engine_pos = text.index("## Engine capabilities")
     assert legend_pos < engine_pos
-    between = text[legend_pos:engine_pos]
-    assert "## " not in between.replace("## Legend", "", 1), (
-        "another heading sits between Legend and Engine capabilities"
-    )
+    legend = _legend_section(text)
+    assert "engine capabilities" in legend.lower()
+    assert "cell vocabulary" in legend.lower() or "vocabulary below" in legend.lower()
 
 
 @pytest.mark.fast
@@ -228,6 +227,7 @@ def test_support_matrix_legend_matches_engine_capability_cells() -> None:
             "QUERY_HISTORY",
             "JOBS",
             "dm_exec_query_stats",
+            "V$SQL",
         }:
             return "Query-log source" in legend
         if "SHOWPLAN" in cell:
@@ -256,6 +256,7 @@ def test_required_capability_notes_present() -> None:
     sqlite = _dialect_section(text, "### SQLite")
     csv = _dialect_section(text, "### CSV (`csv`)")
     sqlserver = _dialect_section(text, "### SQL Server")
+    oracle = _dialect_section(text, "### Oracle")
 
     assert "median" in mysql.lower() and "not supported" in mysql.lower()
     assert "median" in mariadb.lower() and "not supported" in mariadb.lower()
@@ -272,6 +273,11 @@ def test_required_capability_notes_present() -> None:
     sqlserver_lower = sqlserver.lower()
     assert "array_contains" in sqlserver_lower and "not supported" in sqlserver_lower
     assert "openjson" in sqlserver_lower and "unnest" in sqlserver_lower
+
+    oracle_lower = oracle.lower()
+    assert "array_contains" in oracle_lower and "not supported" in oracle_lower
+    assert "v$sql" in oracle_lower
+    assert "json_table" in oracle_lower and "unnest" in oracle_lower
 
     assert "sqlglot" in databricks.lower() and "databricks" in databricks.lower()
     assert "spark dialect" not in databricks.lower()

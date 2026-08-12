@@ -13,13 +13,13 @@ from aetherdialect._constants import (
     SESSION_KIND_AWAITING_SQL_CONFIRM,
     SUSPEND_ID_TO_SESSION_KIND,
 )
-from aetherdialect._contracts_base import PipelineSuspended
 from aetherdialect._contracts_core import (
     DirectReuseSuspendContext,
     GenerationPath,
+    PipelineSuspended,
     RuntimeIntent,
 )
-from aetherdialect._main_execution import PipelineSession
+from aetherdialect._main_session import PipelineSession
 
 
 def _runtime_intent() -> RuntimeIntent:

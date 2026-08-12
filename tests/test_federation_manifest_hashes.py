@@ -9,15 +9,15 @@ from unittest.mock import patch
 
 import pytest
 
-import aetherdialect._federation
+import aetherdialect._utils_artifacts
 from aetherdialect._constants import ARTIFACT_MANIFEST_FILENAME, FEDERATION_ARTIFACT_FORMAT_VERSION
-from aetherdialect._federation import (
+from aetherdialect._federation_execute import (
     _persist_federation_composite_schema_cache,
     _refresh_federation_artifact_manifest_hashes,
 )
 from tests.federation_helpers import federation_member_graph
 
-_ORIGINAL_ARTIFACT_LOCK = aetherdialect._federation.artifact_lock
+_ORIGINAL_ARTIFACT_LOCK = aetherdialect._utils_artifacts.artifact_lock
 
 
 @pytest.mark.fast
@@ -54,9 +54,9 @@ def test_composite_and_manifest_hashes_commit_together() -> None:
             )
 
         with (
-            patch.object(aetherdialect._federation, "artifact_lock", tracking_artifact_lock),
+            patch.object(aetherdialect._federation_execute, "artifact_lock", tracking_artifact_lock),
             patch.object(
-                aetherdialect._federation,
+                aetherdialect._federation_execute,
                 "_refresh_federation_artifact_manifest_hashes",
                 side_effect=tracking_refresh,
             ),

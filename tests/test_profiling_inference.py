@@ -7,19 +7,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect._config import PolicyConfig
-from aetherdialect._contracts_base import InferenceTag
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
+from aetherdialect._contracts_schema import ColumnMetadata, InferenceTag, SchemaGraph, TableMetadata
 from aetherdialect._dialect_sqlglot_engines import DatabricksDialect, DuckDBDialect
-from aetherdialect._schema_catalog import (
-    _profile_column,
-    profile_schema,
-    profile_schema_spark,
-    profile_schema_sql_connector,
-)
 from aetherdialect._schema_graph import (
     _infer_missing_fks_composite,
     fk_overlap_validates,
     infer_missing_fks,
+)
+from aetherdialect._schema_profile import (
+    _profile_column,
+    profile_schema,
+    profile_schema_spark,
+    profile_schema_sql_connector,
 )
 
 
@@ -154,7 +153,7 @@ def test_profile_schema_visits_tables_in_sorted_order() -> None:
     visited: list[str] = []
 
     with patch(
-        "aetherdialect._schema_catalog._profile_table",
+        "aetherdialect._schema_profile._profile_table",
         side_effect=lambda _d, _e, table, **_k: visited.append(table.name),
     ):
         profile_schema(engine, schema, dialect)
@@ -169,7 +168,7 @@ def test_profile_schema_spark_visits_tables_in_sorted_order() -> None:
     visited: list[str] = []
 
     with patch(
-        "aetherdialect._schema_catalog._profile_table_spark",
+        "aetherdialect._schema_profile._profile_table_spark",
         side_effect=lambda _spark, _cat, _sch, table, **_k: visited.append(table.name),
     ):
         profile_schema_spark(spark, "cat", "sch", schema, dialect=dialect)
@@ -184,7 +183,7 @@ def test_profile_schema_sql_connector_visits_tables_in_sorted_order() -> None:
     visited: list[str] = []
 
     with patch(
-        "aetherdialect._schema_catalog._profile_table_sql_connector",
+        "aetherdialect._schema_profile._profile_table_sql_connector",
         side_effect=lambda _conn, _cat, _sch, table, **_k: visited.append(table.name),
     ):
         profile_schema_sql_connector(connection, "cat", "sch", schema, dialect=dialect)

@@ -5,18 +5,16 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect import Sandbox
-from aetherdialect._core_utils import llm_usage_question_scope
+from aetherdialect._utils import llm_usage_question_scope
 
-from ._federation_equivalence_questions import (
+from .conftest import _build_live_aether_engine
+from .live_support import (
     FederationEquivalenceQuestion,
-    generate_federation_equivalence_questions,
-)
-from ._federation_live import (
     build_federation_live_engine,
     ensure_federation_partitions_loaded,
     federation_partitions_available,
+    generate_federation_equivalence_questions,
 )
-from .conftest import _build_live_aether_engine
 
 pytestmark = [pytest.mark.needs_corpus, pytest.mark.live]
 

@@ -22,6 +22,7 @@ from aetherdialect._main_execution import MainExecutionOps
 
 _REPO = Path(__file__).resolve().parents[1]
 _API_REFERENCE = _REPO / "docs" / "API_REFERENCE.md"
+_TROUBLESHOOTING = _REPO / "docs" / "TROUBLESHOOTING.md"
 
 _L37_FEDERATION_DIAGNOSTIC_CODES = frozenset(
     {
@@ -39,7 +40,7 @@ def test_cap_exceeded_emits_dedicated_diagnostic_code() -> None:
         source_id="storefront",
         limit_key="row_cap",
     )
-    diags = MainExecutionOps._federation_error_diagnostics(exc)
+    diags = MainExecutionOps.federation_error_diagnostics(exc)
     assert len(diags) == 1
     assert diags[0].code == DIAGNOSTIC_CODE_FEDERATION_CAP_EXCEEDED
     assert diags[0].source_id == "storefront"
@@ -53,7 +54,7 @@ def test_malformed_member_answer_emits_dedicated_diagnostic_code() -> None:
         source_id="b",
         phase="member",
     )
-    diags = MainExecutionOps._federation_error_diagnostics(exc)
+    diags = MainExecutionOps.federation_error_diagnostics(exc)
     assert len(diags) == 1
     assert diags[0].code == DIAGNOSTIC_CODE_FEDERATION_MALFORMED_MEMBER_ANSWER
     assert diags[0].code != DIAGNOSTIC_CODE_FEDERATION_MEMBER_FAILED
@@ -67,7 +68,7 @@ def test_join_fan_out_emits_dedicated_diagnostic_code() -> None:
         source_id="b",
         phase="coordinator",
     )
-    diags = MainExecutionOps._federation_error_diagnostics(exc)
+    diags = MainExecutionOps.federation_error_diagnostics(exc)
     assert len(diags) == 1
     assert diags[0].code == DIAGNOSTIC_CODE_FEDERATION_JOIN_FAN_OUT
     assert diags[0].source_id == "b"
@@ -79,16 +80,13 @@ def test_join_fan_out_emits_dedicated_diagnostic_code() -> None:
 @pytest.mark.fast
 def test_generic_member_execution_still_emits_member_failed_code() -> None:
     exc = FederationMemberExecutionError("query failed", source_id="a", phase="member")
-    diags = MainExecutionOps._federation_error_diagnostics(exc)
+    diags = MainExecutionOps.federation_error_diagnostics(exc)
     assert len(diags) == 1
     assert diags[0].code == DIAGNOSTIC_CODE_FEDERATION_MEMBER_FAILED
 
 
 @pytest.mark.fast
 def test_api_reference_documents_l37_federation_diagnostic_codes() -> None:
-    text = _API_REFERENCE.read_text(encoding="utf-8")
-    start = text.index("**Federation diagnostics**")
-    end = text.index("**Catch-all**", start)
-    section = text[start:end]
-    missing = sorted(code for code in _L37_FEDERATION_DIAGNOSTIC_CODES if code not in section)
-    assert not missing, f"API_REFERENCE.md federation diagnostics missing L37 codes: {missing}"
+    text = _TROUBLESHOOTING.read_text(encoding="utf-8")
+    missing = sorted(code for code in _L37_FEDERATION_DIAGNOSTIC_CODES if code not in text)
+    assert not missing, f"TROUBLESHOOTING.md federation diagnostics missing L37 codes: {missing}"

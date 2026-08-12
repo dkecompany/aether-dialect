@@ -9,7 +9,7 @@ import pytest
 
 from aetherdialect import ConfigError
 from aetherdialect._constants import ENGINE_DRIVER_REQUIREMENTS
-from aetherdialect._core_utils import require_driver
+from aetherdialect._utils import require_driver
 
 
 @pytest.mark.fast

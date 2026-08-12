@@ -9,7 +9,9 @@ import pytest
 
 from aetherdialect._constants import SUSPEND_STATE_FORMAT_VERSION
 from aetherdialect._contracts_base import ConfigError
-from aetherdialect._main_execution import MainExecutionOps, PipelineSession, PipelineSuspended
+from aetherdialect._contracts_core import PipelineSuspended
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_session import MainSessionSerdeOps, PipelineSession
 
 
 class _DummyPayload:
@@ -52,8 +54,8 @@ def test_export_restore_continues_step(monkeypatch: pytest.MonkeyPatch) -> None:
         assert raw.get("marker") == "ok"
         return _DummyPayload()
 
-    monkeypatch.setattr(MainExecutionOps, "_serialize_pipeline_suspend_payload", fake_serialize)
-    monkeypatch.setattr(MainExecutionOps, "_deserialize_pipeline_suspend_payload", fake_deserialize)
+    monkeypatch.setattr(MainSessionSerdeOps, "_serialize_pipeline_suspend_payload", fake_serialize)
+    monkeypatch.setattr(MainSessionSerdeOps, "_deserialize_pipeline_suspend_payload", fake_deserialize)
 
     sess = PipelineSession(owner, mode="writer")
     sess._suspended = PipelineSuspended("sql_confirm", "confirm?", _DummyPayload())

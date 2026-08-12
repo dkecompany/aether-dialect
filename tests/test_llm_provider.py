@@ -67,12 +67,47 @@ def test_llm_chat_mock_dispatch(tmp_path: Path) -> None:
     }
     path = tmp_path / "mock.json"
     path.write_text(json.dumps(fixtures), encoding="utf-8")
-    EngineConfig.LLM_PROVIDER = "mock"
+    EngineConfig.LLM_PROVIDER = "sandbox"
     EngineConfig.MOCK_FIXTURES_FILE = str(path)
     MockProvider.reset_mock_provider()
     assert EngineConfig.llm_credentials_configured()
     out = LLMProvider.chat("S", "U", task="intent", max_retries=1, timeout=1.0)
     assert "intent" in out
+
+
+def test_llm_chat_mock_provider_synonym_dispatch(tmp_path: Path) -> None:
+    fixtures = {
+        "fixtures": [
+            {
+                "task": "intent",
+                "system": "S",
+                "user": "U",
+                "output_text": '{"intent": "x"}',
+            }
+        ],
+    }
+    path = tmp_path / "mock.json"
+    path.write_text(json.dumps(fixtures), encoding="utf-8")
+    EngineConfig.LLM_PROVIDER = "mock"
+    EngineConfig.MOCK_FIXTURES_FILE = str(path)
+    MockProvider.reset_mock_provider()
+    out = LLMProvider.chat("S", "U", task="intent", max_retries=1, timeout=1.0)
+    assert "intent" in out
+
+
+def test_configure_llm_mock_synonym_sets_sandbox_provider(tmp_path: Path) -> None:
+    from aetherdialect._main_execution import MainExecutionOps
+
+    fixtures = tmp_path / "fixtures.json"
+    fixtures.write_text('{"fixtures": []}', encoding="utf-8")
+    MainExecutionOps._configure_llm_from_environment(
+        {
+            "AETHERDIALECT_LLM_PROVIDER": "mock",
+            "AETHERDIALECT_MOCK_FIXTURES_FILE": str(fixtures),
+        }
+    )
+    assert EngineConfig.LLM_PROVIDER == "sandbox"
+    assert EngineConfig.MOCK_FIXTURES_FILE == str(fixtures)
 
 
 def test_llm_json_parse_through_mock(tmp_path: Path) -> None:
@@ -88,7 +123,7 @@ def test_llm_json_parse_through_mock(tmp_path: Path) -> None:
     }
     path = tmp_path / "mock.json"
     path.write_text(json.dumps(fixtures), encoding="utf-8")
-    EngineConfig.LLM_PROVIDER = "mock"
+    EngineConfig.LLM_PROVIDER = "sandbox"
     EngineConfig.MOCK_FIXTURES_FILE = str(path)
     MockProvider.reset_mock_provider()
     parsed = LLMProvider.json("S", "U", task="default")

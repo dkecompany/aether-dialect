@@ -7,7 +7,6 @@ import pytest
 from aetherdialect._contracts_base import (
     ConfigError,
     FederationContext,
-    FederationMappings,
     NormalizedExpr,
     PredicateGroup,
     SensitivityClassification,
@@ -15,14 +14,16 @@ from aetherdialect._contracts_base import (
     WhereParam,
 )
 from aetherdialect._contracts_core import FederatedPlan, RuntimeIntent, SelectCol
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    _build_source_sub_intent,
-    apply_projected_keys_to_intent,
-    compose_composite_graph,
-    federation_plan_is_degenerate,
+from aetherdialect._contracts_schema import ColumnMetadata, FederationMappings, SchemaGraph, TableMetadata
+from aetherdialect._federation_compose import compose_composite_graph
+from aetherdialect._federation_manifest import (
     parse_federation_manifest,
     parse_federation_mappings,
+)
+from aetherdialect._federation_plan import (
+    _build_source_sub_intent,
+    apply_projected_keys_to_intent,
+    federation_plan_is_degenerate,
     plan_federated_intent,
     render_federation_glue,
     resolve_federated_combine,
@@ -370,7 +371,7 @@ def test_union_plan_keeps_join_combine_when_both_present() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -457,7 +458,7 @@ def test_union_only_glue_renders_union_all() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -788,7 +789,7 @@ _UNION_MANIFEST = {
 def _union_mappings() -> FederationMappings:
     return parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -919,7 +920,7 @@ def test_union_and_join_glue_renders_both() -> None:
     )
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -973,10 +974,7 @@ def test_union_and_join_glue_renders_both() -> None:
 def test_scalar_is_aggregated_union_logical_table_is_eligible() -> None:
     from unittest.mock import patch
 
-    from aetherdialect._federation import (
-        _cross_source_aggregate_ineligible_reason,
-        federation_table_set,
-    )
+    from aetherdialect._federation_plan import _cross_source_aggregate_ineligible_reason, federation_table_set
 
     manifest = parse_federation_manifest(_UNION_MANIFEST, include_derived_roster=True)
     mappings = _union_mappings()
@@ -990,7 +988,7 @@ def test_scalar_is_aggregated_union_logical_table_is_eligible() -> None:
         where=None,
     )
     table_set = federation_table_set(intent, composite, manifest, mappings)
-    with patch("aetherdialect._federation._is_sql_aggregate_select_col", return_value=True):
+    with patch("aetherdialect._federation_plan._is_sql_aggregate_select_col", return_value=True):
         reason = _cross_source_aggregate_ineligible_reason(
             intent,
             manifest,
@@ -1096,7 +1094,7 @@ def test_space_excluded_table_produces_no_sub_intent_step_or_bridge() -> None:
         where=None,
     )
     space = SpaceContext(tables=frozenset({"t_a"}))
-    mappings = FederationMappings(version="0.2.1")
+    mappings = FederationMappings(version="0.2.3")
     tables_all = {"t_a", "t_b"}
     source_by_table = {"t_a": "a", "t_b": "b"}
 
@@ -1184,7 +1182,7 @@ _REPLICA_MANIFEST = {
 def _replica_mappings() -> FederationMappings:
     return parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "entity",
@@ -1276,11 +1274,11 @@ def test_space_deny_objects_excludes_object_from_federated_plan() -> None:
 
 @pytest.mark.fast
 def test_space_partial_deny_of_union_backed_logical_table_raises() -> None:
-    from aetherdialect._federation import validate_federation_context_against_mappings
+    from aetherdialect._federation_compose import validate_federation_context_against_mappings
 
     mappings = parse_federation_mappings(
         {
-            "version": "0.2.1",
+            "version": "0.2.3",
             "logical_tables": [
                 {
                     "logical": "payment",
@@ -1359,7 +1357,7 @@ def test_dropped_member_raises_federation_invariant_error() -> None:
     from unittest.mock import patch
 
     from aetherdialect._contracts_base import FederationInvariantError
-    from aetherdialect._federation import _build_source_sub_intent
+    from aetherdialect._federation_plan import _build_source_sub_intent
 
     manifest = parse_federation_manifest(_MANIFEST, include_derived_roster=True)
     composite = compose_composite_graph(
@@ -1382,7 +1380,7 @@ def test_dropped_member_raises_federation_invariant_error() -> None:
             return None
         return real_build(*args, **kwargs)
 
-    with patch("aetherdialect._federation._build_source_sub_intent", side_effect=_drop_b):
+    with patch("aetherdialect._federation_plan._build_source_sub_intent", side_effect=_drop_b):
         with pytest.raises(FederationInvariantError, match=r"dropped member.*\['b'\].*scope discovery") as exc_info:
             plan_federated_intent(intent, composite, manifest)
     assert "b" in str(exc_info.value)

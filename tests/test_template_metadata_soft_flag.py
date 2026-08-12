@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from aetherdialect._contracts_schema import SchemaDiff, TableDiff
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
 
 
 @pytest.mark.fast

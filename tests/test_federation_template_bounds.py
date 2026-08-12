@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aetherdialect._contracts_base import FederationPlanTemplate
 from aetherdialect._contracts_core import (
     FederatedPlan,
     FederatedPrepareOutcome,
@@ -15,14 +14,17 @@ from aetherdialect._contracts_core import (
     RuntimeIntent,
     SourceStep,
 )
-from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
+from aetherdialect._contracts_schema import ColumnMetadata, FederationPlanTemplate, SchemaGraph, TableMetadata
+from aetherdialect._federation_execute import (
     credit_federation_plan_accept,
     delete_federation_plan_template,
     load_federation_plan_templates,
     save_federation_plan_template,
 )
-from aetherdialect._pipeline import complete_user_feedback_reject, credit_federation_accept
+from aetherdialect._pipeline_generate import (
+    complete_user_feedback_reject,
+    credit_federation_accept,
+)
 from aetherdialect._schema_graph import recompute_join_paths_multi
 
 
@@ -86,8 +88,8 @@ def test_execute_success_does_not_persist_plan_template() -> None:
     session._owner = owner
     session._pending_federation_plan_template = pending
     with (
-        patch("aetherdialect._main_execution.execute_federated_prepare") as mock_exec,
-        patch("aetherdialect._federation.save_federation_plan_template") as save_plan,
+        patch("aetherdialect._main_interactive.execute_federated_prepare") as mock_exec,
+        patch("aetherdialect._pipeline_execute.save_federation_plan_template") as save_plan,
     ):
         mock_exec.return_value = MagicMock(rows=[(1,)], bundle=MagicMock())
         MainExecutionOps._run_sql_execution_for_gen_out(
@@ -125,7 +127,7 @@ def test_accept_persists_plan_with_credited_question() -> None:
 @pytest.mark.fast
 def test_reject_deletes_unaccepted_plan_template() -> None:
     """Rejecting a federation turn must remove a plan that was never accepted."""
-    from aetherdialect._pipeline import UserFeedbackRejectSuspendContext
+    from aetherdialect._contracts_core import UserFeedbackRejectSuspendContext
 
     with tempfile.TemporaryDirectory() as tmp:
         save_federation_plan_template(tmp, _plan_template("plan1"))
@@ -168,7 +170,7 @@ def test_reject_deletes_unaccepted_plan_template() -> None:
 def test_plan_template_file_cap_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
     """Plan template file size must be capped."""
     monkeypatch.setattr(
-        "aetherdialect._federation.FEDERATION_PLAN_TEMPLATE_FILE_CAP",
+        "aetherdialect._federation_execute.FEDERATION_PLAN_TEMPLATE_FILE_CAP",
         2,
         raising=False,
     )
@@ -183,9 +185,9 @@ def test_plan_template_file_cap_enforced(monkeypatch: pytest.MonkeyPatch) -> Non
 
 @pytest.mark.fast
 def test_accepted_questions_cap_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Accepted question list per plan must be capped."""
+    """Accepted question list on each federation plan template must be capped."""
     monkeypatch.setattr(
-        "aetherdialect._federation.FEDERATION_PLAN_ACCEPTED_QUESTIONS_CAP",
+        "aetherdialect._federation_execute.FEDERATION_PLAN_ACCEPTED_QUESTIONS_CAP",
         2,
         raising=False,
     )

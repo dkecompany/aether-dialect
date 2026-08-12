@@ -9,17 +9,15 @@ import pytest
 from aetherdialect._contracts_base import (
     DatabasePingFailed,
     FederationPartialFailureError,
-    FederationPlanTemplate,
     RetryableError,
-    SessionStep,
     StatementTimeoutError,
 )
-from aetherdialect._federation import federation_member_timeout_error
-from aetherdialect._main_execution import (
-    MainExecutionOps,
-    PipelineSession,
-)
-from aetherdialect._pipeline import _raise_partial_member_failure
+from aetherdialect._contracts_core import SessionStep
+from aetherdialect._contracts_schema import FederationPlanTemplate
+from aetherdialect._federation_execute import federation_member_timeout_error
+from aetherdialect._main_execution import MainExecutionOps
+from aetherdialect._main_session import PipelineSession
+from aetherdialect._pipeline_execute import _raise_partial_member_failure
 
 
 @pytest.mark.fast
@@ -95,7 +93,7 @@ def test_partial_failure_interactive_turn_surfaces_retryable_on_step() -> None:
         succeeded=(("a", 2, "2026-01-01T00:00:00+00:00"),),
         retryable=True,
     )
-    with patch("aetherdialect._federation.save_federation_plan_template"):
+    with patch("aetherdialect._federation_execute.save_federation_plan_template"):
         MainExecutionOps._handle_federation_partial_failure_interactive(port, owner, exc)
     kwargs = port.note_turn_outcome.call_args.kwargs
     assert kwargs["retryable"] is True
@@ -125,7 +123,7 @@ def test_session_step_carries_retryable_for_federation_partial_failure() -> None
         "retryable": True,
     }
     session._owner = MagicMock()
-    session._owner._llm_config = MagicMock(provider="mock")
+    session._owner._llm_config = MagicMock(provider="sandbox")
     session._owner._audit_emit = None
     session._turn_llm_usage_start = 0
     session._session_busy = True
@@ -141,7 +139,9 @@ def test_session_step_carries_retryable_for_federation_partial_failure() -> None
 
     step = session._completed_step()
     assert isinstance(step, SessionStep)
-    assert step.retryable is True
+    assert step.error is not None
+    assert step.error.source_id == "b"
+    assert step.error.phase == "member"
 
 
 @pytest.mark.fast

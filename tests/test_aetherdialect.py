@@ -10,26 +10,27 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from aetherdialect import AetherEngine
+from aetherdialect._config import EngineLimits
 from aetherdialect._constants import MIGRATION_MAP_FILENAME
 from aetherdialect._contracts_base import (
     ConfigError,
     EngineContext,
-    LLMConfig,
     NormalizedExpr,
     OrderByCol,
     PredicateGroup,
-    RuntimeConfig,
     WhereParam,
 )
 from aetherdialect._contracts_core import (
+    LLMConfig,
+    RuntimeConfig,
     RuntimeIntent,
     SelectCol,
 )
 from aetherdialect._contracts_schema import (
     QSimSummary,
 )
-from aetherdialect._core_utils import load_runtime_config
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import load_runtime_config
 
 
 def _sample_llm_execution():
@@ -57,8 +58,7 @@ def _make_aether_stub(**overrides):
         _config_file=None,
         _execution_engine=None,
         _audit_sink=None,
-        _construction_phase_callback=None,
-        _ask_phase_callback=None,
+        _phase_callback=None,
         _pipeline_writer_lock=__import__("threading").Lock(),
         _schema_stats={"table_count": 10, "total_filterable": 40},
         _schema_role="owner",
@@ -66,7 +66,8 @@ def _make_aether_stub(**overrides):
         _token_provider=None,
         _native_connection=None,
         _sandbox_closed=False,
-        _tenant_slug=None,
+        _limits=EngineLimits(),
+        _limits_explicit=False,
     )
     defaults.update(overrides)
 
@@ -148,7 +149,7 @@ class TestInitPatches:
 
     @patch("aetherdialect.aetherdialect.initialize_aether_engine")
     def test_init_builds_schema_and_store(self, mock_init: MagicMock) -> None:
-        from aetherdialect._contracts_base import AetherEngineInitResult
+        from aetherdialect._contracts_core import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -178,7 +179,7 @@ class TestInitPatches:
 
     @patch("aetherdialect.aetherdialect.initialize_aether_engine")
     def test_init_calls_initialize_with_engine_context(self, mock_init: MagicMock) -> None:
-        from aetherdialect._contracts_base import AetherEngineInitResult
+        from aetherdialect._contracts_core import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -217,7 +218,7 @@ class TestClearLearningCaches:
         mock_clear: MagicMock,
         mock_init: MagicMock,
     ) -> None:
-        from aetherdialect._contracts_base import AetherEngineInitResult
+        from aetherdialect._contracts_core import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -257,7 +258,7 @@ class TestClearLearningCaches:
         mock_clear: MagicMock,
         mock_init: MagicMock,
     ) -> None:
-        from aetherdialect._contracts_base import AetherEngineInitResult
+        from aetherdialect._contracts_core import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -291,7 +292,7 @@ class TestClearLearningCaches:
         mock_init.assert_called_once()
 
     @patch("aetherdialect.aetherdialect.initialize_aether_engine")
-    @patch("aetherdialect.aetherdialect.clear_persisted_overrides")
+    @patch("aetherdialect.aetherdialect.delete_persisted_structure_artifacts")
     @patch("aetherdialect.aetherdialect.clear_template_store_only")
     @patch("aetherdialect.aetherdialect.clear_simulation_caches_only")
     def test_clear_all_learning_with_overrides_only_clears_disks(
@@ -301,7 +302,7 @@ class TestClearLearningCaches:
         mock_clear_over: MagicMock,
         mock_init: MagicMock,
     ) -> None:
-        from aetherdialect._contracts_base import AetherEngineInitResult
+        from aetherdialect._contracts_core import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -329,14 +330,14 @@ class TestClearLearningCaches:
             _schema_graph=sg,
             _artifacts_dir=Path("/tmp/aether"),
         )
-        t.clear_all_learning(keep_overrides=True)
+        t.clear_all_learning(keep_structure=True)
         mock_tmpl.assert_called_once()
         mock_sim.assert_called_once()
         mock_clear_over.assert_not_called()
         mock_init.assert_called_once()
 
     @patch("aetherdialect.aetherdialect.initialize_aether_engine")
-    @patch("aetherdialect.aetherdialect.clear_persisted_overrides", return_value=True)
+    @patch("aetherdialect.aetherdialect.delete_persisted_structure_artifacts", return_value=True)
     @patch("aetherdialect.aetherdialect.clear_template_store_only")
     @patch("aetherdialect.aetherdialect.clear_simulation_caches_only")
     def test_clear_all_learning_drops_overrides(
@@ -346,7 +347,7 @@ class TestClearLearningCaches:
         mock_clear_over: MagicMock,
         mock_init: MagicMock,
     ) -> None:
-        from aetherdialect._contracts_base import AetherEngineInitResult
+        from aetherdialect._contracts_core import AetherEngineInitResult
 
         sg = MagicMock(
             effective_structural_hash="eh",
@@ -374,7 +375,7 @@ class TestClearLearningCaches:
             _schema_graph=sg,
             _artifacts_dir=Path("/tmp/aether"),
         )
-        t.clear_all_learning(keep_overrides=False)
+        t.clear_all_learning(keep_structure=False)
         mock_tmpl.assert_called_once()
         mock_sim.assert_called_once()
         mock_clear_over.assert_called_once()
@@ -385,66 +386,57 @@ class TestApplyMigrationMap:
     """Tests for ``AetherEngine.apply_migration_map``."""
 
     def test_apply_migration_map_copies_to_artifacts_dir(self) -> None:
-        captured: dict[str, object] = {}
-
-        def _capture_init(self: AetherEngine, *args: object, **kwargs: object) -> None:
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-
         with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "incoming_map.json"
-            src.write_text('{"tables": []}', encoding="utf-8")
             artifacts = Path(td) / "artifacts"
             artifacts.mkdir()
             wrong_cwd = Path(td) / "wrong_cwd"
             wrong_cwd.mkdir()
+            sg = MagicMock(effective_structural_hash="eh")
+            engine = _make_aether_stub(_artifacts_dir=artifacts, _schema_graph=sg)
+            document = {"version": 1, "tables": []}
             old = os.getcwd()
             os.chdir(wrong_cwd)
             try:
-                with patch.object(AetherEngine, "__init__", _capture_init):
-                    out = AetherEngine.apply_migration_map(
-                        str(src),
-                        engine_context=EngineContext(),
-                        artifacts_dir=str(artifacts),
-                    )
-                assert isinstance(out, AetherEngine)
+                with (
+                    patch(
+                        "aetherdialect.aetherdialect.TemplateOps.parse_schema_migration_map_payload",
+                        return_value=MagicMock(),
+                    ),
+                    patch("aetherdialect.aetherdialect.TemplateOps.validate_schema_migration_map"),
+                    patch("aetherdialect.aetherdialect.load_schema_graph_snapshot", return_value=sg),
+                    patch("aetherdialect.aetherdialect.AetherEngine.refresh", return_value=MagicMock()),
+                ):
+                    engine.apply_migration_map(document)
                 dst = artifacts / MIGRATION_MAP_FILENAME
                 assert dst.is_file()
-                assert dst.read_text(encoding="utf-8") == '{"tables": []}'
+                assert '"tables": []' in dst.read_text(encoding="utf-8")
                 assert not (wrong_cwd / MIGRATION_MAP_FILENAME).is_file()
-                args = captured.get("args", ())
-                kwargs = captured.get("kwargs", {})
-                ctx = kwargs.get("engine_context")
-                if ctx is None and len(args) >= 1:
-                    ctx = args[0]
-                assert ctx == EngineContext()
-                assert kwargs.get("artifacts_dir") == str(artifacts)
             finally:
                 os.chdir(old)
 
     def test_apply_migration_map_forwards_native_connection(self) -> None:
-        captured: dict[str, object] = {}
-        sentinel = object()
-
-        def _capture_init(self: AetherEngine, *args: object, **kwargs: object) -> None:
-            captured["kwargs"] = kwargs
-
         with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "map.json"
-            src.write_text('{"version": 1, "action": "remap"}', encoding="utf-8")
             artifacts = Path(td) / "artifacts"
             artifacts.mkdir()
-            with patch.object(AetherEngine, "__init__", _capture_init):
-                AetherEngine.apply_migration_map(
-                    str(src),
-                    engine_context=EngineContext(),
-                    artifacts_dir=str(artifacts),
-                    native_connection=sentinel,
-                    execution_engine=sentinel,
-                )
-        kwargs = captured.get("kwargs", {})
-        assert kwargs.get("native_connection") is sentinel
-        assert kwargs.get("execution_engine") is sentinel
+            sg = MagicMock(effective_structural_hash="eh")
+            engine = _make_aether_stub(
+                _artifacts_dir=artifacts,
+                _schema_graph=sg,
+                _native_connection=object(),
+                _execution_engine=object(),
+            )
+            with (
+                patch(
+                    "aetherdialect.aetherdialect.TemplateOps.parse_schema_migration_map_payload",
+                    return_value=MagicMock(),
+                ),
+                patch("aetherdialect.aetherdialect.TemplateOps.validate_schema_migration_map"),
+                patch("aetherdialect.aetherdialect.load_schema_graph_snapshot", return_value=sg),
+                patch("aetherdialect.aetherdialect.AetherEngine.refresh", return_value=MagicMock()) as refresh_mock,
+            ):
+                engine.apply_migration_map({"version": 1, "action": "remap"})
+            refresh_mock.assert_called_once()
+            assert (artifacts / MIGRATION_MAP_FILENAME).is_file()
 
 
 class TestBuildIntentSummary:
@@ -471,7 +463,7 @@ class TestBuildIntentSummary:
             natural_language="  headline  ",
             limit=10,
         )
-        s = MainExecutionOps._build_intent_summary(intent)
+        s = MainExecutionOps.build_intent_summary(intent)
         assert s.tables == ("t1",)
         assert s.limit == 10
         assert s.natural_language == "headline"

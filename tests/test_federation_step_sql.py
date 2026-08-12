@@ -28,7 +28,7 @@ def test_multi_member_sql_is_source_mapping() -> None:
         generation_path=GenerationPath.FEDERATION_PLAN,
         matched_template=None,
     )
-    sql = MainExecutionOps._resolved_session_step_sql(
+    sql = MainExecutionOps.resolved_session_step_sql(
         None,
         gen_out=gen_out,
         federated_bundle=bundle,
@@ -56,7 +56,7 @@ def test_mapping_values_dialect_specific() -> None:
             ),
         )
     )
-    sql = MainExecutionOps._resolved_session_step_sql(
+    sql = MainExecutionOps.resolved_session_step_sql(
         None,
         federated_bundle=bundle,
         generation_path=GenerationPath.FEDERATION_PLAN,
@@ -71,7 +71,7 @@ def test_one_member_degenerate_sql_str() -> None:
     bundle = FederatedSqlBundle(
         statements=(FederatedStatementRecord(source_id="crm", engine="postgresql", statement="SELECT 1 FROM crm.t"),)
     )
-    sql = MainExecutionOps._resolved_session_step_sql(
+    sql = MainExecutionOps.resolved_session_step_sql(
         None,
         federated_bundle=bundle,
         generation_path=GenerationPath.FEDERATION_PLAN,

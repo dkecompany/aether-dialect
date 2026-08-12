@@ -15,11 +15,11 @@ from aetherdialect._constants import (
     TOML_ENGINE_FIELD_MAPS,
     WINDOW_FRAMES_EXCLUDED_ENGINES,
 )
+from aetherdialect._contracts_base import NormalizedExpr
 from aetherdialect._contracts_core import SelectCol
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
 from aetherdialect._dialect import DialectRegistry
 from aetherdialect._dialect_sqlglot_engines import SnowflakeDialect
-from aetherdialect._intent_process import NormalizedExpr
 from aetherdialect._sql_gen import _maybe_render_array_unnest_select
 
 

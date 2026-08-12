@@ -11,11 +11,11 @@ import pytest
 from aetherdialect._constants import SCHEMA_GRAPH_ID_PREFIX
 from aetherdialect._contracts_base import EngineContext
 from aetherdialect._contracts_schema import SchemaGraph, TableMetadata
-from aetherdialect._core_utils import schema_prompt_cache_id
 from aetherdialect._schema_graph import (
     assign_schema_graph_hashes,
     derive_deterministic_schema_graph_id,
 )
+from aetherdialect._utils import schema_prompt_cache_id
 
 
 def _table(name: str) -> TableMetadata:

@@ -7,8 +7,8 @@ import pytest
 
 from aetherdialect._contracts_base import FederationCapExceededError, SensitivityClassification
 from aetherdialect._contracts_schema import ColumnMetadata, SchemaGraph, TableMetadata
-from aetherdialect._federation import (
-    distinct_semijoin_keys,
+from aetherdialect._federation_execute import distinct_semijoin_keys
+from aetherdialect._federation_plan import (
     semijoin_key_distinct_count,
     semijoin_key_is_allowed,
     semijoin_key_passes_distinct_floor,

@@ -7,10 +7,10 @@ from typing import Any
 
 import pytest
 
-from aetherdialect._core_utils import data_type_to_value_type
+from aetherdialect._utils import data_type_to_value_type
 
-from ._engine_live import build_engine_t2s, engine_schema, skip_unless_configured
-from ._schema_graph_role_spec import RENTAL_SHOP_COLUMN_ROLE_ALLOWLIST
+from .live_support import build_engine_t2s, engine_schema, skip_unless_configured
+from .mydb_profile import RENTAL_SHOP_COLUMN_ROLE_ALLOWLIST
 
 LIVE_ENGINE_SPECS: tuple[tuple[str, str, str], ...] = (
     ("postgresql", "PGDATABASE", "rental_shop"),
@@ -19,6 +19,7 @@ LIVE_ENGINE_SPECS: tuple[tuple[str, str, str], ...] = (
     ("mysql", "MYSQL_DATABASE", "rental_shop"),
     ("mariadb", "MARIADB_DATABASE", "rental_shop"),
     ("sqlserver", "SQLSERVER_DATABASE", "rental_shop"),
+    ("oracle", "ORACLE_SERVICE_NAME", "FREEPDB1"),
     ("redshift", "REDSHIFT_DATABASE", "rental_shop"),
     ("databricks", "DATABRICKS_SCHEMA", "rental_shop"),
     ("snowflake", "SNOWFLAKE_DATABASE", "rental_shop"),

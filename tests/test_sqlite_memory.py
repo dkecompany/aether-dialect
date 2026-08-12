@@ -32,7 +32,7 @@ def _reset_sqlite_runtime_config() -> None:
     try:
         SQLiteRuntimeConfig.DATABASE_PATH = ":memory:"
         SQLiteRuntimeConfig.SCHEMA = "main"
-        SQLiteRuntimeConfig.clear_attached_connection()
+        SQLiteRuntimeConfig.NATIVE_CONNECTION = None
         yield
     finally:
         SQLiteRuntimeConfig.DATABASE_PATH = orig_path
@@ -55,7 +55,7 @@ def test_in_memory_reflect_and_execute_share_database() -> None:
 def test_in_memory_via_attach_connection() -> None:
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     _seed_memory_table(connection)
-    SQLiteRuntimeConfig.attach_connection(connection)
+    SQLiteRuntimeConfig.NATIVE_CONNECTION = connection
     dialect = DialectRegistry.get("sqlite", SQLiteRuntimeConfig)
     graph = dialect.reflect_schema_graph(include="tables")
     assert "items" in graph.tables
@@ -78,7 +78,7 @@ def test_rental_shop_sqlite_translate_rental_date_timestamp() -> None:
     scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
     if str(scripts_dir) not in sys.path:
         sys.path.insert(0, str(scripts_dir))
-    from aetherdialect._core_utils import data_type_to_value_type
+    from aetherdialect._utils import data_type_to_value_type
     from load_rental_shop_engines import iter_create_table_blocks, translate_create
 
     ddl = (Path(__file__).resolve().parents[1] / "scripts" / "data" / "rental_shop.sql").read_text(encoding="utf-8")

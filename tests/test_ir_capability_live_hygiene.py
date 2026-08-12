@@ -1,4 +1,4 @@
-"""Fast guard against skip-only IR capability live placeholders."""
+"""IR capability live tests must not be skip-only placeholders."""
 
 from __future__ import annotations
 

@@ -10,12 +10,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import aetherdialect._schema_overrides
+import aetherdialect._schema_finalize
 from aetherdialect._config import EngineConfig
 from aetherdialect._contracts_base import ConfigError, EngineContext, FederationContext
 from aetherdialect._contracts_schema import SchemaGraph
-from aetherdialect._core_utils import read_gzip_json
 from aetherdialect._dialect import Dialect
+from aetherdialect._schema_finalize import build_schema_graph
 from aetherdialect._schema_graph import (
     assign_schema_graph_hashes,
     classify_scope_change,
@@ -24,7 +24,8 @@ from aetherdialect._schema_graph import (
     schema_context_from_descriptor,
     scope_descriptor_for,
 )
-from aetherdialect._schema_overrides import build_schema_graph, save_schema_to_cache
+from aetherdialect._schema_reflect import save_schema_to_cache
+from aetherdialect._utils_artifacts import read_gzip_json
 
 pytestmark = pytest.mark.usefixtures("stub_schema_llm_classifier")
 
@@ -106,7 +107,7 @@ def test_classify_subset_when_new_narrows_allow_objects() -> None:
     assert classify_scope_change(old, new) == "subset"
 
 
-def test_classify_superset_when_old_universal_new_universal_deny_removed() -> None:
+def test_classify_superset_when_old_universal_new_universal_deny_dropped() -> None:
     old = EngineContext(deny_columns=frozenset({"orders.status", "customers.email"}))
     new = EngineContext(deny_columns=frozenset({"orders.status"}))
     assert classify_scope_change(old, new) == "superset"
@@ -181,7 +182,7 @@ def test_cache_subset_path_filters_in_memory_no_reflect(
 
     classify_calls: list[Any] = []
     monkeypatch.setattr(
-        aetherdialect._schema_overrides,
+        aetherdialect._schema_finalize,
         "apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
     )
@@ -210,11 +211,19 @@ def test_cache_subset_path_with_notes_change_reruns_classifier(
     classify_calls: list[Any] = []
     boolean_calls: list[int] = []
     monkeypatch.setattr(
-        "aetherdialect._schema_graph.apply_column_roles_llm",
+        "aetherdialect._schema_profile.apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
     )
     monkeypatch.setattr(
-        "aetherdialect._schema_graph.apply_boolean_coercion_pass",
+        "aetherdialect._schema_profile.apply_boolean_coercion_pass",
+        lambda sg: boolean_calls.append(1),
+    )
+    monkeypatch.setattr(
+        "aetherdialect._schema_profile.apply_column_roles_llm",
+        lambda sg, notes_content=None, **kwargs: classify_calls.append(notes_content),
+    )
+    monkeypatch.setattr(
+        "aetherdialect._schema_profile.apply_boolean_coercion_pass",
         lambda sg: boolean_calls.append(1),
     )
 
@@ -245,11 +254,11 @@ def test_cache_subset_via_deny_objects(
     assert sorted(raw["tables"].keys()) == ["customers", "orders"]
 
 
-def test_legacy_cache_without_scope_descriptor_skips_subset_path(
+def test_cache_without_scope_descriptor_skips_subset_path(
     schema_graph: SchemaGraph,
     cache_path: str,
 ) -> None:
-    """Legacy caches lacking ``scope_descriptor`` cannot use the subset path → fall to legacy validation."""
+    """Caches lacking ``scope_descriptor`` cannot use the subset path and fall back to fingerprint validation."""
     ctx_saved = EngineContext()
     dialect = _ProbeStubDialect()
     probe = compute_dialect_probe(dialect, ctx_saved)
@@ -257,7 +266,7 @@ def test_legacy_cache_without_scope_descriptor_skips_subset_path(
 
     raw = read_gzip_json(cache_path)
     raw["scope_descriptor"] = None
-    from aetherdialect._core_utils import write_gzip_json_atomic
+    from aetherdialect._utils_artifacts import write_gzip_json_atomic
 
     write_gzip_json_atomic(cache_path, raw, sort_keys=True)
 
@@ -300,8 +309,8 @@ def test_full_rebuild_profiles_only_columns_after_scope_trim(
         allow_columns=frozenset({"customers.customer_id"}),
     )
     build_schema_graph(dialect, ctx, notes_content=None)
-    assert dialect.reflect_calls == 1
-    assert reflect_kw == [("tables", frozenset({"customers"}))]
+    assert dialect.reflect_calls == 2
+    assert reflect_kw == [("tables", None), ("views", None)]
     assert profiled_snapshots == [1]
 
 
@@ -327,12 +336,16 @@ def test_full_build_applies_deny_objects_filter(
     dialect = _ReflectDialect()
     ctx = EngineContext(deny_objects=frozenset({"products"}))
     monkeypatch.setattr(
-        aetherdialect._schema_overrides,
+        aetherdialect._schema_finalize,
         "apply_column_roles_llm",
         lambda sg, notes_content=None, **kwargs: None,
     )
+    monkeypatch.setattr(
+        "aetherdialect._schema_profile.apply_column_roles_llm",
+        lambda sg, notes_content=None, **kwargs: None,
+    )
     out = build_schema_graph(dialect, ctx, notes_content="n")
-    assert dialect.reflect_calls == 1
+    assert dialect.reflect_calls == 2
     assert "customers" in out.tables
     assert "orders" in out.tables
     assert "products" not in out.tables

@@ -16,7 +16,7 @@ from aetherdialect.aetherdialect import AetherFederation
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COORDINATOR_MODULES = (
-    REPO_ROOT / "src" / "aetherdialect" / "_federation.py",
+    REPO_ROOT / "src" / "aetherdialect" / "_federation_execute.py",
     REPO_ROOT / "src" / "aetherdialect" / "_dialect_sqlglot_engines.py",
 )
 
@@ -76,6 +76,6 @@ def test_federation_construction_names_the_extra(monkeypatch: pytest.MonkeyPatch
         with pytest.raises(ConfigError, match=r"pip install aetherdialect\[(federation|duckdb)\]"):
             AetherFederation(
                 "fed",
-                members={"src": object()},
-                declaration_file="missing.json",
+                members=(object(), object()),
+                declaration="missing.json",
             )

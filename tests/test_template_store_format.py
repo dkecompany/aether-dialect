@@ -9,8 +9,8 @@ import pytest
 from aetherdialect._config import PolicyConfig
 from aetherdialect._constants import TEMPLATE_STORE_FORMAT_VERSION, TEMPLATE_STORE_HEADER_FILENAME
 from aetherdialect._contracts_base import ConfigError
-from aetherdialect._core_utils import write_gzip_json_atomic
-from aetherdialect._templates import TemplateOps
+from aetherdialect._templates_ops import TemplateOps
+from aetherdialect._utils_artifacts import write_gzip_json_atomic
 
 
 @pytest.mark.fast

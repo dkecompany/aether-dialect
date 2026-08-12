@@ -12,10 +12,9 @@ from aetherdialect._constants import SESSION_KIND_AWAITING_SQL_CONFIRM
 from aetherdialect._contracts_base import MockFixtureMissingError
 from aetherdialect._contracts_core import QuestionFormStorage, RuntimeIntent, ValueHistory
 from aetherdialect._llm_provider import MockProvider
-from aetherdialect._templates import (
-    TemplateOps,
-)
-from tests.test_reuse_saved_question import _minimal_template
+from aetherdialect._sandbox import Sandbox
+from aetherdialect._templates_ops import TemplateOps
+from tests.template_fixtures import _minimal_template
 
 
 @pytest.fixture(autouse=True)
@@ -97,7 +96,7 @@ def test_resolve_param_display_names_uses_fixture_under_mock(monkeypatch: pytest
     schema = MagicMock()
     schema.tables = {}
     with patch(
-        "aetherdialect._templates.LLMProvider.chat",
+        "aetherdialect._llm_provider.LLMProvider.chat",
         return_value='{"display_names":{"p1":"Item category"}}',
     ):
         names = TemplateOps.resolve_param_display_names(
@@ -137,7 +136,7 @@ def test_resolve_param_display_names_falls_back_on_missing_fixture(monkeypatch: 
         unit_handle="",
     )
     with patch(
-        "aetherdialect._templates.LLMProvider.chat",
+        "aetherdialect._llm_provider.LLMProvider.chat",
         side_effect=MockFixtureMissingError(task="default", system="s", user="u"),
     ):
         names = TemplateOps.resolve_param_display_names(
@@ -152,15 +151,16 @@ def test_resolve_param_display_names_falls_back_on_missing_fixture(monkeypatch: 
 
 
 @pytest.mark.needs_corpus
+@pytest.mark.not_fast
 def test_catalog_paraphrase_hits_direct_reuse_after_accept() -> None:
     canonical = "How many items are in the catalog by item type?"
-    pairs = AetherEngine.sandbox_paraphrase_pairs()
+    pairs = Sandbox._sandbox_paraphrase_pairs()
     row = next(item for item in pairs if item.get("canonical") == canonical)
     paraphrases = row.get("paraphrases")
     assert isinstance(paraphrases, list) and paraphrases
     paraphrase = str(paraphrases[0])
 
-    with AetherEngine.offline_sandbox() as sb:
+    with Sandbox.create_offline_sandbox(AetherEngine) as sb:
         with sb.engine.session() as session:
             accepted = session.accept_until_done(canonical)
             assert accepted.done
